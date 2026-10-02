@@ -1,0 +1,37 @@
+{
+  "name": "stayfrosty",
+  "version": "0.0.0",
+  "description": "A VPS with no front door: Hetzner Cloud boxes reachable only through Cloudflare Tunnel and Access.",
+  "license": "MIT",
+  "author": "TheRoccoB",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheRoccoB/stayfrosty.git"
+  },
+  "type": "module",
+  "bin": {
+    "frosty": "dist/bin.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "frosty": "node --experimental-strip-types src/bin.ts",
+    "hooks": "git config core.hooksPath .githooks",
+    "scan": "gitleaks git --redact --verbose --config .gitleaks.toml",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3"
+  }
+}

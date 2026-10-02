@@ -1,0 +1,14 @@
+#!/bin/sh
+# Refuses a commit that adds a secret. Enable once per clone with: npm run hooks
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "gitleaks is not installed, so this commit was not scanned for secrets." >&2
+  echo "Install it (brew install gitleaks) and commit again." >&2
+  exit 1
+fi
+root="$(git rev-parse --show-toplevel)"
+if ! gitleaks git --pre-commit --staged --redact --no-banner --config "$root/.gitleaks.toml" "$root"; then
+  echo "" >&2
+  echo "gitleaks found what looks like a secret in the staged changes. The commit was stopped." >&2
+  echo "Remove it from the file (tokens belong in the environment), then: git add -u && git commit" >&2
+  exit 1
+fi

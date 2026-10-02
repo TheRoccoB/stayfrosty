@@ -1,0 +1,39 @@
+# gitleaks rules for this repo: the default ruleset plus the credentials stayfrosty handles.
+title = "stayfrosty"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "hetzner-cloud-token"
+description = "Hetzner Cloud API token (64 alphanumeric characters) next to an hcloud or hetzner name"
+regex = '''(?i)(?:hcloud|hetzner)[\w.-]{0,30}[\s'"`]{0,3}(?:=|:|:=|=>)[\s'"`]{0,3}([A-Za-z0-9]{64})\b'''
+secretGroup = 1
+keywords = ["hcloud", "hetzner"]
+
+[[rules]]
+id = "cloudflare-api-token-env"
+description = "Cloudflare API token (40 characters) next to a cloudflare or CF_ name"
+regex = '''(?i)(?:cloudflare|\bcf)[\w.-]{0,30}[\s'"`]{0,3}(?:=|:|:=|=>)[\s'"`]{0,3}([A-Za-z0-9_-]{40})\b'''
+secretGroup = 1
+keywords = ["cloudflare", "cf_", "cf-", "cf."]
+
+[[rules]]
+id = "cloudflare-prefixed-token"
+description = "Cloudflare user, account or global API token in the prefixed format (cfut_, cfat_, cfk_)"
+regex = '''\bcf(?:ut|at|k)_[A-Za-z0-9_-]{40,}'''
+keywords = ["cfut_", "cfat_", "cfk_"]
+
+[[rules]]
+id = "cloudflare-tunnel-token"
+description = "Cloudflare Tunnel token (base64 JSON with account, tunnel and secret)"
+regex = '''eyJhIjoi[A-Za-z0-9+/=_-]{50,}'''
+keywords = ["eyjhijoi"]
+
+[allowlist]
+description = "Lockfile integrity hashes and build output"
+paths = [
+  '''package-lock\.json''',
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+]

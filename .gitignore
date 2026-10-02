@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+.env*
+config.json
+*.pem
+*.key
+# Local build brief, kept out of the public repo.
+BUILD.md
