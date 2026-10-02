@@ -70,3 +70,4 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
 - [M1] The Hetzner Ubuntu image ships with an unattended-upgrades stamp from the day it was built, and `boot-finished` changes on every boot. The "ran within 2 days" check uses the server's `created` time from the API and ignores stamps older than the box. Alt: a marker file written by cloud-init.
 - [M1] When cloud-init fails, `new` shows the log lines before the first failure marker, not the last lines (which are host keys), and the hardening script reports the failing line through an ERR trap. Alt: dump the whole log.
 - [M1] In fsn1 the cheapest type Hetzner offers today is cpx12, so that is the default `init` picks. Alt: none; it comes from the API.
+- [M1] Acceptance: Rocco skipped the hotspot scan. From the laptop, only IPv4 port 22 answered (the window), and nothing answered on the box's IPv6, including 22. The console password worked in the Hetzner web console.
