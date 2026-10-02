@@ -1,6 +1,6 @@
 import { Cloudflare, NAME_PREFIX, type CfTunnel } from "../cloudflare.ts";
 import { loadConfig, type Env } from "../config.ts";
-import { Hetzner, LABEL_BOX, MANAGED_SELECTOR, serverLocation, type HzFirewall } from "../hetzner.ts";
+import { Hetzner, LABEL_BOX, LABEL_WINDOW_OPENED, MANAGED_SELECTOR, serverLocation, type HzFirewall } from "../hetzner.ts";
 import type { Fetch, Sleep } from "../http.ts";
 import { table, yellow, type Io } from "../io.ts";
 import { loadTokens } from "../tokens.ts";
@@ -12,9 +12,6 @@ export interface LsDeps {
   sleep?: Sleep;
   now?: () => Date;
 }
-
-// Firewall label set when a window opens, so its age survives across laptops.
-export const LABEL_WINDOW_OPENED = "stayfrosty-window-opened";
 
 export async function runLs(deps: LsDeps): Promise<number> {
   const env = deps.env ?? process.env;

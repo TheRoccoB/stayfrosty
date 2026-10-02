@@ -3,20 +3,24 @@ import { FrostyError } from "./errors.ts";
 import { terminalIo, type Io } from "./io.ts";
 import { redact } from "./redact.ts";
 import { runInit } from "./commands/init.ts";
+import { runConsolePassword } from "./commands/console-password.ts";
+import { runDestroy } from "./commands/destroy.ts";
 import { runLs } from "./commands/ls.ts";
+import { runNew } from "./commands/new.ts";
 import { VERSION } from "./version.ts";
 
 const USAGE = `frosty ${VERSION}: a VPS with no front door
 
 Usage:
   frosty init                         write config, check tokens (creates nothing)
-  frosty new <box> [--type --location]
+  frosty new <box> [--type T] [--location L] [--resume]
   frosty adopt <box> --ip <ip>
   frosty verify [<box> | --all] [--full]
   frosty breakglass <box> [--minutes N | --close]
   frosty ls
   frosty ssh-config                   rewrite ~/.ssh/stayfrosty.conf from the APIs
-  frosty destroy <box>
+  frosty destroy <box>                type the box name to confirm
+  frosty console-password <box>       set a new password for the Hetzner web console
 
 Global flags:
   --dry-run    print what would change, change nothing
@@ -27,8 +31,6 @@ Tokens come from HCLOUD_TOKEN and CLOUDFLARE_API_TOKEN. Run "frosty init" for de
 
 // Commands from later milestones, so nobody mistakes a missing command for a broken one.
 const PLANNED: Record<string, string> = {
-  new: "M1",
-  destroy: "M1",
   adopt: "M4",
   verify: "M3",
   breakglass: "M3",
@@ -44,6 +46,9 @@ export async function main(argv: string[], io: Io): Promise<number> {
       help: { type: "boolean", short: "h" },
       version: { type: "boolean" },
       "dry-run": { type: "boolean" },
+      resume: { type: "boolean" },
+      type: { type: "string" },
+      location: { type: "string" },
     },
   });
   const command = positionals[0];
@@ -61,6 +66,12 @@ export async function main(argv: string[], io: Io): Promise<number> {
       return runInit({ io, dryRun });
     case "ls":
       return runLs({ io });
+    case "new":
+      return runNew({ io }, { box: positionals[1], resume: values["resume"] === true, dryRun, serverType: stringFlag(values["type"]), location: stringFlag(values["location"]) });
+    case "destroy":
+      return runDestroy({ io }, { box: positionals[1], dryRun });
+    case "console-password":
+      return runConsolePassword({ io }, { box: positionals[1], dryRun });
     default: {
       const milestone = PLANNED[command];
       if (milestone !== undefined) {
@@ -71,6 +82,10 @@ export async function main(argv: string[], io: Io): Promise<number> {
       return 2;
     }
   }
+}
+
+function stringFlag(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 export function reportError(error: unknown, io: Io): number {

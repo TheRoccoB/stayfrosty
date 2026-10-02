@@ -1,4 +1,4 @@
-import { ApiError } from "./errors.ts";
+import { ApiError, FrostyError } from "./errors.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
 import { redact } from "./redact.ts";
 
@@ -8,6 +8,9 @@ export const HETZNER_BASE_URL = "https://api.hetzner.cloud/v1";
 export const LABEL_MANAGED = "stayfrosty";
 export const LABEL_BOX = "stayfrosty-box";
 export const MANAGED_SELECTOR = `${LABEL_MANAGED}=1`;
+// Firewall label set when a window opens, so its age survives across laptops.
+export const LABEL_WINDOW_OPENED = "stayfrosty-window-opened";
+export const WINDOW_DESCRIPTION = "stayfrosty window";
 
 export interface HzServer {
   id: number;
@@ -184,6 +187,111 @@ export class Hetzner {
   listSshKeys(): Promise<HzSshKey[]> {
     return this.listAll<HzSshKey>("/ssh_keys", "ssh_keys");
   }
+
+  async createSshKey(name: string, publicKey: string, labels: Record<string, string>): Promise<HzSshKey> {
+    const body = await this.request<{ ssh_key: HzSshKey }>("POST", "/ssh_keys", { name, public_key: publicKey, labels });
+    return body.ssh_key;
+  }
+
+  async createFirewall(name: string, labels: Record<string, string>, rules: HzFirewallRule[]): Promise<{ firewall: HzFirewall; actions: HzAction[] }> {
+    return this.request<{ firewall: HzFirewall; actions: HzAction[] }>("POST", "/firewalls", { name, labels, rules });
+  }
+
+  async updateFirewallLabels(id: number, labels: Record<string, string>): Promise<HzFirewall> {
+    const body = await this.request<{ firewall: HzFirewall }>("PUT", `/firewalls/${id}`, { labels });
+    return body.firewall;
+  }
+
+  async setFirewallRules(id: number, rules: HzFirewallRule[]): Promise<HzAction[]> {
+    const body = await this.request<{ actions: HzAction[] }>("POST", `/firewalls/${id}/actions/set_rules`, { rules });
+    return body.actions;
+  }
+
+  async applyFirewall(id: number, serverId: number): Promise<HzAction[]> {
+    const body = await this.request<{ actions: HzAction[] }>("POST", `/firewalls/${id}/actions/apply_to_resources`, {
+      apply_to: [{ type: "server", server: { id: serverId } }],
+    });
+    return body.actions;
+  }
+
+  async deleteFirewall(id: number): Promise<void> {
+    await this.request<unknown>("DELETE", `/firewalls/${id}`);
+  }
+
+  async createServer(input: CreateServerInput): Promise<{ server: HzServer; action: HzAction; next_actions: HzAction[] }> {
+    return this.request<{ server: HzServer; action: HzAction; next_actions: HzAction[] }>("POST", "/servers", {
+      name: input.name,
+      server_type: input.serverType,
+      image: input.image,
+      location: input.location,
+      ssh_keys: input.sshKeyIds,
+      user_data: input.userData,
+      labels: input.labels,
+      firewalls: input.firewallIds.map((firewall) => ({ firewall })),
+      public_net: { enable_ipv4: true, enable_ipv6: true },
+      start_after_create: true,
+    });
+  }
+
+  async getServer(id: number): Promise<HzServer> {
+    const body = await this.request<{ server: HzServer }>("GET", `/servers/${id}`);
+    return body.server;
+  }
+
+  async deleteServer(id: number): Promise<HzAction> {
+    const body = await this.request<{ action: HzAction }>("DELETE", `/servers/${id}`);
+    return body.action;
+  }
+
+  async getAction(id: number): Promise<HzAction> {
+    const body = await this.request<{ action: HzAction }>("GET", `/actions/${id}`);
+    return body.action;
+  }
+
+  // Polls GET /actions/{id} until the action leaves "running".
+  async waitForAction(action: HzAction, timeoutMs = 300_000, now: () => number = Date.now): Promise<HzAction> {
+    const deadline = now() + timeoutMs;
+    let current = action;
+    while (current.status === "running") {
+      if (now() >= deadline) {
+        throw new FrostyError(`Hetzner action ${current.command} (${current.id}) is still running after ${Math.round(timeoutMs / 1000)}s.`, "Run the command again; it resumes where it stopped.");
+      }
+      await this.sleep(2000);
+      current = await this.getAction(current.id);
+    }
+    if (current.status === "error") {
+      const reason = current.error === null ? "no reason given" : `${current.error.code}: ${current.error.message}`;
+      throw new FrostyError(`Hetzner action ${current.command} failed: ${reason}.`, "Run the command again; it resumes where it stopped.");
+    }
+    return current;
+  }
+}
+
+export interface HzAction {
+  id: number;
+  command: string;
+  status: "running" | "success" | "error";
+  progress: number;
+  error: { code: string; message: string } | null;
+}
+
+export interface CreateServerInput {
+  name: string;
+  serverType: string;
+  image: string;
+  location: string;
+  sshKeyIds: number[];
+  userData: string;
+  labels: Record<string, string>;
+  firewallIds: number[];
+}
+
+export function boxLabels(box: string, extra: Record<string, string> = {}): Record<string, string> {
+  return { [LABEL_MANAGED]: "1", [LABEL_BOX]: box, ...extra };
+}
+
+export function boxSelector(box: string): string {
+  return `${MANAGED_SELECTOR},${LABEL_BOX}=${box}`;
 }
 
 export function serverLocation(server: HzServer): string {

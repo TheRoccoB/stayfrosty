@@ -37,3 +37,28 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
 - [M0] M2: Access apps can no longer take new app-scoped policies; create a reusable policy at `/access/policies`, reference it by ID, and delete it in `destroy`.
 - [M0] M2: deleting a tunnel needs `DELETE .../cfd_tunnel/{id}/connections` first.
 - [M0] M2: the `tunnel_health_event` notification's `new_status` values are not documented; check `available_alerts` before filtering on them.
+
+## M1
+
+- [M1] The window admits the laptop's IPv4 as a /32, and frosty reaches the box on its IPv4. IPv6 (/128) is used only when the laptop has no IPv4. Why: one address, the narrowest rule. Alt: open both families.
+- [M1] The laptop's public IP comes from Cloudflare's trace endpoint at 1.1.1.1 (and 2606:4700:4700::1111). Why: Cloudflare is already trusted here. Alt: a third-party "what is my IP" service.
+- [M1] Console password: printed once on a terminal, or piped to `passwordCommand`, or skipped (login stays locked) with a pointer to the new `frosty console-password <box>`. `--resume` keeps an existing password. Rocco chose this. Alt: always print.
+- [M1] The console password is 24 characters from 56 letters and digits without look-alikes (about 139 bits). Why: the Hetzner console types through a virtual keyboard where symbols and layouts break. Alt: symbols for more bits per character.
+- [M1] The sshd drop-in adds `AuthenticationMethods publickey` to the four settings in the brief. Why: a hard guarantee that only keys work, whatever else is set. Alt: the four settings only.
+- [M1] The cloudflared apt source is written by the hardening script after its key is installed, not in `write_files`. Why: cloud-init's package update runs first and would fail on a repo with no key. Alt: cloud-init `apt:` sources with the key inline.
+- [M1] The Cloudflare apt key is fetched over HTTPS from pkg.cloudflare.com and not pinned by fingerprint. Why: Cloudflare rolled it in 2025, and a pin would break every new box on the next roll. Alt: pin the fingerprint in the repo.
+- [M1] Hardening is files in `write_files` plus one idempotent script, `/usr/local/sbin/stayfrosty-harden`, run by `runcmd`. Only `users`, `write_files`, `packages` and `runcmd` are used. Why: `adopt` (M4) can render the same file as a script. Alt: more cloud-init modules.
+- [M1] The hardening script runs `ufw --force reset` before adding its rules. Why: leftover rules (like stayfrosty.sh's home-IP rule) disappear. Alt: delete only known rules.
+- [M1] frosty keeps its own `known_hosts` next to its config and trusts a new box's host key on first use, through the window. IPs are forgotten on `new` and `destroy` because Hetzner reuses them. Why: injecting host keys would put a private key in user data, which any process on the box can read. Alt: inject host keys.
+- [M1] frosty runs ssh with `-F /dev/null`, so `~/.ssh/config` cannot change how it connects. A key with a passphrase must be in ssh-agent. Alt: read the user's config.
+- [M1] After cloud-init, `new` reboots the box if the first upgrade asked for it, and confirms with a new boot ID. Why: a fresh box starts on its new kernel. Alt: wait for the nightly reboot.
+- [M1] A cloud-init exit of 2 (recoverable errors) is a failure. Why: "finished clean" means clean. Alt: accept warnings.
+- [M1] The on-box checks of section 6 plus two login checks (root refused, only publickey offered) run at the end of `new`. Their fixes say "destroy and new" until `adopt` exists. Alt: wait for `verify` in M3.
+- [M1] Listening sockets allowed off loopback: TCP 22 owned by sshd or systemd (ssh.socket), UDP 68 and 546 owned by systemd-networkd (DHCP). Alt: allow nothing but 22.
+- [M1] cloudflared passes when installed from pkg.cloudflare.com; a newer version in the repo is noted, not failed. Why: unattended-upgrades installs it within a day. Alt: fail on any lag, or compare with GitHub releases.
+- [M1] "unattended-upgrades ran within 2 days" passes for a box younger than 2 days that has not run yet. Alt: fail new boxes until the first run.
+- [M1] Box names: 1 to 30 of `a-z 0-9 -`, starting with a letter. They become the Hetzner server name and the `ssh-<box>` DNS label. Alt: allow uppercase and map it.
+- [M1] The SSH public key is uploaded once as `stayfrosty-<sha256 prefix>` labeled `stayfrosty=1`, or reused if Hetzner already has it under any name. `destroy` leaves it, since boxes share it. Alt: one key per box.
+- [M1] Boxes get IPv4 and IPv6. Why: GitHub and many mirrors still need IPv4. Alt: IPv6 only (later).
+- [M1] `destroy` reads the typed name from stdin, so it can be piped. AGENTS.md (M3) will say an agent may do that only for test boxes it created itself. Alt: require a terminal.
+- [M1] Window rules omit `destination_ips`. Why: Hetzner uses it only for outbound rules. Alt: send an empty list.

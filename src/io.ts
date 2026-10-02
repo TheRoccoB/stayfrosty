@@ -7,6 +7,8 @@ export interface Io {
   out(line?: string): void;
   err(line?: string): void;
   ask(question: string, defaultValue?: string): Promise<string>;
+  // Prints a secret a person asked for (the console password). Bypasses redaction.
+  reveal(line: string): void;
   close(): void;
 }
 
@@ -53,6 +55,9 @@ export function terminalIo(): Io {
     },
     err(line = "") {
       process.stderr.write(`${redact(line)}\n`);
+    },
+    reveal(line) {
+      process.stdout.write(`${line}\n`);
     },
     async ask(question, defaultValue) {
       const suffix = defaultValue === undefined || defaultValue === "" ? "" : ` [${defaultValue}]`;

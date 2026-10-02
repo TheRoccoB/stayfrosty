@@ -1,0 +1,108 @@
+#cloud-config
+# stayfrosty hardening. This file is the single source: `frosty new` sends it as user data and
+# `frosty adopt` runs the same content over SSH. frosty fills in the double-underscore placeholders.
+#
+# No secrets in here, ever: user data is readable by any process on the box through the
+# metadata service. Tokens and passwords are sent over SSH on stdin after boot.
+
+users:
+  - name: "__ADMIN_USER__"
+    groups: [sudo]
+    shell: /bin/bash
+    # Access plus the SSH key is the gate. A sudo password would break unattended operation.
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - "__SSH_PUBLIC_KEY__"
+
+disable_root: true
+ssh_pwauth: false
+
+package_update: true
+package_upgrade: true
+packages:
+  - ufw
+  - unattended-upgrades
+  - update-notifier-common
+  - curl
+  - gnupg
+
+write_files:
+  # sshd reads sshd_config.d in lexical order and keeps the first value it sees, so 00- wins
+  # over cloud-init's own 50-cloud-init.conf.
+  - path: /etc/ssh/sshd_config.d/00-stayfrosty.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # Managed by stayfrosty. Change it in the stayfrosty repo, not here.
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      AuthenticationMethods publickey
+      AllowUsers __ADMIN_USER__
+
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root:root
+    permissions: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+
+  # Read after Ubuntu's 50unattended-upgrades. Origins-Pattern adds to its security origins.
+  # The cloudflared repo's Release file has no Suite, so it can only be matched by pattern.
+  - path: /etc/apt/apt.conf.d/52stayfrosty-unattended-upgrades
+    owner: root:root
+    permissions: "0644"
+    content: |
+      // Managed by stayfrosty.
+      Unattended-Upgrade::Origins-Pattern {
+        "origin=${distro_id},archive=${distro_codename}-security";
+        "origin=cloudflared,codename=any";
+      };
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "__REBOOT_TIME__";
+
+  - path: /usr/local/sbin/stayfrosty-harden
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Managed by stayfrosty. Applies what the files above cannot. Safe to run again.
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      # cloudflared from Cloudflare's signed apt repository, so unattended-upgrades updates it.
+      # The source is added here, after its key, not in write_files: cloud-init's package
+      # update runs before this script and would fail on a repo whose key is not there yet.
+      if [ ! -s /usr/share/keyrings/cloudflare-main.gpg ]; then
+        install -d -m 0755 /usr/share/keyrings
+        curl -fsSL --retry 5 https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg.tmp
+        mv /usr/share/keyrings/cloudflare-main.gpg.tmp /usr/share/keyrings/cloudflare-main.gpg
+        chmod 0644 /usr/share/keyrings/cloudflare-main.gpg
+      fi
+      echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" > /etc/apt/sources.list.d/cloudflared.list
+      apt-get update -q
+      apt-get install -y -q cloudflared
+
+      # No fail2ban: tunnel traffic arrives from localhost, and the direct path is only ever
+      # open to one IP during a window. Remove it if an older setup installed it.
+      if dpkg -s fail2ban >/dev/null 2>&1; then
+        apt-get purge -y -q fail2ban
+      fi
+
+      # UFW is the second layer behind the Hetzner firewall. Port 22 stays allowed here or
+      # break-glass cannot work; the Hetzner firewall is what keeps it closed.
+      ufw --force reset >/dev/null
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw limit 22/tcp
+      ufw --force enable
+
+      systemctl enable --now unattended-upgrades.service
+
+      sshd -t
+      systemctl try-reload-or-restart ssh.service
+
+runcmd:
+  - [/usr/local/sbin/stayfrosty-harden]

@@ -44,3 +44,11 @@ jobs:
       - run: npm test
 
       - run: npm run build
+
+      - name: Validate cloud-init.yaml (template and rendered)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q cloud-init
+          cloud-init schema --config-file cloud-init.yaml
+          npm run -s render-cloud-init > "$RUNNER_TEMP/rendered.yaml"
+          cloud-init schema --config-file "$RUNNER_TEMP/rendered.yaml"

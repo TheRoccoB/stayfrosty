@@ -14,6 +14,7 @@
   },
   "files": [
     "dist",
+    "cloud-init.yaml",
     "README.md",
     "LICENSE"
   ],
@@ -27,7 +28,8 @@
     "frosty": "node --experimental-strip-types src/bin.ts",
     "hooks": "git config core.hooksPath .githooks",
     "scan": "gitleaks git --redact --verbose --config .gitleaks.toml",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "render-cloud-init": "node scripts/render-cloud-init.ts"
   },
   "devDependencies": {
     "@types/node": "22.20.5",

@@ -12,8 +12,8 @@ describe("cli", () => {
 
   it("names the milestone of a command that is not built yet", async () => {
     const io = new ScriptedIo();
-    expect(await main(["new", "web1"], io)).toBe(2);
-    expect(io.text()).toContain("milestone M1");
+    expect(await main(["verify", "web1"], io)).toBe(2);
+    expect(io.text()).toContain("milestone M3");
     expect(io.text()).toContain("Nothing was changed.");
   });
 

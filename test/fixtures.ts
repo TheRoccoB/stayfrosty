@@ -36,6 +36,12 @@ export class ScriptedIo implements Io {
     this.stderr.push(redact(line));
   }
 
+  readonly revealed: string[] = [];
+
+  reveal(line: string): void {
+    this.revealed.push(line);
+  }
+
   async ask(question: string, defaultValue?: string): Promise<string> {
     this.questions.push(question);
     const answer = this.answers.shift();
