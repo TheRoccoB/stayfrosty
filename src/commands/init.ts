@@ -1,5 +1,4 @@
-import { accessSync, constants, existsSync, readFileSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { Cloudflare, type CfTokenStatus, type CfZone } from "../cloudflare.ts";
 import {
   DEFAULTS,
@@ -22,6 +21,7 @@ import type { Fetch, Sleep } from "../http.ts";
 import { green, red, table, yellow, type Io } from "../io.ts";
 import { redactJson } from "../redact.ts";
 import { TOKEN_HELP, loadTokens } from "../tokens.ts";
+import { findCommand } from "../which.ts";
 
 export interface InitDeps {
   io: Io;
@@ -418,16 +418,5 @@ export function ubuntuLtsImages(images: HzImage[]): HzImage[] {
 }
 
 export function commandExists(name: string, env: Env): boolean {
-  for (const dir of (env["PATH"] ?? "").split(delimiter)) {
-    if (dir.length === 0) {
-      continue;
-    }
-    try {
-      accessSync(join(dir, name), constants.X_OK);
-      return true;
-    } catch {
-      continue;
-    }
-  }
-  return false;
+  return findCommand(name, env) !== undefined;
 }

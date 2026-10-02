@@ -39,3 +39,23 @@ export function checkCloudflared(policyText: string, box: string): CheckResult {
   }
   return pass(name, `${policy.installed}, the newest in the repo`);
 }
+
+// The connector: running, enabled, and its token file root-only.
+export function checkConnector(text: string, box: string): CheckResult {
+  const name = "cloudflared service: running, token file root-only";
+  const [active, enabled, tokenStat] = text.trim().split("\n").map((l) => l.trim());
+  const problems: string[] = [];
+  if (active !== "active") {
+    problems.push(`service is ${active ?? "unknown"}`);
+  }
+  if (enabled !== "enabled") {
+    problems.push(`service is ${enabled ?? "unknown"} at boot`);
+  }
+  if (tokenStat !== "600 root") {
+    problems.push(`/etc/cloudflared/token is ${tokenStat ?? "missing"}, want 600 root`);
+  }
+  if (problems.length > 0) {
+    return fail(name, problems.join("; "), active !== "active" ? `Look at the logs: ssh ${box} sudo journalctl -u cloudflared -n 50` : reapplyFix(box));
+  }
+  return pass(name, "active, enabled, token 600 root");
+}

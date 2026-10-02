@@ -47,6 +47,7 @@ export async function main(argv: string[], io: Io): Promise<number> {
       version: { type: "boolean" },
       "dry-run": { type: "boolean" },
       resume: { type: "boolean" },
+      direct: { type: "boolean" },
       type: { type: "string" },
       location: { type: "string" },
     },
@@ -71,7 +72,7 @@ export async function main(argv: string[], io: Io): Promise<number> {
     case "destroy":
       return runDestroy({ io }, { box: positionals[1], dryRun });
     case "console-password":
-      return runConsolePassword({ io }, { box: positionals[1], dryRun });
+      return runConsolePassword({ io }, { box: positionals[1], dryRun, direct: values["direct"] === true });
     default: {
       const milestone = PLANNED[command];
       if (milestone !== undefined) {

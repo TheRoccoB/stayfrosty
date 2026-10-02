@@ -1,5 +1,6 @@
 import type { SshResult, SshRunOptions, SshTarget } from "../src/box.ts";
 import { GATHER_SCRIPT } from "../src/checks/onbox.ts";
+import { TOKEN_SEARCH_SCRIPT } from "../src/checks/token.ts";
 import { APT_CONFIG_GOOD, POLICY_GOOD, SS_GOOD, SSHD_T_GOOD, UFW_GOOD } from "./box-fixtures.ts";
 
 export interface SshCall {
@@ -43,6 +44,9 @@ export class FakeBox {
     if (command === "sudo bash -s" && opts.stdin === GATHER_SCRIPT) {
       return ok(gatherOutput());
     }
+    if (command.startsWith("sudo bash -c") && command.includes(TOKEN_SEARCH_SCRIPT.split("\n")[0] as string)) {
+      return ok("### ps\n0\n### environ\n0\n### files\n600 root /etc/cloudflared/token\n400 root /run/credentials/cloudflared.service/tunnel-token\n### end\n");
+    }
     if (command.startsWith("sudo passwd -S")) {
       return ok(`ops ${this.passwordState} 2026-10-01 0 99999 7 -1\n`);
     }
@@ -79,6 +83,7 @@ export function gatherOutput(now = Math.floor(Date.now() / 1000)): string {
     "### uu-stamp", "none",
     "### reboot-required", "none",
     "### cloudflared", POLICY_GOOD,
+    "### connector", "active\nenabled\n600 root",
     "### now", String(now),
     "### end",
   ].join("\n");

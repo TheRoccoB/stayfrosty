@@ -1,13 +1,19 @@
 import { createHash } from "node:crypto";
-import { FRESH_CONNECTION, lastLines, waitForSsh, type SshTarget } from "../box.ts";
+import { FRESH_CONNECTION, hostKeyAlias, knownHostsPath, lastLines, waitForSsh, type SshTarget } from "../box.ts";
 import { checkOnlyPublickey, checkRootRefused } from "../checks/login.ts";
 import { runOnBoxChecks } from "../checks/onbox.ts";
 import type { CheckResult } from "../checks/types.ts";
 import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
-import { assertBoxName, buildContext, directTarget, ipv6Host, type Context, type Deps } from "../context.ts";
+import { assertBoxName, buildContext, directTarget, requireCloudflared, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
+import { checkAccess, checkAccessLogin, checkAlert, checkDns, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
+import { checkTokenNotExposed } from "../checks/token.ts";
+import { ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, installConnector, waitForHealthyTunnel } from "../edge.ts";
+import { tildify, writeSshConfig, type SshConfigEntry } from "../sshconfig.ts";
 import { FrostyError } from "../errors.ts";
 import {
+  LABEL_BOX,
   LABEL_MANAGED,
+  MANAGED_SELECTOR,
   LABEL_WINDOW_OPENED,
   WINDOW_DESCRIPTION,
   boxLabels,
@@ -52,6 +58,7 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   const location = opts.location ?? config.location;
 
   // 1. Preflight.
+  requireCloudflared(ctx);
   const userData = renderCloudInit(loadTemplate(), { adminUser: config.adminUser, sshPublicKey: ctx.publicKey, rebootTime: config.rebootTime });
   const laptop = await ctx.laptopIp();
   const source = windowSource(laptop);
@@ -69,7 +76,9 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   io.out(`${opts.dryRun ? "Would create" : "Creating"} box ${box}: ${serverType} in ${location}, ${config.image}, admin user ${config.adminUser}.`);
   io.out(`  Hetzner firewall ${firewallName(box)}: ${firewall === undefined ? "create" : "keep"}, inbound only TCP 22 from this laptop (${source.cidr}).`);
   io.out(`  Hetzner server ${box}: ${server === undefined ? "create with the firewall attached and cloud-init.yaml as user data" : `keep (${server.status})`}.`);
-  io.out("  Then wait for cloud-init, set the console password, and run the on-box checks.");
+  io.out("  Then wait for cloud-init and set the console password.");
+  io.out(`  Cloudflare: tunnel ${firewallName(box)}, proxied CNAME ssh-${box}.${config.domain}, Access app and policy for ${config.accessEmails.join(", ")}, tunnel alert to ${config.alertEmail}.`);
+  io.out(`  ~/.ssh/stayfrosty.conf gets a "Host ${box}" block, then the window closes and everything is checked through the tunnel.`);
   if (opts.dryRun) {
     io.out("Dry run: nothing was changed.");
     return 0;
@@ -114,19 +123,15 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
       await hetzner.waitForAction(action);
     }
     server = await hetzner.getServer(created.server.id);
-    // Hetzner reuses IPs. Forget whatever box had this address before.
-    for (const host of [server.public_net.ipv4?.ip, ipv6Host(server.public_net.ipv6?.ip)]) {
-      if (host !== undefined) {
-        await ctx.forgetHost(host);
-      }
-    }
+    // A new box has a new host key; forget the pin of any earlier box with this name.
+    await ctx.forgetHost(hostKeyAlias(box));
   } else if (!(server.public_net.firewalls ?? []).some((f) => f.id === firewall.id)) {
     io.out(`Attaching firewall ${firewall.name} to ${box}.`);
     for (const action of await hetzner.applyFirewall(firewall.id, server.id)) {
       await hetzner.waitForAction(action);
     }
   }
-  const target = directTarget(ctx, server, source.family);
+  const target = directTarget(ctx, box, server, source.family);
 
   // 5. Wait for SSH through the window, then for cloud-init.
   io.out(`Waiting for SSH on ${target.host} (up to 5 minutes).`);
@@ -142,8 +147,45 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
     await setConsolePassword(ctx, { box, target, user: config.adminUser, passwordCommand: config.passwordCommand });
   }
 
-  // M1 ends here; the tunnel, Access and closing the window come in M2.
-  const results = await checkBox(ctx, box, target, server);
+  // 7 to 12: tunnel, token, DNS, Access, alert, then wait until Cloudflare sees it healthy.
+  const edge = await findEdge(ctx, box);
+  const tunnel = await ensureTunnel(ctx, box, edge.tunnel);
+  const token = await installConnector(ctx, target, tunnel.id);
+  await ensureDns(ctx, box, tunnel.id, edge);
+  await ensureAccess(ctx, box, edge);
+  await ensureAlert(ctx, box, tunnel.id, edge);
+  io.out("Waiting for the tunnel to report healthy.");
+  await waitForHealthyTunnel(ctx, tunnel.id);
+
+  // 13. SSH config for every box frosty manages.
+  const written = await writeSshConfig(ctx.env, await sshConfigEntries(ctx), ctx.now);
+  io.out(`Wrote ${tildify(written.path, ctx.env)}.`);
+  if (written.includeAdded) {
+    io.out(`Added "Include stayfrosty.conf" to the top of ~/.ssh/config${written.backup === undefined ? "" : ` (the old file is at ${tildify(written.backup, ctx.env)})`}.`);
+  }
+
+  // 14. The real path: ssh <box>, through Access. The first login opens a browser.
+  const hostname = sshHostname(ctx, box);
+  if (!(await ctx.hasAccessToken(hostname))) {
+    io.out("");
+    io.out(`A browser window opens for the Cloudflare Access login to ${hostname}. Log in there to continue.`);
+    io.out("(This click is the human in the loop. frosty waits up to 5 minutes.)");
+  }
+  const viaTunnel = await ctx.userSsh(box, "true", (line) => io.err(`  ${line}`), 5 * 60_000);
+  if (viaTunnel.code !== 0) {
+    throw new FrostyError(
+      `ssh ${box} through the tunnel failed (exit ${viaTunnel.code}). The window is still open, so nothing is locked out.`,
+      `If the Access login timed out, run: frosty new ${box} --resume`,
+    );
+  }
+  io.out(`ssh ${box} works through Cloudflare Access.`);
+
+  // 15. Only now close the window.
+  await closeWindow(ctx, firewall);
+  io.out(`Closed the window. The box firewall now admits nothing.`);
+
+  // 16. Everything, checked through the tunnel.
+  const results = await checkBox(ctx, box, tunnelTarget(ctx, box), server, { tunnel: true, token });
   printResults(ctx, results);
   const failed = results.filter((r) => !r.ok);
   io.out("");
@@ -151,10 +193,36 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
     io.err(`${failed.length} check(s) failed on ${box}. The fixes are listed above.`);
     return 1;
   }
-  io.out(`Box ${box} is up. Only this laptop's IP can reach it, on port 22:`);
-  io.out(`  ssh -i ${config.sshKey} ${config.adminUser}@${target.host}`);
-  io.out("The tunnel and Access come in M2; until then the window stays open. Remove the box with: frosty destroy " + box);
+  io.out(`Box ${box} is ready. Log in with: ssh ${box}`);
   return 0;
+}
+
+async function closeWindow(ctx: Context, firewall: HzFirewall): Promise<void> {
+  for (const action of await ctx.hetzner.setFirewallRules(firewall.id, [])) {
+    await ctx.hetzner.waitForAction(action);
+  }
+  const current = (await ctx.hetzner.listFirewalls(boxSelector(firewall.labels[LABEL_BOX] ?? ""))).find((f) => f.id === firewall.id) ?? firewall;
+  const labels = { ...current.labels };
+  delete labels[LABEL_WINDOW_OPENED];
+  await ctx.hetzner.updateFirewallLabels(firewall.id, labels);
+}
+
+// One Host block per labeled server. The API is the source of truth, not the file.
+export async function sshConfigEntries(ctx: Context): Promise<SshConfigEntry[]> {
+  const cloudflared = requireCloudflared(ctx);
+  const servers = await ctx.hetzner.listServers(MANAGED_SELECTOR);
+  return servers
+    .map((s) => s.labels[LABEL_BOX])
+    .filter((b): b is string => b !== undefined)
+    .map((b) => ({
+      box: b,
+      hostname: sshHostname(ctx, b),
+      user: ctx.config.adminUser,
+      identityFile: ctx.config.sshKey,
+      cloudflared,
+      knownHosts: tildify(knownHostsPath(ctx.env), ctx.env),
+      hostKeyAlias: hostKeyAlias(b),
+    }));
 }
 
 // A server or firewall with frosty's name but without its labels belongs to someone else.
@@ -238,12 +306,31 @@ async function rebootIfRequired(ctx: Context, target: SshTarget): Promise<void> 
   }
 }
 
-export async function checkBox(ctx: Context, box: string, target: SshTarget, server: HzServer): Promise<CheckResult[]> {
+// The checks of section 6 that exist so far. With `tunnel`, also the Cloudflare side and the
+// closed window; with `token`, a search of the box for the tunnel token.
+export async function checkBox(ctx: Context, box: string, target: SshTarget, server: HzServer, opts: { tunnel: boolean; token?: string }): Promise<CheckResult[]> {
   const login = [await checkRootRefused(ctx.ssh, target, box), await checkOnlyPublickey(ctx.ssh, target, box)];
   const created = Date.parse(server.created);
   const createdAt = Number.isFinite(created) ? Math.floor(created / 1000) : undefined;
-  const onBox = await runOnBoxChecks(ctx.ssh, target, box, ctx.config.adminUser, ctx.config.rebootTime, createdAt);
-  return [...login, ...onBox];
+  const onBox = await runOnBoxChecks(ctx.ssh, target, { box, adminUser: ctx.config.adminUser, rebootTime: ctx.config.rebootTime, createdAt, tunnel: opts.tunnel });
+  if (!opts.tunnel) {
+    return [...login, ...onBox];
+  }
+  const { config, cloudflare } = ctx;
+  const hostname = sshHostname(ctx, box);
+  const [edge, firewalls, records] = await Promise.all([findEdge(ctx, box), ctx.hetzner.listFirewalls(boxSelector(box)), cloudflare.listDnsRecords(config.zoneId)]);
+  const ingress = edge.tunnel === undefined ? [] : await cloudflare.getTunnelIngress(config.accountId, edge.tunnel.id);
+  const app = edge.app === undefined ? undefined : await cloudflare.getAccessApp(config.accountId, edge.app.id);
+  const api = [
+    checkWindowClosed(box, firewalls[0], ctx.now()),
+    checkTunnel(box, edge.tunnel, ingress, hostname),
+    checkAccess(box, app, edge.policy, hostname, config.accessEmails),
+    checkDns(box, records, hostname, edge.tunnel?.id, server.public_net.ipv4?.ip, server.public_net.ipv6?.ip),
+    checkAlert(box, edge.alert, edge.tunnel?.id),
+    await checkAccessLogin(ctx.fetch, hostname),
+  ];
+  const tokenCheck = opts.token === undefined ? [] : [await checkTokenNotExposed(ctx.ssh, target, opts.token)];
+  return [...login, ...onBox, ...tokenCheck, ...api];
 }
 
 export function printResults(ctx: Context, results: CheckResult[]): void {

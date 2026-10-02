@@ -6,12 +6,20 @@ import { FrostyError } from "./errors.ts";
 import type { Sleep } from "./http.ts";
 import { redact } from "./redact.ts";
 
-// How frosty reaches a box over SSH. `host` is an IP during a window; later milestones add
-// the tunnel hostname.
+// How frosty reaches a box over SSH: its public IP during a window, or its SSH hostname
+// through the tunnel (with a ProxyCommand).
 export interface SshTarget {
   host: string;
   user: string;
   keyPath: string;
+  // The box's host key is pinned under this name (stayfrosty-<box>), whatever the address.
+  // The key learned through the window is the one the tunnel path must present.
+  hostKeyAlias: string;
+  proxyCommand?: string;
+}
+
+export function hostKeyAlias(box: string): string {
+  return `stayfrosty-${box}`;
 }
 
 export interface SshResult {
@@ -54,9 +62,14 @@ export function sshArgs(target: SshTarget, env: Env, extra: string[] = []): stri
     "-o",
     "ConnectTimeout=10",
     "-o",
-    "StrictHostKeyChecking=accept-new",
+    // First contact is through the window, from one IP, to a box minutes old. After that the
+    // key is pinned and the tunnel path must match it.
+    `StrictHostKeyChecking=${target.proxyCommand === undefined ? "accept-new" : "yes"}`,
     "-o",
     `UserKnownHostsFile=${knownHostsPath(env)}`,
+    "-o",
+    `HostKeyAlias=${target.hostKeyAlias}`,
+    ...(target.proxyCommand === undefined ? [] : ["-o", `ProxyCommand=${target.proxyCommand}`]),
     "-o",
     "ServerAliveInterval=15",
     "-o",
@@ -165,8 +178,8 @@ export async function waitForSsh(opts: {
     last = lastLines(result.stderr, 3);
     if (/REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed/i.test(result.stderr)) {
       throw new FrostyError(
-        `The SSH host key for ${opts.target.host} does not match the one frosty saw before.`,
-        `If this IP belonged to a box you destroyed, forget it with: ssh-keygen -R ${opts.target.host} -f ${knownHostsPath()}  Otherwise stop: something may be intercepting the connection.`,
+        `The SSH host key of ${opts.target.host} does not match the one frosty pinned for this box (${opts.target.hostKeyAlias}).`,
+        "Stop here: something may be intercepting the connection. If you rebuilt the box outside frosty, destroy it with frosty destroy and create it again.",
       );
     }
     if (opts.now() >= deadline) {
@@ -180,3 +193,41 @@ export async function waitForSsh(opts: {
     await opts.sleep(10_000);
   }
 }
+
+export type UserSsh = (host: string, command: string, onStderr: (line: string) => void, timeoutMs: number) => Promise<SshResult>;
+
+// `ssh <box> <command>` exactly as the user would type it, through ~/.ssh/config, the Include
+// and the cloudflared ProxyCommand. The first time, cloudflared opens a browser for the
+// Access login; its messages are passed through so the user sees what to do.
+export const userSsh: UserSsh = (host, command, onStderr, timeoutMs) =>
+  new Promise((resolve, reject) => {
+    const child = spawn("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=30", host, command], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let partial = "";
+    const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      stderr += text;
+      partial += text;
+      const lines = partial.split("\n");
+      partial = lines.pop() ?? "";
+      for (const line of lines) {
+        onStderr(line);
+      }
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(new FrostyError(`Could not start ssh: ${error.message}`, "Install OpenSSH."));
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (partial.length > 0) {
+        onStderr(partial);
+      }
+      resolve({ code: code ?? 255, stdout, stderr });
+    });
+  });

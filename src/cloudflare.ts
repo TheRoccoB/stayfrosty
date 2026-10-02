@@ -1,6 +1,6 @@
 import { ApiError, FrostyError } from "./errors.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
-import { redact } from "./redact.ts";
+import { redact, registerSecret } from "./redact.ts";
 
 export const CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4";
 
@@ -28,6 +28,27 @@ export interface CfTunnel {
   created_at: string;
   deleted_at: string | null;
   config_src?: string;
+  connections?: { colo_name?: string; client_version?: string; is_pending_reconnect?: boolean }[];
+}
+
+export interface CfIngressRule {
+  hostname?: string;
+  service: string;
+}
+
+export interface CfAccessRule {
+  email?: { email: string };
+  everyone?: Record<string, never>;
+  [other: string]: unknown;
+}
+
+export interface CfAccessPolicy {
+  id: string;
+  name: string;
+  decision: string;
+  include: CfAccessRule[];
+  exclude?: CfAccessRule[];
+  require?: CfAccessRule[];
 }
 
 export interface CfAccessApp {
@@ -35,6 +56,8 @@ export interface CfAccessApp {
   name: string;
   domain?: string;
   type: string;
+  session_duration?: string;
+  policies?: { id: string; name?: string; decision?: string; precedence?: number; include?: CfAccessRule[] }[];
 }
 
 export interface CfNotificationPolicy {
@@ -42,6 +65,8 @@ export interface CfNotificationPolicy {
   name: string;
   alert_type: string;
   enabled: boolean;
+  filters?: Record<string, string[]>;
+  mechanisms?: Record<string, { id: string }[]>;
 }
 
 export interface CfDnsRecord {
@@ -50,6 +75,7 @@ export interface CfDnsRecord {
   name: string;
   content: string;
   proxied?: boolean;
+  comment?: string | null;
 }
 
 export interface CfTokenStatus {
@@ -192,8 +218,90 @@ export class Cloudflare {
     return this.listAll<CfDnsRecord>(`/zones/${encodeURIComponent(zoneId)}/dns_records`, query, 100);
   }
 
+  // Tunnels.
+
+  async createTunnel(accountId: string, name: string): Promise<CfTunnel> {
+    return this.request<CfTunnel>("POST", `${acct(accountId)}/cfd_tunnel`, { name, config_src: "cloudflare" });
+  }
+
+  getTunnel(accountId: string, tunnelId: string): Promise<CfTunnel> {
+    return this.request<CfTunnel>("GET", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}`);
+  }
+
+  // The token is registered for redaction before anything else can see it.
+  async getTunnelToken(accountId: string, tunnelId: string): Promise<string> {
+    const token = await this.request<string>("GET", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/token`);
+    registerSecret(token);
+    return token;
+  }
+
+  async putTunnelIngress(accountId: string, tunnelId: string, ingress: CfIngressRule[]): Promise<void> {
+    await this.request<unknown>("PUT", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/configurations`, { config: { ingress } });
+  }
+
+  async getTunnelIngress(accountId: string, tunnelId: string): Promise<CfIngressRule[]> {
+    const result = await this.request<{ config?: { ingress?: CfIngressRule[] } }>("GET", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/configurations`);
+    return result.config?.ingress ?? [];
+  }
+
+  async deleteTunnel(accountId: string, tunnelId: string): Promise<void> {
+    // A tunnel with live connections cannot be deleted; drop them first.
+    await this.request<unknown>("DELETE", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/connections`);
+    await this.request<unknown>("DELETE", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}`);
+  }
+
+  // DNS.
+
+  createDnsRecord(zoneId: string, record: { type: string; name: string; content: string; proxied: boolean; comment: string }): Promise<CfDnsRecord> {
+    return this.request<CfDnsRecord>("POST", `/zones/${encodeURIComponent(zoneId)}/dns_records`, { ...record, ttl: 1 });
+  }
+
+  async deleteDnsRecord(zoneId: string, recordId: string): Promise<void> {
+    await this.request<unknown>("DELETE", `/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(recordId)}`);
+  }
+
+  // Access.
+
+  listAccessPolicies(accountId: string): Promise<CfAccessPolicy[]> {
+    return this.listAll<CfAccessPolicy>(`${acct(accountId)}/access/policies`);
+  }
+
+  createAccessPolicy(accountId: string, policy: { name: string; decision: string; include: CfAccessRule[]; session_duration?: string }): Promise<CfAccessPolicy> {
+    return this.request<CfAccessPolicy>("POST", `${acct(accountId)}/access/policies`, policy);
+  }
+
+  async deleteAccessPolicy(accountId: string, policyId: string): Promise<void> {
+    await this.request<unknown>("DELETE", `${acct(accountId)}/access/policies/${encodeURIComponent(policyId)}`);
+  }
+
+  getAccessApp(accountId: string, appId: string): Promise<CfAccessApp> {
+    return this.request<CfAccessApp>("GET", `${acct(accountId)}/access/apps/${encodeURIComponent(appId)}`);
+  }
+
+  createAccessApp(accountId: string, app: Record<string, unknown>): Promise<CfAccessApp> {
+    return this.request<CfAccessApp>("POST", `${acct(accountId)}/access/apps`, app);
+  }
+
+  async deleteAccessApp(accountId: string, appId: string): Promise<void> {
+    await this.request<unknown>("DELETE", `${acct(accountId)}/access/apps/${encodeURIComponent(appId)}`);
+  }
+
+  // Notifications.
+
+  createNotificationPolicy(accountId: string, policy: Record<string, unknown>): Promise<{ id: string }> {
+    return this.request<{ id: string }>("POST", `${acct(accountId)}/alerting/v3/policies`, policy);
+  }
+
+  async deleteNotificationPolicy(accountId: string, policyId: string): Promise<void> {
+    await this.request<unknown>("DELETE", `${acct(accountId)}/alerting/v3/policies/${encodeURIComponent(policyId)}`);
+  }
+
   async countDnsRecords(zoneId: string): Promise<number> {
     const env = await this.envelope<CfDnsRecord[]>("GET", withQuery(`/zones/${encodeURIComponent(zoneId)}/dns_records`, { per_page: 5 }));
     return env.result_info?.total_count ?? (Array.isArray(env.result) ? env.result.length : 0);
   }
+}
+
+function acct(accountId: string): string {
+  return `/accounts/${encodeURIComponent(accountId)}`;
 }

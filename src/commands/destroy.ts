@@ -1,19 +1,24 @@
-import { assertBoxName, buildContext, ipv6Host, type Deps } from "../context.ts";
+import { hostKeyAlias } from "../box.ts";
+import { assertBoxName, buildContext, type Deps } from "../context.ts";
+import { describeEdge, edgeIsEmpty, findEdge, removeEdge, removeTunnel } from "../edge.ts";
 import { ApiError, FrostyError } from "../errors.ts";
 import { boxSelector } from "../hetzner.ts";
+import { tildify, writeSshConfig } from "../sshconfig.ts";
+import { sshConfigEntries } from "./new.ts";
 
 export interface DestroyOptions {
   box: string | undefined;
   dryRun: boolean;
 }
 
-// Deletes everything frosty created for one box, found by label. Never anything unlabeled.
+// Deletes everything frosty created for one box: found by label in Hetzner and by name in
+// Cloudflare. Never anything else.
 export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<number> {
   const box = assertBoxName(opts.box);
   const ctx = await buildContext(deps);
   const { io, hetzner } = ctx;
-  const [servers, firewalls] = await Promise.all([hetzner.listServers(boxSelector(box)), hetzner.listFirewalls(boxSelector(box))]);
-  if (servers.length === 0 && firewalls.length === 0) {
+  const [servers, firewalls, edge] = await Promise.all([hetzner.listServers(boxSelector(box)), hetzner.listFirewalls(boxSelector(box)), findEdge(ctx, box)]);
+  if (servers.length === 0 && firewalls.length === 0 && edgeIsEmpty(edge)) {
     io.out(`frosty has nothing named ${box}. Nothing to destroy. See what exists with: frosty ls`);
     return 0;
   }
@@ -25,6 +30,9 @@ export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<numb
   for (const firewall of firewalls) {
     io.out(`  Hetzner firewall ${firewall.name} (id ${firewall.id})`);
   }
+  for (const line of describeEdge(edge)) {
+    io.out(`  ${line}`);
+  }
   if (opts.dryRun) {
     io.out("Dry run: nothing was deleted.");
     return 0;
@@ -35,23 +43,28 @@ export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<numb
     return 1;
   }
 
+  // The alert goes first, so deleting the box does not send a tunnel-down email.
+  await removeEdge(ctx, edge);
   for (const server of servers) {
     io.out(`Deleting server ${server.name}.`);
     await hetzner.waitForAction(await hetzner.deleteServer(server.id));
-    for (const host of [server.public_net.ipv4?.ip, ipv6Host(server.public_net.ipv6?.ip)]) {
-      if (host !== undefined) {
-        await ctx.forgetHost(host);
-      }
-    }
   }
+  await ctx.forgetHost(hostKeyAlias(box));
   for (const firewall of firewalls) {
     io.out(`Deleting firewall ${firewall.name}.`);
     await deleteFirewallWhenFree(ctx.hetzner, firewall.id, ctx.sleep, ctx.now);
   }
+  // The connector is gone with the server; now the tunnel can go.
+  await removeTunnel(ctx, edge);
 
-  const [leftServers, leftFirewalls] = await Promise.all([hetzner.listServers(boxSelector(box)), hetzner.listFirewalls(boxSelector(box))]);
-  if (leftServers.length > 0 || leftFirewalls.length > 0) {
-    throw new FrostyError(`Some of ${box} is still there after deleting.`, `Run frosty destroy ${box} again, then: frosty ls`);
+  if (ctx.cloudflaredPath !== undefined) {
+    const written = await writeSshConfig(ctx.env, await sshConfigEntries(ctx), ctx.now);
+    io.out(`Removed ${box} from ${tildify(written.path, ctx.env)}.`);
+  }
+
+  const [leftServers, leftFirewalls, leftEdge] = await Promise.all([hetzner.listServers(boxSelector(box)), hetzner.listFirewalls(boxSelector(box)), findEdge(ctx, box)]);
+  if (leftServers.length > 0 || leftFirewalls.length > 0 || !edgeIsEmpty(leftEdge)) {
+    throw new FrostyError(`Some of ${box} is still there after deleting: ${describeEdge(leftEdge).join(", ") || "Hetzner resources"}.`, `Run frosty destroy ${box} again, then: frosty ls`);
   }
   io.out(`Box ${box} is gone. Check with: frosty ls`);
   return 0;

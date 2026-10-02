@@ -11,6 +11,14 @@ import { ScriptedIo, sampleConfig } from "./fixtures.ts";
 const HZ = "api.hetzner.cloud";
 const CF = "api.cloudflare.com";
 
+function emptyCloudflare(http: FakeHttp): void {
+  http
+    .on("GET", CF, "/client/v4/accounts/acc1/access/apps", cfOk([], { total_pages: 1 }))
+    .on("GET", CF, "/client/v4/accounts/acc1/access/policies", cfOk([], { total_pages: 1 }))
+    .on("GET", CF, "/client/v4/accounts/acc1/alerting/v3/policies", cfOk([]))
+    .on("GET", CF, "/client/v4/zones/zone123/dns_records", cfOk([], { total_pages: 1 }));
+}
+
 describe("frosty ls", () => {
   let home = "";
   let env: Record<string, string>;
@@ -31,6 +39,7 @@ describe("frosty ls", () => {
       .on("GET", HZ, "/v1/servers", hzPage("servers", []))
       .on("GET", HZ, "/v1/firewalls", hzPage("firewalls", []))
       .on("GET", CF, "/client/v4/accounts/acc1/cfd_tunnel", cfOk([], { total_pages: 1 }));
+    emptyCloudflare(http);
     const io = new ScriptedIo();
     expect(await runLs({ io, env, fetch: http.fetch, sleep: noSleep })).toBe(0);
     expect(io.text()).toContain("No boxes.");
@@ -70,6 +79,9 @@ describe("frosty ls", () => {
         { id: "t2", name: "stayfrosty-gone", status: "down", created_at: "", deleted_at: null },
         { id: "t3", name: "someone-elses", status: "healthy", created_at: "", deleted_at: null },
       ], { total_pages: 1 }));
+    emptyCloudflare(http);
+    http.on("GET", CF, "/client/v4/accounts/acc1/access/apps", cfOk([{ id: "a1", name: "stayfrosty-gone", type: "self_hosted" }, { id: "a2", name: "stayfrosty-web1", type: "self_hosted" }], { total_pages: 1 }));
+    http.on("GET", CF, "/client/v4/zones/zone123/dns_records", cfOk([{ id: "d1", type: "CNAME", name: "ssh-gone.example.com", content: "x", comment: "stayfrosty box gone" }], { total_pages: 1 }));
     const io = new ScriptedIo();
     await runLs({ io, env, fetch: http.fetch, sleep: noSleep, now: () => now });
     const text = io.text();
@@ -77,6 +89,9 @@ describe("frosty ls", () => {
     expect(text).toContain("Hetzner firewall stayfrosty-old");
     expect(text).toContain("Cloudflare tunnel stayfrosty-gone");
     expect(text).not.toContain("someone-elses");
+    expect(text).toContain("Cloudflare Access application stayfrosty-gone");
+    expect(text).not.toContain("Cloudflare Access application stayfrosty-web1");
+    expect(text).toContain("Cloudflare DNS record CNAME ssh-gone.example.com");
   });
 
   it("formats ages", () => {

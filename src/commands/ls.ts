@@ -22,10 +22,14 @@ export async function runLs(deps: LsDeps): Promise<number> {
   const hetzner = new Hetzner({ token: tokens.hetzner, fetch: deps.fetch, sleep: deps.sleep });
   const cloudflare = new Cloudflare({ token: tokens.cloudflare, fetch: deps.fetch, sleep: deps.sleep });
 
-  const [servers, firewalls, tunnels] = await Promise.all([
+  const [servers, firewalls, tunnels, apps, policies, alerts, records] = await Promise.all([
     hetzner.listServers(MANAGED_SELECTOR),
     hetzner.listFirewalls(MANAGED_SELECTOR),
     cloudflare.listTunnels(config.accountId, { is_deleted: false }),
+    cloudflare.listAccessApps(config.accountId),
+    cloudflare.listAccessPolicies(config.accountId),
+    cloudflare.listNotificationPolicies(config.accountId),
+    cloudflare.listDnsRecords(config.zoneId, { "comment.startswith": "stayfrosty box " }),
   ]);
   const ourTunnels = tunnels.filter((tunnel) => tunnel.name.startsWith(NAME_PREFIX));
 
@@ -63,10 +67,21 @@ export async function runLs(deps: LsDeps): Promise<number> {
       leftovers.push(`Hetzner firewall ${firewall.name}`);
     }
   }
-  for (const tunnel of ourTunnels) {
-    if (!boxNames.has(tunnel.name.slice(NAME_PREFIX.length))) {
-      leftovers.push(`Cloudflare tunnel ${tunnel.name}`);
-    }
+  const orphan = (name: string): boolean => name.startsWith(NAME_PREFIX) && !boxNames.has(name.slice(NAME_PREFIX.length));
+  for (const tunnel of tunnels.filter((t) => orphan(t.name))) {
+    leftovers.push(`Cloudflare tunnel ${tunnel.name}`);
+  }
+  for (const app of apps.filter((a) => orphan(a.name))) {
+    leftovers.push(`Cloudflare Access application ${app.name}`);
+  }
+  for (const policy of policies.filter((p) => orphan(p.name))) {
+    leftovers.push(`Cloudflare Access policy ${policy.name}`);
+  }
+  for (const alert of alerts.filter((a) => orphan(a.name))) {
+    leftovers.push(`Cloudflare notification ${alert.name}`);
+  }
+  for (const record of records.filter((r) => !boxNames.has((r.comment ?? "").slice("stayfrosty box ".length)))) {
+    leftovers.push(`Cloudflare DNS record ${record.type} ${record.name}`);
   }
   if (leftovers.length > 0) {
     io.out("");

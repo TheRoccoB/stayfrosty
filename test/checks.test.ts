@@ -135,8 +135,69 @@ describe("on-box evaluation", () => {
       "### now", String(NOW),
       "### end",
     ].join("\n");
-    const results = evaluateOnBox(parseSections(text), "t1", "ops", "04:00", NOW - 600);
+    const results = evaluateOnBox(parseSections(text), { box: "t1", adminUser: "ops", rebootTime: "04:00", createdAt: NOW - 600, tunnel: false });
     expect(results.filter((r) => !r.ok)).toEqual([]);
     expect(results).toHaveLength(6);
+  });
+});
+
+describe("tunnel token search", () => {
+  it("passes when the token is only where it belongs", async () => {
+    const { evaluateTokenSearch } = await import("../src/checks/token.ts");
+    const ok = "### ps\n0\n### environ\n0\n### files\n600 root /etc/cloudflared/token\n400 cloudflared /run/credentials/cloudflared.service/tunnel-token\n### end\n";
+    expect(evaluateTokenSearch(ok).ok).toBe(true);
+  });
+
+  it("fails on ps, environment, a readable copy, or an unfinished search", async () => {
+    const { evaluateTokenSearch } = await import("../src/checks/token.ts");
+    const bad = "### ps\n1\n### environ\n1\n### files\n644 root /etc/systemd/system/cloudflared.service\n600 root /etc/cloudflared/token\n";
+    const result = evaluateTokenSearch(bad);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("command line");
+    expect(result.detail).toContain("environment");
+    expect(result.detail).toContain("/etc/systemd/system/cloudflared.service (mode 644, owner root)");
+    expect(result.detail).toContain("did not finish");
+  });
+});
+
+describe("edge checks", () => {
+  it("recognizes the Access login, by redirect or by 401", async () => {
+    const { isAccessLogin } = await import("../src/checks/edge.ts");
+    expect(isAccessLogin(302, "https://team.cloudflareaccess.com/cdn-cgi/access/login/ssh-t1.example.com?kid=x", null)).toBe(true);
+    expect(isAccessLogin(401, null, "Bearer realm=x")).toBe(true);
+    expect(isAccessLogin(302, "https://evil.example.com/cdn-cgi/access/login/x", null)).toBe(false);
+    expect(isAccessLogin(200, null, null)).toBe(false);
+  });
+
+  it("finds the box's IP anywhere in the zone, including its IPv6 /64", async () => {
+    const { checkDns } = await import("../src/checks/edge.ts");
+    const records = [
+      { id: "1", type: "CNAME", name: "ssh-t1.example.com", content: "tun.cfargotunnel.com", proxied: true },
+      { id: "2", type: "AAAA", name: "old.example.com", content: "2a01:4f8:c012:766f::5", proxied: false },
+    ];
+    const result = checkDns("t1", records, "ssh-t1.example.com", "tun", "192.0.2.10", "2a01:4f8:c012:766f::/64");
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("AAAA old.example.com");
+    expect(checkDns("t1", records.slice(0, 1), "ssh-t1.example.com", "tun", "192.0.2.10", "2a01:4f8:c012:766f::/64").ok).toBe(true);
+  });
+
+  it("flags an Everyone rule or a bypass decision in Access", async () => {
+    const { checkAccess } = await import("../src/checks/edge.ts");
+    const policy = { id: "p", name: "stayfrosty-t1", decision: "allow", include: [{ email: { email: "me@example.com" } }] };
+    const app = { id: "a", name: "stayfrosty-t1", type: "self_hosted", domain: "ssh-t1.example.com", policies: [{ ...policy, precedence: 1 }] };
+    expect(checkAccess("t1", app, policy, "ssh-t1.example.com", ["me@example.com"]).ok).toBe(true);
+    const open = { ...policy, decision: "bypass", include: [{ everyone: {} }] };
+    const result = checkAccess("t1", { ...app, policies: [{ ...open, precedence: 1 }] }, open, "ssh-t1.example.com", ["me@example.com"]);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("decides bypass");
+    expect(result.detail).toContain("an Everyone rule");
+  });
+
+  it("reports an open window with its age", async () => {
+    const { checkWindowClosed } = await import("../src/checks/edge.ts");
+    const firewall = { id: 1, name: "stayfrosty-t1", labels: { "stayfrosty-window-opened": "1790000000" }, rules: [{ direction: "in" as const, protocol: "tcp", port: "22", source_ips: ["198.51.100.7/32"] }], applied_to: [] };
+    const result = checkWindowClosed("t1", firewall, 1_790_000_000_000 + 30 * 60_000);
+    expect(result.detail).toContain("open for 30 minutes");
+    expect(checkWindowClosed("t1", { ...firewall, rules: [] }, 0).ok).toBe(true);
   });
 });

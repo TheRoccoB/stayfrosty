@@ -1,5 +1,6 @@
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { closeSshMaster, systemSsh, forgetHost, type SshRunner, type SshTarget } from "./box.ts";
+import { closeSshMaster, hostKeyAlias, systemSsh, forgetHost, userSsh, type SshRunner, type SshTarget, type UserSsh } from "./box.ts";
 import { isPublicKey } from "./cloudinit.ts";
 import { Cloudflare } from "./cloudflare.ts";
 import { expandHome, loadConfig, type Config, type Env } from "./config.ts";
@@ -10,6 +11,7 @@ import type { Io } from "./io.ts";
 import { findLaptopIp, type LaptopIp } from "./ip.ts";
 import { shellPasswordCommand, type PasswordCommandRunner } from "./password.ts";
 import { loadTokens } from "./tokens.ts";
+import { findCommand } from "./which.ts";
 
 // Everything a command touches in the outside world, injectable for tests.
 export interface Deps {
@@ -21,7 +23,11 @@ export interface Deps {
   ssh?: SshRunner;
   forgetHost?: (host: string) => Promise<void>;
   closeSsh?: (target: SshTarget) => Promise<void>;
+  userSsh?: UserSsh;
+  // Whether cloudflared on the laptop already holds an Access token for a hostname.
+  hasAccessToken?: (hostname: string) => Promise<boolean>;
   laptopIp?: () => Promise<LaptopIp>;
+  cloudflaredPath?: string | undefined;
   isTty?: boolean;
   runPasswordCommand?: PasswordCommandRunner;
 }
@@ -37,11 +43,15 @@ export interface Context {
   ssh: SshRunner;
   forgetHost: (host: string) => Promise<void>;
   closeSsh: (target: SshTarget) => Promise<void>;
+  userSsh: UserSsh;
+  hasAccessToken: (hostname: string) => Promise<boolean>;
+  fetch: Fetch;
   laptopIp: () => Promise<LaptopIp>;
   isTty: boolean;
   runPasswordCommand: PasswordCommandRunner;
   keyPath: string;
   publicKey: string;
+  cloudflaredPath: string | undefined;
 }
 
 export async function buildContext(deps: Deps): Promise<Context> {
@@ -71,11 +81,15 @@ export async function buildContext(deps: Deps): Promise<Context> {
     ssh: deps.ssh ?? systemSsh(env),
     forgetHost: deps.forgetHost ?? ((host) => forgetHost(host, env)),
     closeSsh: deps.closeSsh ?? ((target) => closeSshMaster(target, env)),
+    userSsh: deps.userSsh ?? userSsh,
+    hasAccessToken: deps.hasAccessToken ?? ((hostname) => cloudflaredHasToken(findCommand("cloudflared", env), hostname)),
+    fetch: fetchImpl,
     laptopIp: deps.laptopIp ?? (() => findLaptopIp(fetchImpl)),
     isTty: deps.isTty ?? (process.stdin.isTTY === true && process.stdout.isTTY === true),
     runPasswordCommand: deps.runPasswordCommand ?? shellPasswordCommand,
     keyPath,
     publicKey,
+    cloudflaredPath: "cloudflaredPath" in deps ? deps.cloudflaredPath : findCommand("cloudflared", env),
   };
 }
 
@@ -93,12 +107,43 @@ export function assertBoxName(box: string | undefined): string {
 }
 
 // During a window frosty reaches the box directly on its public IP.
-export function directTarget(ctx: Context, server: HzServer, family: 4 | 6): SshTarget {
+export function directTarget(ctx: Context, box: string, server: HzServer, family: 4 | 6): SshTarget {
   const host = family === 4 ? server.public_net.ipv4?.ip : ipv6Host(server.public_net.ipv6?.ip);
   if (host === undefined) {
     throw new FrostyError(`Box ${server.name} has no public IPv${family} address.`, "This is a bug in frosty. Please report it.");
   }
-  return { host, user: ctx.config.adminUser, keyPath: ctx.keyPath };
+  return { host, user: ctx.config.adminUser, keyPath: ctx.keyPath, hostKeyAlias: hostKeyAlias(box) };
+}
+
+export function sshHostname(ctx: Context, box: string): string {
+  return `ssh-${box}.${ctx.config.domain}`;
+}
+
+// Through the tunnel and Access. cloudflared on the laptop carries the SSH connection.
+export function tunnelTarget(ctx: Context, box: string): SshTarget {
+  return {
+    ...tunnelTargetBase(ctx, box),
+    proxyCommand: `${requireCloudflared(ctx)} access ssh --hostname %h`,
+  };
+}
+
+export function requireCloudflared(ctx: Context): string {
+  if (ctx.cloudflaredPath === undefined) {
+    throw new FrostyError(
+      "cloudflared is not installed on this laptop, and SSH through the tunnel needs it.",
+      "Install it (macOS: brew install cloudflared; others: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/), then run the command again.",
+    );
+  }
+  return ctx.cloudflaredPath;
+}
+
+function tunnelTargetBase(ctx: Context, box: string): SshTarget {
+  return {
+    host: sshHostname(ctx, box),
+    user: ctx.config.adminUser,
+    keyPath: ctx.keyPath,
+    hostKeyAlias: hostKeyAlias(box),
+  };
 }
 
 // Hetzner reports the box's IPv6 as a /64 network; the box itself answers on ::1 within it.
@@ -107,4 +152,16 @@ export function ipv6Host(network: string | undefined): string | undefined {
     return undefined;
   }
   return network.replace(/\/64$/, "").replace(/::$/, "::1");
+}
+
+// `cloudflared access token` prints a cached, unexpired token and never opens a browser.
+function cloudflaredHasToken(cloudflared: string | undefined, hostname: string): Promise<boolean> {
+  if (cloudflared === undefined) {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    const child = spawn(cloudflared, ["access", "token", `-app=https://${hostname}`], { stdio: "ignore" });
+    child.on("error", () => resolve(false));
+    child.on("close", (code) => resolve(code === 0));
+  });
 }

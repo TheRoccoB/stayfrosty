@@ -1,5 +1,5 @@
 import { runOrFail, type SshRunner, type SshTarget } from "../box.ts";
-import { checkCloudflared } from "./cloudflared.ts";
+import { checkCloudflared, checkConnector } from "./cloudflared.ts";
 import { checkListeners } from "./listeners.ts";
 import { checkSshd } from "./sshd.ts";
 import type { CheckResult } from "./types.ts";
@@ -17,6 +17,7 @@ section apt-config; apt-config dump 2>/dev/null | grep -E '^(Unattended-Upgrade:
 section uu-stamp; stat -c %Y /var/lib/apt/periodic/unattended-upgrades-stamp 2>/dev/null || echo none
 section reboot-required; stat -c %Y /var/run/reboot-required 2>/dev/null || echo none
 section cloudflared; apt-cache policy cloudflared 2>&1 || true
+section connector; systemctl is-active cloudflared.service 2>&1; systemctl is-enabled cloudflared.service 2>&1; stat -c '%a %U' /etc/cloudflared/token 2>&1 || true
 section now; date +%s
 section end
 `;
@@ -43,7 +44,17 @@ export function parseSections(text: string): Map<string, string> {
   return out;
 }
 
-export function evaluateOnBox(sections: Map<string, string>, box: string, adminUser: string, rebootTime: string, createdAt: number | undefined): CheckResult[] {
+export interface OnBoxExpectations {
+  box: string;
+  adminUser: string;
+  rebootTime: string;
+  createdAt: number | undefined;
+  // False until the tunnel is set up (a box mid-way through `new`).
+  tunnel: boolean;
+}
+
+export function evaluateOnBox(sections: Map<string, string>, want: OnBoxExpectations): CheckResult[] {
+  const { box, adminUser, rebootTime, createdAt } = want;
   const get = (key: string): string => sections.get(key) ?? "";
   const now = Number(get("now").trim()) || Math.floor(Date.now() / 1000);
   return [
@@ -56,17 +67,11 @@ export function evaluateOnBox(sections: Map<string, string>, box: string, adminU
     ),
     checkCloudflared(get("cloudflared"), box),
     checkPendingReboot(get("reboot-required"), now, rebootTime),
+    ...(want.tunnel ? [checkConnector(get("connector"), box)] : []),
   ];
 }
 
-export async function runOnBoxChecks(
-  ssh: SshRunner,
-  target: SshTarget,
-  box: string,
-  adminUser: string,
-  rebootTime: string,
-  createdAt: number | undefined,
-): Promise<CheckResult[]> {
+export async function runOnBoxChecks(ssh: SshRunner, target: SshTarget, want: OnBoxExpectations): Promise<CheckResult[]> {
   const output = await runOrFail(ssh, target, "sudo bash -s", "Collecting on-box state", { stdin: GATHER_SCRIPT, timeoutMs: 60_000 });
-  return evaluateOnBox(parseSections(output), box, adminUser, rebootTime, createdAt);
+  return evaluateOnBox(parseSections(output), want);
 }

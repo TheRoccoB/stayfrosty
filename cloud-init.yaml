@@ -63,6 +63,42 @@ write_files:
       Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
       Unattended-Upgrade::Automatic-Reboot-Time "__REBOOT_TIME__";
 
+  # The tunnel connector. It stays inactive until frosty writes the token over SSH. The
+  # token reaches cloudflared as a systemd credential: not on the command line (visible in
+  # ps), not in the environment, and cloudflared runs as an unprivileged dynamic user.
+  - path: /etc/systemd/system/cloudflared.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # Managed by stayfrosty.
+      [Unit]
+      Description=Cloudflare Tunnel (stayfrosty)
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=/etc/cloudflared/token
+
+      [Service]
+      Type=notify
+      DynamicUser=yes
+      LoadCredential=tunnel-token:/etc/cloudflared/token
+      ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run --token-file %d/tunnel-token
+      Restart=always
+      RestartSec=5s
+      TimeoutStartSec=0
+      NoNewPrivileges=yes
+      ProtectSystem=strict
+      ProtectHome=yes
+      PrivateTmp=yes
+      PrivateDevices=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      RestrictSUIDSGID=yes
+      LockPersonality=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
   - path: /usr/local/sbin/stayfrosty-harden
     owner: root:root
     permissions: "0755"
@@ -101,6 +137,9 @@ write_files:
       ufw --force enable
 
       systemctl enable --now unattended-upgrades.service
+
+      # Pick up the cloudflared unit from write_files. frosty enables it once the token exists.
+      systemctl daemon-reload
 
       # With socket activation (Ubuntu 24.04 and later) /run/sshd only exists once ssh.service
       # has started, and sshd -t refuses to run without it.

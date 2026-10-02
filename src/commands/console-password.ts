@@ -1,11 +1,11 @@
-import { assertBoxName, buildContext, directTarget, type Deps } from "../context.ts";
+import { assertBoxName, buildContext, directTarget, tunnelTarget, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { boxSelector } from "../hetzner.ts";
 import { windowSource } from "../ip.ts";
 import { setConsolePassword } from "../password.ts";
 
 // Sets a new console password for the admin user. Needs a terminal or passwordCommand.
-export async function runConsolePassword(deps: Deps, opts: { box: string | undefined; dryRun: boolean }): Promise<number> {
+export async function runConsolePassword(deps: Deps, opts: { box: string | undefined; dryRun: boolean; direct?: boolean }): Promise<number> {
   const box = assertBoxName(opts.box);
   const ctx = await buildContext(deps);
   const server = (await ctx.hetzner.listServers(boxSelector(box)))[0];
@@ -23,7 +23,8 @@ export async function runConsolePassword(deps: Deps, opts: { box: string | undef
     ctx.io.out("Dry run: nothing was changed.");
     return 0;
   }
-  const target = directTarget(ctx, server, windowSource(await ctx.laptopIp()).family);
+  // Normally through the tunnel. --direct uses the box's IP, for an open break-glass window.
+  const target = opts.direct === true ? directTarget(ctx, box, server, windowSource(await ctx.laptopIp()).family) : tunnelTarget(ctx, box);
   await setConsolePassword(ctx, { box, target, user: ctx.config.adminUser, passwordCommand: ctx.config.passwordCommand });
   return 0;
 }
