@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { availableServerTypes, pickLocation, runInit, ubuntuLtsImages } from "../src/commands/init.ts";
+import { availableServerTypes, pickLocation, runInit, soldOutNote, soldOutServerTypes, ubuntuLtsImages } from "../src/commands/init.ts";
 import type { HzImage, HzServerType } from "../src/hetzner.ts";
 import { clearSecretsForTests } from "../src/redact.ts";
 import { FakeHttp, cfFail, cfOk, hzPage, noSleep } from "./fake-http.ts";
@@ -40,7 +40,12 @@ function fakeApis(): FakeHttp {
       { id: 1, name: "fsn1", city: "Falkenstein", country: "DE", network_zone: "eu-central" },
       { id: 2, name: "ash", city: "Ashburn, VA", country: "US", network_zone: "us-east" },
     ]))
-    .on("GET", HZ, "/v1/server_types", hzPage("server_types", [serverType("cx33", "6.00"), serverType("cx23", "4.00"), serverType("old", "1.00", { deprecated: true })]))
+    .on("GET", HZ, "/v1/server_types", hzPage("server_types", [
+      serverType("cx33", "6.00"),
+      serverType("cx23", "4.00"),
+      serverType("old", "1.00", { deprecated: true }),
+      serverType("cheap", "2.00", { locations: [{ id: 1, name: "fsn1", available: false, deprecation: null }] }),
+    ]))
     .on("GET", HZ, "/v1/images", hzPage("images", [image("ubuntu-24.04", "24.04"), image("ubuntu-25.10", "25.10"), image("ubuntu-26.04", "26.04")]))
     .on("GET", HZ, "/v1/ssh_keys", hzPage("ssh_keys", []))
     .on("GET", CF, "/client/v4/zones", (call) => {
@@ -116,6 +121,16 @@ describe("frosty init", () => {
     expect(io.text()).toContain("Dry run: would write");
   });
 
+  it("shows a sold-out type but refuses it", async () => {
+    const http = fakeApis();
+    // domain, emails, alert, user, key, location, then "cheap" (refused) and Enter for the default.
+    const io = new ScriptedIo(["example.com", "me@example.com", "", "", "", "", "cheap", "", "", "", "", ""]);
+    expect(await runInit({ io, dryRun: true, env, fetch: http.fetch, sleep: noSleep })).toBe(0);
+    expect(io.text()).toMatch(/cheap .*sold out in every location/);
+    expect(io.stderr.join("\n")).toContain("cheap is sold out in every location");
+    expect(io.text()).toContain('"serverType": "cx23"');
+  });
+
   it("re-asks for a domain the token cannot see", async () => {
     const http = fakeApis();
     const io = new ScriptedIo(["nope.com", ...DEFAULT_ANSWERS]);
@@ -165,6 +180,21 @@ describe("init helpers", () => {
       serverType("elsewhere", "1.00", { prices: [{ location: "ash", price_monthly: { gross: "1", net: "1" } }] }),
     ];
     expect(availableServerTypes(types, "fsn1").map((t) => t.name)).toEqual(["a", "b"]);
+  });
+
+  it("lists sold-out types with where they are still in stock", () => {
+    const gone = serverType("cx23", "6.49", {
+      locations: [
+        { id: 1, name: "fsn1", available: false, deprecation: null },
+        { id: 2, name: "hel1", available: true, deprecation: null },
+      ],
+    });
+    const everywhere = serverType("cax11", "6.99", { locations: [{ id: 1, name: "fsn1", available: false, deprecation: null }] });
+    const types = [gone, everywhere, serverType("cpx12", "13.49")];
+    expect(soldOutServerTypes(types, "fsn1").map((t) => t.name)).toEqual(["cx23", "cax11"]);
+    expect(soldOutNote(gone, "fsn1")).toBe("sold out here, in stock in hel1");
+    expect(soldOutNote(everywhere, "fsn1")).toBe("sold out in every location");
+    expect(availableServerTypes(types, "fsn1").map((t) => t.name)).toEqual(["cpx12"]);
   });
 
   it("keeps only Ubuntu LTS images, newest first", () => {

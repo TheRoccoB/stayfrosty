@@ -149,20 +149,27 @@ export async function runInit(deps: InitDeps): Promise<number> {
     locations.some((l) => l.name === v) ? undefined : `Pick one of: ${locations.map((l) => l.name).join(", ")}.`,
   );
 
-  const types = availableServerTypes(await hetzner.listServerTypes(), location);
+  const allTypes = await hetzner.listServerTypes();
+  const types = availableServerTypes(allTypes, location);
+  const soldOut = soldOutServerTypes(allTypes, location);
   if (types.length === 0) {
-    throw new FrostyError(`Hetzner offers no server types in ${location} right now.`, "Run frosty init again and pick another location.");
+    throw new FrostyError(`Hetzner has no server types in stock in ${location} right now.`, "Run frosty init again and pick another location.");
   }
   io.out("");
-  io.out(`Server types in ${location}, cheapest first:`);
-  const shown = types.slice(0, 10);
-  for (const line of table([["  NAME", "ARCH", "CPU", "RAM", "DISK", "EUR/MONTH", "TRAFFIC"], ...shown.map((t) => serverTypeRow(t, location))])) {
+  io.out(`Server types in ${location}, cheapest first (sold-out types are listed but cannot be picked):`);
+  const shown = [...types, ...soldOut].sort((a, b) => monthly(a, location) - monthly(b, location) || a.name.localeCompare(b.name)).slice(0, 12);
+  const rows = shown.map((t) => [...serverTypeRow(t, location), soldOut.includes(t) ? soldOutNote(t, location) : ""]);
+  for (const line of table([["  NAME", "ARCH", "CPU", "RAM", "DISK", "EUR/MONTH", "TRAFFIC", ""], ...rows])) {
     io.out(line);
   }
   const typeNames = types.map((t) => t.name);
-  const serverTypeName = await askValid(io, "Server type", previous !== undefined && typeNames.includes(previous.serverType) ? previous.serverType : types[0]?.name, (v) =>
-    typeNames.includes(v) ? undefined : `Pick an available type, e.g. ${typeNames.slice(0, 3).join(", ")}.`,
-  );
+  const serverTypeName = await askValid(io, "Server type", previous !== undefined && typeNames.includes(previous.serverType) ? previous.serverType : types[0]?.name, (v) => {
+    const gone = soldOut.find((t) => t.name === v);
+    if (gone !== undefined) {
+      return `${v} is ${soldOutNote(gone, location)}. Pick a type in stock here, or run frosty init again with another location.`;
+    }
+    return typeNames.includes(v) ? undefined : `Pick an available type, e.g. ${typeNames.slice(0, 3).join(", ")}.`;
+  });
   const serverType = types.find((t) => t.name === serverTypeName) as HzServerType;
 
   const images = ubuntuLtsImages(await hetzner.listSystemImages(serverType.architecture));
@@ -369,6 +376,22 @@ export function availableServerTypes(types: HzServerType[], location: string): H
     return true;
   });
   return priced.sort((a, b) => monthly(a, location) - monthly(b, location) || a.name.localeCompare(b.name));
+}
+
+// Types Hetzner sells here but has no capacity for right now. They come back, so show them.
+export function soldOutServerTypes(types: HzServerType[], location: string): HzServerType[] {
+  return types.filter((t) => {
+    if (isDeprecated(t.deprecated) || isDeprecated(t.deprecation) || !t.prices.some((p) => p.location === location)) {
+      return false;
+    }
+    const here = t.locations?.find((l) => l.name === location);
+    return here !== undefined && here.available === false && !isDeprecated(here.deprecation);
+  });
+}
+
+export function soldOutNote(type: HzServerType, location: string): string {
+  const elsewhere = (type.locations ?? []).filter((l) => l.name !== location && l.available !== false && !isDeprecated(l.deprecation)).map((l) => l.name);
+  return elsewhere.length === 0 ? "sold out in every location" : `sold out here, in stock in ${elsewhere.join(", ")}`;
 }
 
 function monthly(type: HzServerType, location: string): number {
