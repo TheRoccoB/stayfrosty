@@ -103,17 +103,7 @@ export async function runInit(deps: InitDeps): Promise<number> {
   const status = await verifyCloudflareToken(cloudflare, accountId);
   checks.push({ name: "Cloudflare token is active", ok: status.status === "active", detail: `status ${status.status}${status.expires_on === undefined ? "" : `, expires ${status.expires_on}`}` });
 
-  const zoneScope = await cloudflare.firstZones();
-  if (zoneScope.total > 1) {
-    checks.push({
-      name: "Cloudflare token limited to one zone",
-      ok: true,
-      warn: true,
-      detail: `the token can see ${zoneScope.total} zones. Limit its Zone resources to ${domain} only.`,
-    });
-  } else {
-    checks.push({ name: "Cloudflare token limited to one zone", ok: true, detail: "only this zone is visible" });
-  }
+  checks.push(await zoneScopeCheck(cloudflare, zone));
 
   checks.push(await readCheck("Cloudflare DNS (Zone, DNS Write)", async () => `${await cloudflare.countDnsRecords(zone.id)} record(s) readable`));
   checks.push(await readCheck("Cloudflare Tunnel (Account, Cloudflare Tunnel Edit or Write)", async () => `${(await cloudflare.listTunnels(accountId, { is_deleted: false })).length} tunnel(s) readable`));
@@ -248,6 +238,31 @@ export async function runInit(deps: InitDeps): Promise<number> {
     return 1;
   }
   return 0;
+}
+
+// GET /zones lists every zone in the account whatever the token's scope, so it proves
+// nothing. What matters is whether the token can read DNS on another zone (read only).
+async function zoneScopeCheck(cloudflare: Cloudflare, zone: CfZone): Promise<Check> {
+  const name = "Cloudflare token limited to one zone";
+  const others = (await cloudflare.firstZones()).zones.filter((z) => z.id !== zone.id).slice(0, 4);
+  const reachable: string[] = [];
+  for (const other of others) {
+    try {
+      await cloudflare.countDnsRecords(other.id);
+      reachable.push(other.name);
+    } catch (error) {
+      if (!(error instanceof ApiError && (error.status === 401 || error.status === 403))) {
+        throw error;
+      }
+    }
+  }
+  if (reachable.length > 0) {
+    return { name, ok: true, warn: true, detail: `the token can also reach DNS in ${reachable.join(", ")}. Limit its Zone resources to ${zone.name} only.` };
+  }
+  if (others.length === 0) {
+    return { name, ok: true, detail: "no other zones in the account" };
+  }
+  return { name, ok: true, detail: `DNS in other zones is refused (tried ${others.length})` };
 }
 
 async function loadPrevious(path: string, io: Io): Promise<Config | undefined> {

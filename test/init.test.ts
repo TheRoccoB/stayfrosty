@@ -147,6 +147,25 @@ describe("frosty init", () => {
     expect(io.text()).toContain("Access: Apps and Policies");
   });
 
+  it("passes the zone scope when other zones refuse DNS, and warns when one allows it", async () => {
+    const zones = (call: { url: URL }) => {
+      if (call.url.searchParams.get("name") === "example.com") {
+        return cfOk([{ id: "zone1", name: "example.com", status: "active", account: { id: "acc1", name: "acct" } }], { total_count: 1, total_pages: 1 });
+      }
+      return cfOk([{ id: "zone1", name: "example.com" }, { id: "zone2", name: "other.com" }], { total_count: 2, total_pages: 1 });
+    };
+    const scoped = fakeApis().on("GET", CF, "/client/v4/zones", zones).on("GET", CF, "/client/v4/zones/zone2/dns_records", cfFail(403, 10000, "Authentication error"));
+    const io = new ScriptedIo(DEFAULT_ANSWERS);
+    await runInit({ io, dryRun: true, env, fetch: scoped.fetch, sleep: noSleep });
+    expect(io.text()).toMatch(/pass\s+Cloudflare token limited to one zone\s+DNS in other zones is refused \(tried 1\)/);
+    expect(scoped.writes()).toEqual([]);
+
+    const broad = fakeApis().on("GET", CF, "/client/v4/zones", zones).on("GET", CF, "/client/v4/zones/zone2/dns_records", cfOk([], { total_count: 0 }));
+    const io2 = new ScriptedIo(DEFAULT_ANSWERS);
+    await runInit({ io: io2, dryRun: true, env, fetch: broad.fetch, sleep: noSleep });
+    expect(io2.text()).toMatch(/note\s+Cloudflare token limited to one zone\s+the token can also reach DNS in other.com/);
+  });
+
   it("explains missing tokens without calling anything", async () => {
     const http = fakeApis();
     const io = new ScriptedIo([]);
