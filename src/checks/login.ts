@@ -1,4 +1,4 @@
-import type { SshRunner, SshTarget } from "../box.ts";
+import { FRESH_CONNECTION, type SshRunner, type SshTarget } from "../box.ts";
 import { fail, pass, reapplyFix, type CheckResult } from "./types.ts";
 
 // Asks sshd which methods it offers, without offering a key: the "none" method fails and
@@ -14,7 +14,7 @@ export function parseOfferedMethods(stderr: string): string[] | undefined {
 export async function checkOnlyPublickey(ssh: SshRunner, target: SshTarget, box: string): Promise<CheckResult> {
   const name = "sshd offers only public key login";
   const result = await ssh(target, "true", {
-    extraOptions: ["-v", "-o", "PreferredAuthentications=none", "-o", "PubkeyAuthentication=no"],
+    extraOptions: [...FRESH_CONNECTION, "-v", "-o", "PreferredAuthentications=none", "-o", "PubkeyAuthentication=no"],
     timeoutMs: 30_000,
   });
   const methods = parseOfferedMethods(result.stderr);
@@ -29,7 +29,7 @@ export async function checkOnlyPublickey(ssh: SshRunner, target: SshTarget, box:
 
 export async function checkRootRefused(ssh: SshRunner, target: SshTarget, box: string): Promise<CheckResult> {
   const name = "root login is refused";
-  const result = await ssh({ ...target, user: "root" }, "true", { timeoutMs: 30_000 });
+  const result = await ssh({ ...target, user: "root" }, "true", { timeoutMs: 30_000, extraOptions: FRESH_CONNECTION });
   if (result.code === 0) {
     return fail(name, "root logged in with the SSH key", reapplyFix(box));
   }

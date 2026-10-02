@@ -60,7 +60,7 @@ class FakeHetzner {
           id,
           name: body["name"],
           status: "running",
-          created: "",
+          created: new Date().toISOString(),
           labels: body["labels"],
           server_type: { name: body["server_type"] },
           location: { name: body["location"] },
@@ -122,6 +122,7 @@ describe("frosty new and destroy", () => {
     sleep: noSleep,
     now: () => 1_790_000_000_000,
     ssh: box.run,
+    closeSsh: async () => {},
     forgetHost: async (host) => {
       forgotten.push(host);
     },
@@ -217,7 +218,7 @@ describe("frosty new and destroy", () => {
 
   it("fails with the cloud-init log when cloud-init did not finish clean", async () => {
     box.on((call) => (call.command === "sudo cloud-init status --wait --long" ? { code: 1, stdout: "status: error", stderr: "" } : undefined));
-    box.on((call) => (call.command.startsWith("sudo tail") ? { code: 0, stdout: "E: Unable to locate package nope", stderr: "" } : undefined));
+    box.on((call) => (call.command === "sudo cat /var/log/cloud-init-output.log" ? { code: 0, stdout: "ok\nE: Unable to locate package nope\nhost keys", stderr: "" } : undefined));
     const io = new ScriptedIo();
     await expect(runNew(deps(io), { box: "t1", resume: false, dryRun: false })).rejects.toThrow(/Unable to locate package nope/);
   });

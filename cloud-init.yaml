@@ -70,6 +70,7 @@ write_files:
       #!/bin/bash
       # Managed by stayfrosty. Applies what the files above cannot. Safe to run again.
       set -euo pipefail
+      trap 'echo "stayfrosty-harden: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
       export DEBIAN_FRONTEND=noninteractive
 
       # cloudflared from Cloudflare's signed apt repository, so unattended-upgrades updates it.
@@ -101,6 +102,9 @@ write_files:
 
       systemctl enable --now unattended-upgrades.service
 
+      # With socket activation (Ubuntu 24.04 and later) /run/sshd only exists once ssh.service
+      # has started, and sshd -t refuses to run without it.
+      install -d -m 0755 /run/sshd
       sshd -t
       systemctl try-reload-or-restart ssh.service
 

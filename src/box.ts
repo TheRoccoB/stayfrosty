@@ -28,14 +28,21 @@ export interface SshRunOptions {
 
 export type SshRunner = (target: SshTarget, command: string, opts?: SshRunOptions) => Promise<SshResult>;
 
+// Options that make one ssh call open its own connection instead of reusing the shared one.
+export const FRESH_CONNECTION = ["-o", "ControlMaster=no", "-o", "ControlPath=none"];
+
 // frosty keeps its own known_hosts so it never edits ~/.ssh/known_hosts, and so a reused
 // Hetzner IP can be forgotten without touching anything else.
 export function knownHostsPath(env: Env = process.env): string {
   return join(dirname(configPath(env)), "known_hosts");
 }
 
+// ssh keeps the first value it sees for an option, so `extra` goes first to override defaults.
+// Commands share one connection per box (ControlMaster): UFW's `limit 22/tcp` rejects an IP
+// after 6 new connections in 30 seconds, and frosty runs many short commands.
 export function sshArgs(target: SshTarget, env: Env, extra: string[] = []): string[] {
   return [
+    ...extra,
     "-F",
     "/dev/null",
     "-i",
@@ -54,7 +61,12 @@ export function sshArgs(target: SshTarget, env: Env, extra: string[] = []): stri
     "ServerAliveInterval=15",
     "-o",
     "ServerAliveCountMax=4",
-    ...extra,
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    `ControlPath=${join(dirname(configPath(env)), "cm-%C")}`,
+    "-o",
+    "ControlPersist=60",
     "-l",
     target.user,
     target.host,
@@ -101,6 +113,15 @@ export function systemSsh(env: Env = process.env): SshRunner {
     });
 }
 
+// Closes the shared connection, e.g. after a reboot killed the box end of it.
+export function closeSshMaster(target: SshTarget, env: Env = process.env): Promise<void> {
+  return new Promise((resolve) => {
+    const child = spawn("ssh", [...sshArgs(target, env), "-O", "exit"], { stdio: "ignore" });
+    child.on("error", () => resolve());
+    child.on("close", () => resolve());
+  });
+}
+
 // Forgets a host key, used when Hetzner hands a reused IP to a new box.
 export function forgetHost(host: string, env: Env = process.env): Promise<void> {
   return new Promise((resolve) => {
@@ -137,7 +158,7 @@ export async function waitForSsh(opts: {
   const deadline = opts.now() + opts.timeoutMs;
   let last = "";
   for (;;) {
-    const result = await opts.ssh(opts.target, "true", { timeoutMs: 20_000 });
+    const result = await opts.ssh(opts.target, "true", { timeoutMs: 20_000, extraOptions: FRESH_CONNECTION });
     if (result.code === 0) {
       return;
     }
@@ -155,6 +176,7 @@ export async function waitForSsh(opts: {
       );
     }
     opts.onWait?.(last);
-    await opts.sleep(5000);
+    // Slower than UFW's limit of 6 new connections per 30 seconds, so polling cannot lock us out.
+    await opts.sleep(10_000);
   }
 }

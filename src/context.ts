@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { systemSsh, forgetHost, type SshRunner, type SshTarget } from "./box.ts";
+import { closeSshMaster, systemSsh, forgetHost, type SshRunner, type SshTarget } from "./box.ts";
 import { isPublicKey } from "./cloudinit.ts";
 import { Cloudflare } from "./cloudflare.ts";
 import { expandHome, loadConfig, type Config, type Env } from "./config.ts";
@@ -20,6 +20,7 @@ export interface Deps {
   now?: () => number;
   ssh?: SshRunner;
   forgetHost?: (host: string) => Promise<void>;
+  closeSsh?: (target: SshTarget) => Promise<void>;
   laptopIp?: () => Promise<LaptopIp>;
   isTty?: boolean;
   runPasswordCommand?: PasswordCommandRunner;
@@ -35,6 +36,7 @@ export interface Context {
   now: () => number;
   ssh: SshRunner;
   forgetHost: (host: string) => Promise<void>;
+  closeSsh: (target: SshTarget) => Promise<void>;
   laptopIp: () => Promise<LaptopIp>;
   isTty: boolean;
   runPasswordCommand: PasswordCommandRunner;
@@ -68,6 +70,7 @@ export async function buildContext(deps: Deps): Promise<Context> {
     now: deps.now ?? Date.now,
     ssh: deps.ssh ?? systemSsh(env),
     forgetHost: deps.forgetHost ?? ((host) => forgetHost(host, env)),
+    closeSsh: deps.closeSsh ?? ((target) => closeSshMaster(target, env)),
     laptopIp: deps.laptopIp ?? (() => findLaptopIp(fetchImpl)),
     isTty: deps.isTty ?? (process.stdin.isTTY === true && process.stdout.isTTY === true),
     runPasswordCommand: deps.runPasswordCommand ?? shellPasswordCommand,

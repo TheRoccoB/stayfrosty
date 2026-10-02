@@ -50,3 +50,18 @@ describe("laptop IP", () => {
     expect(ipv6Host(undefined)).toBeUndefined();
   });
 });
+
+describe("cloud-init failure excerpt", () => {
+  it("shows the lines before the first failure, not the host keys printed after it", async () => {
+    const { failureExcerpt } = await import("../src/commands/new.ts");
+    const log = ["apt stuff", "Missing privilege separation directory: /run/sshd", "stayfrosty-harden: failed at line 40: sshd -t", "WARNING: Failed to run module scripts_user", "randomart"].join("\n");
+    const excerpt = failureExcerpt(log, 2);
+    expect(excerpt).toContain("Missing privilege separation directory");
+    expect(excerpt).not.toContain("randomart");
+  });
+
+  it("falls back to the tail when there is no marker", async () => {
+    const { failureExcerpt } = await import("../src/commands/new.ts");
+    expect(failureExcerpt("a\nb")).toBe("a\nb");
+  });
+});

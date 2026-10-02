@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lastLines, waitForSsh, type SshTarget } from "../box.ts";
+import { FRESH_CONNECTION, lastLines, waitForSsh, type SshTarget } from "../box.ts";
 import { checkOnlyPublickey, checkRootRefused } from "../checks/login.ts";
 import { runOnBoxChecks } from "../checks/onbox.ts";
 import type { CheckResult } from "../checks/types.ts";
@@ -143,7 +143,7 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   }
 
   // M1 ends here; the tunnel, Access and closing the window come in M2.
-  const results = await checkBox(ctx, box, target);
+  const results = await checkBox(ctx, box, target, server);
   printResults(ctx, results);
   const failed = results.filter((r) => !r.ok);
   io.out("");
@@ -194,11 +194,23 @@ async function waitForCloudInit(ctx: Context, target: SshTarget): Promise<void> 
   if (result.code === 0) {
     return;
   }
-  const log = await ctx.ssh(target, "sudo tail -n 40 /var/log/cloud-init-output.log", { timeoutMs: 30_000 });
+  const log = await ctx.ssh(target, "sudo cat /var/log/cloud-init-output.log", { timeoutMs: 30_000 });
   throw new FrostyError(
-    `cloud-init did not finish cleanly (exit ${result.code}).\n${lastLines(result.stdout, 15)}\n--- /var/log/cloud-init-output.log (last 40 lines) ---\n${log.stdout}`,
+    `cloud-init did not finish cleanly (exit ${result.code}).\n${lastLines(result.stdout, 15)}\n--- /var/log/cloud-init-output.log, before the first failure ---\n${failureExcerpt(log.stdout)}`,
     "This means cloud-init.yaml or a package mirror failed. Fix the cause in the repo, then rebuild: frosty destroy <box> && frosty new <box>",
   );
+}
+
+// cloud-init prints host keys after a failed module, so the log's last lines hide the cause.
+// Show the lines leading up to the first failure marker instead.
+export function failureExcerpt(log: string, before = 25): string {
+  const lines = log.split("\n");
+  const marker = /stayfrosty-harden: failed|Failed to run module|Traceback \(most recent call last\)|^E: /;
+  const at = lines.findIndex((line) => marker.test(line));
+  if (at === -1) {
+    return lines.slice(-40).join("\n");
+  }
+  return lines.slice(Math.max(0, at - before), at + 1).join("\n");
 }
 
 // A first-boot upgrade often brings a new kernel. Reboot now rather than at the nightly window,
@@ -211,10 +223,12 @@ async function rebootIfRequired(ctx: Context, target: SshTarget): Promise<void> 
   }
   ctx.io.out("The updates need a reboot. Rebooting now and waiting for SSH.");
   await ctx.ssh(target, "sudo systemctl reboot", { timeoutMs: 30_000 });
+  await ctx.closeSsh(target);
   const deadline = ctx.now() + SSH_UP_TIMEOUT;
   for (;;) {
-    await ctx.sleep(5000);
-    const now = await ctx.ssh(target, "cat /proc/sys/kernel/random/boot_id", { timeoutMs: 20_000 });
+    // Slower than UFW's limit of 6 new connections per 30 seconds.
+    await ctx.sleep(10_000);
+    const now = await ctx.ssh(target, "cat /proc/sys/kernel/random/boot_id", { timeoutMs: 20_000, extraOptions: FRESH_CONNECTION });
     if (now.code === 0 && now.stdout.trim() !== bootId) {
       return;
     }
@@ -224,9 +238,11 @@ async function rebootIfRequired(ctx: Context, target: SshTarget): Promise<void> 
   }
 }
 
-export async function checkBox(ctx: Context, box: string, target: SshTarget): Promise<CheckResult[]> {
+export async function checkBox(ctx: Context, box: string, target: SshTarget, server: HzServer): Promise<CheckResult[]> {
   const login = [await checkRootRefused(ctx.ssh, target, box), await checkOnlyPublickey(ctx.ssh, target, box)];
-  const onBox = await runOnBoxChecks(ctx.ssh, target, box, ctx.config.adminUser, ctx.config.rebootTime);
+  const created = Date.parse(server.created);
+  const createdAt = Number.isFinite(created) ? Math.floor(created / 1000) : undefined;
+  const onBox = await runOnBoxChecks(ctx.ssh, target, box, ctx.config.adminUser, ctx.config.rebootTime, createdAt);
   return [...login, ...onBox];
 }
 

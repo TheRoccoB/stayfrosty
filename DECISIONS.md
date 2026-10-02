@@ -62,3 +62,11 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
 - [M1] Boxes get IPv4 and IPv6. Why: GitHub and many mirrors still need IPv4. Alt: IPv6 only (later).
 - [M1] `destroy` reads the typed name from stdin, so it can be piped. AGENTS.md (M3) will say an agent may do that only for test boxes it created itself. Alt: require a terminal.
 - [M1] Window rules omit `destination_ips`. Why: Hetzner uses it only for outbound rules. Alt: send an empty list.
+
+### Found in the live runs
+
+- [M1] Ubuntu 26.04 starts sshd through socket activation, so `/run/sshd` does not exist until the first connection and `sshd -t` fails without it. The hardening script creates it first. Alt: start ssh.service first.
+- [M1] UFW's `limit 22/tcp` rejects an IP after 6 new connections in 30 seconds, and frosty's own commands tripped it. frosty now shares one SSH connection per box (ControlMaster, 60s persist, socket next to the config), and its connection polls run every 10 seconds instead of 5. The login checks and post-reboot polls open fresh connections on purpose. Alt: `allow 22/tcp` instead of `limit`.
+- [M1] The Hetzner Ubuntu image ships with an unattended-upgrades stamp from the day it was built, and `boot-finished` changes on every boot. The "ran within 2 days" check uses the server's `created` time from the API and ignores stamps older than the box. Alt: a marker file written by cloud-init.
+- [M1] When cloud-init fails, `new` shows the log lines before the first failure marker, not the last lines (which are host keys), and the hardening script reports the failing line through an ERR trap. Alt: dump the whole log.
+- [M1] In fsn1 the cheapest type Hetzner offers today is cpx12, so that is the default `init` picks. Alt: none; it comes from the API.

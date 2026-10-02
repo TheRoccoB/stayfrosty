@@ -1,4 +1,5 @@
-// Command output from a hardened box, used by the check and command tests.
+// Command output from a hardened box (captured from a live Ubuntu 26.04 box), used by the
+// check and command tests.
 
 export const SSHD_T_GOOD = `port 22
 permitrootlogin no
@@ -11,7 +12,7 @@ pubkeyauthentication yes
 
 export const UFW_GOOD = `Status: active
 Logging: on (low)
-Default: deny (incoming), allow (outgoing), deny (routed)
+Default: deny (incoming), allow (outgoing), disabled (routed)
 New profiles: skip
 
 To                         Action      From
@@ -24,6 +25,8 @@ To                         Action      From
 export const SS_GOOD = `udp   UNCONN 0      0         127.0.0.54:53        0.0.0.0:*    users:(("systemd-resolve",pid=500,fd=16))
 udp   UNCONN 0      0      127.0.0.53%lo:53        0.0.0.0:*    users:(("systemd-resolve",pid=500,fd=14))
 udp   UNCONN 0      0    192.0.2.10%eth0:68        0.0.0.0:*    users:(("systemd-network",pid=480,fd=23))
+udp   UNCONN 0      0          127.0.0.1:323       0.0.0.0:*    users:(("chronyd",pid=13903,fd=4))
+udp   UNCONN 0      0              [::1]:323          [::]:*    users:(("chronyd",pid=13903,fd=5))
 tcp   LISTEN 0      4096      127.0.0.54:53        0.0.0.0:*    users:(("systemd-resolve",pid=500,fd=17))
 tcp   LISTEN 0      4096         0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=900,fd=3),("systemd",pid=1,fd=93))
 tcp   LISTEN 0      4096            [::]:22           [::]:*    users:(("sshd",pid=900,fd=4),("systemd",pid=1,fd=94))

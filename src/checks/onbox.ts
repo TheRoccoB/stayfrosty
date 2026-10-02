@@ -15,7 +15,6 @@ section ss; ss -tulnpH 2>&1 || true
 section uu-enabled; systemctl is-enabled unattended-upgrades.service 2>&1 || true
 section apt-config; apt-config dump 2>/dev/null | grep -E '^(Unattended-Upgrade::(Origins-Pattern|Automatic-Reboot)|APT::Periodic::(Unattended-Upgrade|Update-Package-Lists))' || true
 section uu-stamp; stat -c %Y /var/lib/apt/periodic/unattended-upgrades-stamp 2>/dev/null || echo none
-section boot-finished; stat -c %Y /var/lib/cloud/instance/boot-finished 2>/dev/null || echo none
 section reboot-required; stat -c %Y /var/run/reboot-required 2>/dev/null || echo none
 section cloudflared; apt-cache policy cloudflared 2>&1 || true
 section now; date +%s
@@ -44,7 +43,7 @@ export function parseSections(text: string): Map<string, string> {
   return out;
 }
 
-export function evaluateOnBox(sections: Map<string, string>, box: string, adminUser: string, rebootTime: string): CheckResult[] {
+export function evaluateOnBox(sections: Map<string, string>, box: string, adminUser: string, rebootTime: string, createdAt: number | undefined): CheckResult[] {
   const get = (key: string): string => sections.get(key) ?? "";
   const now = Number(get("now").trim()) || Math.floor(Date.now() / 1000);
   return [
@@ -52,7 +51,7 @@ export function evaluateOnBox(sections: Map<string, string>, box: string, adminU
     checkUfw(get("ufw"), box),
     checkListeners(get("ss")),
     checkUnattendedUpgrades(
-      { enabled: get("uu-enabled"), aptConfig: get("apt-config"), stamp: get("uu-stamp"), bootFinished: get("boot-finished"), now },
+      { enabled: get("uu-enabled"), aptConfig: get("apt-config"), stamp: get("uu-stamp"), createdAt, now },
       box,
     ),
     checkCloudflared(get("cloudflared"), box),
@@ -60,7 +59,14 @@ export function evaluateOnBox(sections: Map<string, string>, box: string, adminU
   ];
 }
 
-export async function runOnBoxChecks(ssh: SshRunner, target: SshTarget, box: string, adminUser: string, rebootTime: string): Promise<CheckResult[]> {
+export async function runOnBoxChecks(
+  ssh: SshRunner,
+  target: SshTarget,
+  box: string,
+  adminUser: string,
+  rebootTime: string,
+  createdAt: number | undefined,
+): Promise<CheckResult[]> {
   const output = await runOrFail(ssh, target, "sudo bash -s", "Collecting on-box state", { stdin: GATHER_SCRIPT, timeoutMs: 60_000 });
-  return evaluateOnBox(parseSections(output), box, adminUser, rebootTime);
+  return evaluateOnBox(parseSections(output), box, adminUser, rebootTime, createdAt);
 }

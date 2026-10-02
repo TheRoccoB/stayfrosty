@@ -156,7 +156,7 @@ export async function runInit(deps: InitDeps): Promise<number> {
   io.out("");
   io.out(`Server types in ${location}, cheapest first:`);
   const shown = types.slice(0, 10);
-  for (const line of table([["  NAME", "ARCH", "CPU", "RAM", "DISK", "PER MONTH", "TRAFFIC"], ...shown.map((t) => serverTypeRow(t, location))])) {
+  for (const line of table([["  NAME", "ARCH", "CPU", "RAM", "DISK", "EUR/MONTH", "TRAFFIC"], ...shown.map((t) => serverTypeRow(t, location))])) {
     io.out(line);
   }
   const typeNames = types.map((t) => t.name);

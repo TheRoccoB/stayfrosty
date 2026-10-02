@@ -62,15 +62,19 @@ describe("listeners check", () => {
 });
 
 describe("unattended-upgrades check", () => {
-  const base = { enabled: "enabled", aptConfig: APT_CONFIG_GOOD, stamp: "none", bootFinished: String(NOW - 3600), now: NOW };
+  const base = { enabled: "enabled", aptConfig: APT_CONFIG_GOOD, stamp: "none", createdAt: NOW - 3600, now: NOW };
 
   it("passes a new box that has not run yet", () => {
     expect(checkUnattendedUpgrades(base, "t1")).toMatchObject({ ok: true, detail: "not run yet (new box)" });
   });
 
   it("fails an old box that never ran, or ran long ago", () => {
-    expect(checkUnattendedUpgrades({ ...base, bootFinished: String(NOW - 5 * 86_400) }, "t1").ok).toBe(false);
-    expect(checkUnattendedUpgrades({ ...base, stamp: String(NOW - 3 * 86_400) }, "t1").detail).toContain("last run 3d ago");
+    expect(checkUnattendedUpgrades({ ...base, createdAt: NOW - 5 * 86_400 }, "t1").ok).toBe(false);
+    expect(checkUnattendedUpgrades({ ...base, createdAt: NOW - 10 * 86_400, stamp: String(NOW - 3 * 86_400) }, "t1").detail).toContain("last run 3d ago");
+  });
+
+  it("ignores a stamp baked into the image before the box existed", () => {
+    expect(checkUnattendedUpgrades({ ...base, stamp: String(NOW - 5 * 86_400) }, "t1")).toMatchObject({ ok: true, detail: "not run yet (new box)" });
   });
 
   it("fails without the cloudflared origin or auto reboot", () => {
@@ -126,13 +130,12 @@ describe("on-box evaluation", () => {
       "### uu-enabled", "enabled",
       "### apt-config", APT_CONFIG_GOOD,
       "### uu-stamp", "none",
-      "### boot-finished", String(NOW - 600),
       "### reboot-required", "none",
       "### cloudflared", POLICY_GOOD,
       "### now", String(NOW),
       "### end",
     ].join("\n");
-    const results = evaluateOnBox(parseSections(text), "t1", "ops", "04:00");
+    const results = evaluateOnBox(parseSections(text), "t1", "ops", "04:00", NOW - 600);
     expect(results.filter((r) => !r.ok)).toEqual([]);
     expect(results).toHaveLength(6);
   });

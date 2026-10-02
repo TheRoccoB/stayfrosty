@@ -77,7 +77,6 @@ export function gatherOutput(now = Math.floor(Date.now() / 1000)): string {
     "### uu-enabled", "enabled",
     "### apt-config", APT_CONFIG_GOOD,
     "### uu-stamp", "none",
-    "### boot-finished", String(now - 600),
     "### reboot-required", "none",
     "### cloudflared", POLICY_GOOD,
     "### now", String(now),

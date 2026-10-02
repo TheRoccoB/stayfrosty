@@ -21,7 +21,9 @@ export interface UpdatesInput {
   enabled: string;
   aptConfig: string;
   stamp: string | undefined;
-  bootFinished: string | undefined;
+  // When the box was created, from the Hetzner API. The image ships with stamps from the day
+  // it was built, so a stamp older than the box means it has not run on this box yet.
+  createdAt: number | undefined;
   now: number;
 }
 
@@ -43,11 +45,12 @@ export function checkUnattendedUpgrades(input: UpdatesInput, box: string): Check
   if (!/^Unattended-Upgrade::Automatic-Reboot "true";/m.test(input.aptConfig)) {
     problems.push("automatic reboot is off");
   }
-  const stamp = parseEpoch(input.stamp);
-  const born = parseEpoch(input.bootFinished);
+  const born = input.createdAt;
+  const rawStamp = parseEpoch(input.stamp);
+  const stamp = rawStamp !== undefined && born !== undefined && rawStamp < born ? undefined : rawStamp;
   if (stamp === undefined) {
     if (born === undefined || input.now - born > 2 * DAY) {
-      problems.push("it has never run");
+      problems.push("it has never run on this box");
     }
   } else if (input.now - stamp > 2 * DAY) {
     problems.push(`last run ${ageText(input.now - stamp)} ago`);
