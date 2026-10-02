@@ -42,6 +42,8 @@ describe("frosty new and destroy", () => {
       return userSshResult;
     },
     hasAccessToken: async () => false,
+    authoritativeResolves: async () => true,
+    systemResolves: async () => true,
     cloudflaredPath: "/opt/homebrew/bin/cloudflared",
     laptopIp: async () => ({ ipv4: "198.51.100.7", ipv6: undefined }),
     isTty: true,
@@ -154,6 +156,39 @@ describe("frosty new and destroy", () => {
     await expect(runNew(deps(new ScriptedIo()), { box: "t1", resume: false, dryRun: false })).rejects.toThrow(/window is still open/);
     expect(events).toEqual(["user ssh t1 true"]);
     expect((hz.firewalls[0] as { rules: unknown[] }).rules).toHaveLength(1);
+  });
+
+  it("waits for the zone's nameservers before the laptop looks the name up, and explains a cached miss", async () => {
+    let authoritativeAsks = 0;
+    let clock = 1_790_000_000_000;
+    const order: string[] = [];
+    const io = new ScriptedIo();
+    const run = runNew(
+      deps(io, {
+        now: () => {
+          clock += 10_000;
+          return clock;
+        },
+        authoritativeResolves: async () => {
+          authoritativeAsks += 1;
+          order.push("authoritative");
+          return authoritativeAsks > 2;
+        },
+        systemResolves: async () => {
+          order.push("system");
+          return false;
+        },
+        hasAccessToken: async () => {
+          order.push("cloudflared");
+          return false;
+        },
+      }),
+      { box: "t1", resume: false, dryRun: false },
+    );
+    await expect(run).rejects.toThrow(/cannot resolve it/);
+    expect(order.slice(0, 4)).toEqual(["authoritative", "authoritative", "authoritative", "system"]);
+    expect(order).not.toContain("cloudflared");
+    expect(events).toEqual([]);
   });
 
   it("refuses a DNS record for the SSH hostname that it did not create", async () => {

@@ -222,3 +222,26 @@ export function describeEdge(edge: Edge): string[] {
   }
   return lines;
 }
+
+// A lookup before the record is live gets "no such host", and resolvers (macOS's included)
+// cache that for the zone's negative TTL, 30 minutes on Cloudflare. So nothing on the laptop
+// looks the name up until the zone's own nameservers answer for it.
+export async function waitForDns(ctx: Context, hostname: string): Promise<void> {
+  const deadline = ctx.now() + 2 * 60_000;
+  while (!(await ctx.authoritativeResolves(hostname, ctx.config.domain))) {
+    if (ctx.now() >= deadline) {
+      throw new FrostyError(`Cloudflare's nameservers still do not answer for ${hostname} after 2 minutes.`, "Run the command again with --resume.");
+    }
+    await ctx.sleep(3000);
+  }
+  const systemDeadline = ctx.now() + 60_000;
+  while (!(await ctx.systemResolves(hostname))) {
+    if (ctx.now() >= systemDeadline) {
+      throw new FrostyError(
+        `${hostname} is live, but this laptop still cannot resolve it: an earlier "no such host" answer is cached. The window is still open.`,
+        "Flush the cache (macOS: sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder), or wait up to 30 minutes. Then run: frosty new <box> --resume",
+      );
+    }
+    await ctx.sleep(5000);
+  }
+}

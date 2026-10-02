@@ -7,15 +7,15 @@ export const TOKEN_SEARCH_SCRIPT = `token=$(cat)
 pat() { printf '%s\\n' "$token"; }
 echo "### ps"; ps -eo args | grep -cF -f <(pat) || true
 echo "### environ"; for p in $(pgrep -x cloudflared); do tr '\\0' '\\n' < /proc/$p/environ | grep -cF -f <(pat) || true; done
-echo "### files"; grep -rlsF -f <(pat) /etc /run /var /home /root /tmp /usr/local 2>/dev/null | while IFS= read -r f; do stat -c '%a %U %n' "$f"; done
+echo "### files"; grep -rlsF -f <(pat) /etc /run /var /home /root /tmp /usr/local 2>/dev/null | while IFS= read -r f; do stat -c '%a %U %G %n' "$f"; done
 echo "### end"
 `;
 
-// The places the token is meant to be, and who may own each: frosty's root-only file, and
-// systemd's credential copy, which belongs to the service's dynamic user (named after the unit).
-const ALLOWED: { path: RegExp; owners: string[] }[] = [
-  { path: /^\/etc\/cloudflared\/token$/, owners: ["root"] },
-  { path: /^\/run\/credentials\/cloudflared\.service\/tunnel-token$/, owners: ["root", "cloudflared"] },
+// The two places the token is meant to be: frosty's file (root, 600), and systemd's
+// credential copy (root:root 440, plus an ACL that lets only the service's user read it).
+const ALLOWED: { path: RegExp; modes: string[] }[] = [
+  { path: /^\/etc\/cloudflared\/token$/, modes: ["600"] },
+  { path: /^\/run\/credentials\/cloudflared\.service\/tunnel-token$/, modes: ["400", "440"] },
 ];
 
 export function evaluateTokenSearch(output: string): CheckResult {
@@ -41,12 +41,11 @@ export function evaluateTokenSearch(output: string): CheckResult {
     problems.push("cloudflared has it in its environment");
   }
   for (const entry of sections.get("files") ?? []) {
-    const [mode, owner, ...rest] = entry.split(" ");
+    const [mode, owner, group, ...rest] = entry.split(" ");
     const path = rest.join(" ");
-    const worldReadable = (parseInt(mode ?? "0", 8) & 0o044) !== 0;
     const allowed = ALLOWED.find((a) => a.path.test(path));
-    if (allowed === undefined || worldReadable || !allowed.owners.includes(owner ?? "")) {
-      problems.push(`${path} (mode ${mode}, owner ${owner})`);
+    if (allowed === undefined || !allowed.modes.includes(mode ?? "") || owner !== "root" || group !== "root") {
+      problems.push(`${path} (mode ${mode}, ${owner}:${group})`);
     }
   }
   if (sections.get("end") === undefined) {
@@ -55,7 +54,7 @@ export function evaluateTokenSearch(output: string): CheckResult {
   if (problems.length > 0) {
     return fail(name, problems.join("; "), "Treat the token as leaked: frosty destroy the box (the tunnel and its token go with it) and create it again.");
   }
-  return pass(name, `only in /etc/cloudflared/token (root, 600) and systemd's credential`);
+  return pass(name, "only in /etc/cloudflared/token (root, 600) and systemd's credential (root, 440)");
 }
 
 export async function checkTokenNotExposed(ssh: SshRunner, target: SshTarget, token: string): Promise<CheckResult> {

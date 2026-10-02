@@ -45,7 +45,7 @@ export class FakeBox {
       return ok(gatherOutput());
     }
     if (command.startsWith("sudo bash -c") && command.includes(TOKEN_SEARCH_SCRIPT.split("\n")[0] as string)) {
-      return ok("### ps\n0\n### environ\n0\n### files\n600 root /etc/cloudflared/token\n400 root /run/credentials/cloudflared.service/tunnel-token\n### end\n");
+      return ok("### ps\n0\n### environ\n0\n### files\n600 root root /etc/cloudflared/token\n440 root root /run/credentials/cloudflared.service/tunnel-token\n### end\n");
     }
     if (command.startsWith("sudo passwd -S")) {
       return ok(`ops ${this.passwordState} 2026-10-01 0 99999 7 -1\n`);

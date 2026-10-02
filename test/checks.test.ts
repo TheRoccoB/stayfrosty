@@ -53,6 +53,14 @@ describe("listeners check", () => {
     expect(checkListeners(SS_GOOD).ok).toBe(true);
   });
 
+  it("allows cloudflared's QUIC sockets on ephemeral ports, nothing else of it", () => {
+    // Captured from a live box: 4 QUIC connections to Cloudflare.
+    const quic = `${SS_GOOD}udp UNCONN 0 0 *:58746 *:* users:(("cloudflared",pid=2743,fd=9))\nudp UNCONN 0 0 *:35496 *:* users:(("cloudflared",pid=2743,fd=7))\n`;
+    expect(checkListeners(quic).ok).toBe(true);
+    const metrics = `${SS_GOOD}tcp LISTEN 0 4096 0.0.0.0:20241 0.0.0.0:* users:(("cloudflared",pid=2743,fd=11))\n`;
+    expect(checkListeners(metrics).ok).toBe(false);
+  });
+
   it("reports a published Docker port by process", () => {
     const bad = `${SS_GOOD}tcp   LISTEN 0      4096         0.0.0.0:8080      0.0.0.0:*    users:(("docker-proxy",pid=1200,fd=4))\n`;
     const result = checkListeners(bad);
@@ -144,18 +152,20 @@ describe("on-box evaluation", () => {
 describe("tunnel token search", () => {
   it("passes when the token is only where it belongs", async () => {
     const { evaluateTokenSearch } = await import("../src/checks/token.ts");
-    const ok = "### ps\n0\n### environ\n0\n### files\n600 root /etc/cloudflared/token\n400 cloudflared /run/credentials/cloudflared.service/tunnel-token\n### end\n";
+    // Captured from a live box.
+    const ok = "### ps\n0\n### environ\n0\n### files\n600 root root /etc/cloudflared/token\n440 root root /run/credentials/cloudflared.service/tunnel-token\n### end\n";
     expect(evaluateTokenSearch(ok).ok).toBe(true);
   });
 
   it("fails on ps, environment, a readable copy, or an unfinished search", async () => {
     const { evaluateTokenSearch } = await import("../src/checks/token.ts");
-    const bad = "### ps\n1\n### environ\n1\n### files\n644 root /etc/systemd/system/cloudflared.service\n600 root /etc/cloudflared/token\n";
+    const bad = "### ps\n1\n### environ\n1\n### files\n644 root root /etc/systemd/system/cloudflared.service\n644 root root /etc/cloudflared/token\n";
     const result = evaluateTokenSearch(bad);
     expect(result.ok).toBe(false);
     expect(result.detail).toContain("command line");
     expect(result.detail).toContain("environment");
-    expect(result.detail).toContain("/etc/systemd/system/cloudflared.service (mode 644, owner root)");
+    expect(result.detail).toContain("/etc/systemd/system/cloudflared.service (mode 644, root:root)");
+    expect(result.detail).toContain("/etc/cloudflared/token (mode 644, root:root)");
     expect(result.detail).toContain("did not finish");
   });
 });

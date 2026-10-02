@@ -7,7 +7,7 @@ import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
 import { assertBoxName, buildContext, directTarget, requireCloudflared, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
 import { checkAccess, checkAccessLogin, checkAlert, checkDns, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
 import { checkTokenNotExposed } from "../checks/token.ts";
-import { ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, installConnector, waitForHealthyTunnel } from "../edge.ts";
+import { ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, installConnector, waitForDns, waitForHealthyTunnel } from "../edge.ts";
 import { tildify, writeSshConfig, type SshConfigEntry } from "../sshconfig.ts";
 import { FrostyError } from "../errors.ts";
 import {
@@ -166,6 +166,8 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
 
   // 14. The real path: ssh <box>, through Access. The first login opens a browser.
   const hostname = sshHostname(ctx, box);
+  io.out(`Waiting for ${hostname} to resolve.`);
+  await waitForDns(ctx, hostname);
   if (!(await ctx.hasAccessToken(hostname))) {
     io.out("");
     io.out(`A browser window opens for the Cloudflare Access login to ${hostname}. Log in there to continue.`);

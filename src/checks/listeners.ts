@@ -35,15 +35,19 @@ export function isLoopback(address: string): boolean {
   return address.startsWith("127.") || address === "::1" || address.startsWith("::ffff:127.");
 }
 
-// Sockets every box has on purpose: sshd (or systemd holding ssh.socket) on 22, and the DHCP
-// clients of systemd-networkd. Everything else non-loopback is reported by process, which
-// catches Docker publishing ports that UFW cannot see.
+// Sockets every box has on purpose: sshd (or systemd holding ssh.socket) on 22, the DHCP
+// clients of systemd-networkd, and cloudflared's outbound QUIC connections to Cloudflare,
+// which sit unconnected on ephemeral ports (32768 and up). Everything else non-loopback is
+// reported by process, which catches Docker publishing ports that UFW cannot see.
 function expected(l: Listener): boolean {
   if (l.proto === "tcp" && l.port === 22) {
     return l.processes.length === 0 || l.processes.every((p) => p === "sshd" || p === "systemd" || p === "sshd-session");
   }
   if (l.proto === "udp" && (l.port === 68 || l.port === 546)) {
     return l.processes.every((p) => p.startsWith("systemd-network"));
+  }
+  if (l.proto === "udp" && l.port >= 32768 && l.processes.length > 0 && l.processes.every((p) => p === "cloudflared")) {
+    return true;
   }
   return false;
 }

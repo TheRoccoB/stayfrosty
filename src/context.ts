@@ -4,6 +4,7 @@ import { closeSshMaster, hostKeyAlias, systemSsh, forgetHost, userSsh, type SshR
 import { isPublicKey } from "./cloudinit.ts";
 import { Cloudflare } from "./cloudflare.ts";
 import { expandHome, loadConfig, type Config, type Env } from "./config.ts";
+import { authoritativeResolves, systemResolves } from "./dns.ts";
 import { FrostyError } from "./errors.ts";
 import { Hetzner, type HzServer } from "./hetzner.ts";
 import { realSleep, type Fetch, type Sleep } from "./http.ts";
@@ -26,6 +27,8 @@ export interface Deps {
   userSsh?: UserSsh;
   // Whether cloudflared on the laptop already holds an Access token for a hostname.
   hasAccessToken?: (hostname: string) => Promise<boolean>;
+  authoritativeResolves?: (hostname: string, domain: string) => Promise<boolean>;
+  systemResolves?: (hostname: string) => Promise<boolean>;
   laptopIp?: () => Promise<LaptopIp>;
   cloudflaredPath?: string | undefined;
   isTty?: boolean;
@@ -45,6 +48,8 @@ export interface Context {
   closeSsh: (target: SshTarget) => Promise<void>;
   userSsh: UserSsh;
   hasAccessToken: (hostname: string) => Promise<boolean>;
+  authoritativeResolves: (hostname: string, domain: string) => Promise<boolean>;
+  systemResolves: (hostname: string) => Promise<boolean>;
   fetch: Fetch;
   laptopIp: () => Promise<LaptopIp>;
   isTty: boolean;
@@ -83,6 +88,8 @@ export async function buildContext(deps: Deps): Promise<Context> {
     closeSsh: deps.closeSsh ?? ((target) => closeSshMaster(target, env)),
     userSsh: deps.userSsh ?? userSsh,
     hasAccessToken: deps.hasAccessToken ?? ((hostname) => cloudflaredHasToken(findCommand("cloudflared", env), hostname)),
+    authoritativeResolves: deps.authoritativeResolves ?? authoritativeResolves,
+    systemResolves: deps.systemResolves ?? systemResolves,
     fetch: fetchImpl,
     laptopIp: deps.laptopIp ?? (() => findLaptopIp(fetchImpl)),
     isTty: deps.isTty ?? (process.stdin.isTTY === true && process.stdout.isTTY === true),
