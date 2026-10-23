@@ -204,7 +204,10 @@ export type UserSsh = (host: string, command: string, onStderr: (line: string) =
 // Access login; its messages are passed through so the user sees what to do.
 export const userSsh: UserSsh = (host, command, onStderr, timeoutMs) =>
   new Promise((resolve, reject) => {
-    const child = spawn("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=30", host, command], { stdio: ["ignore", "pipe", "pipe"] });
+    // The connect timeout covers cloudflared waiting for the browser login, so it must be as long as
+    // the whole wait: a 30-second one gave up before the person could log in.
+    const connectTimeout = Math.max(30, Math.ceil(timeoutMs / 1000));
+    const child = spawn("ssh", ["-o", "BatchMode=yes", "-o", `ConnectTimeout=${connectTimeout}`, host, command], { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let partial = "";
