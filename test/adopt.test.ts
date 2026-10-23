@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { knownHostsPath } from "../src/box.ts";
 import { runAdopt, type AdoptOptions } from "../src/commands/adopt.ts";
 import { runDestroy } from "../src/commands/destroy.ts";
+import { runDetachForeign } from "../src/commands/detach-foreign.ts";
 import { runNew } from "../src/commands/new.ts";
 import { runVerify } from "../src/commands/verify.ts";
 import { saveConfig } from "../src/config.ts";
@@ -20,6 +21,8 @@ const PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeFakeFakeFakeFakeFak
 const HOST_FP = "SHA256:rC03+WKxJ6r3tjXgR+DoNWl8wJdQwqaWAASgZMSY+E4";
 const OTHER_FP = "SHA256:AvIeAKW5ylXHzyFk7OpcweuSAKsPbJ3Y8ZuWGBI2HX8";
 const IP = "192.0.2.20";
+// The hardening script carries file contents base64-encoded; decode them to look inside.
+const decodeFiles = (script: string): string => [...script.matchAll(/printf '%s' '([A-Za-z0-9+/=]+)' \| base64 -d/g)].map((m) => Buffer.from(m[1] as string, "base64").toString("utf8")).join("\n");
 // The fake box reports the real clock, so the test runs on it too.
 const NOW = Math.floor(Date.now() / 1000);
 
@@ -51,6 +54,7 @@ describe("frosty adopt", () => {
         { type: "ecdsa-sha2-nistp256", key: "AAAAE2VjZHNh", fingerprint: "SHA256:ecdsaecdsaecdsaecdsaecdsaecdsaecdsaecdsaecd" },
       ];
     },
+    fingerprintOf: async (k) => (k.includes("HostHost") ? HOST_FP : "SHA256:other"),
     hasAccessToken: async () => true,
     authoritativeResolves: async () => true,
     systemResolves: async () => true,
@@ -186,16 +190,39 @@ describe("frosty adopt", () => {
     expect(io.text()).toContain(`Pinned app1's host key ssh-ed25519 ${HOST_FP} (trusted on first use).`);
   });
 
-  it("with a foreign firewall attached, attaches frosty's first, stops, and resumes once it is detached", async () => {
+  it("with a foreign firewall attached: attaches frosty's, pins the key, stops; detach-foreign removes it from this box only; resume needs no --host-key", async () => {
+    hz.firewalls.push({ id: 99, name: "ssh-only", labels: {}, rules: [{ direction: "in", protocol: "tcp", port: "22", source_ips: ["0.0.0.0/0"] }], applied_to: [{ type: "server", server: { id: 7 } }, { type: "server", server: { id: 8 } }] });
     hz.servers[0] = existingServer({ public_net: { ipv4: { ip: IP }, ipv6: null, firewalls: [{ id: 99, status: "applied" }] } });
-    await expect(runAdopt(deps(new ScriptedIo()), opts())).rejects.toThrow(/1 firewall\(s\) frosty did not make \(id 99\)/);
+    hz.servers.push(existingServer({ id: 8, name: "svc1", public_net: { ipv4: { ip: "192.0.2.21" }, ipv6: null, firewalls: [{ id: 99, status: "applied" }] } }));
+    await expect(runAdopt(deps(new ScriptedIo()), opts())).rejects.toMatchObject({ message: expect.stringMatching(/1 firewall\(s\) frosty did not make \(id 99\)/), hint: expect.stringContaining("frosty detach-foreign app1") });
     const net = server()["public_net"] as { firewalls: { id: number }[] };
-    const ours = (hz.firewalls[0] as { id: number }).id;
+    const ours = (hz.firewalls.find((f) => f["name"] === "stayfrosty-app1") as { id: number }).id;
     expect(net.firewalls.map((f) => f.id)).toEqual([99, ours]);
     expect(box.calls).toEqual([]);
-    net.firewalls = net.firewalls.filter((f) => f.id !== 99);
-    const io = new ScriptedIo();
-    expect(await runAdopt(deps(io), opts({ resume: true })), io.text()).toBe(0);
+    expect(readFileSync(knownHostsPath(env), "utf8")).toContain("stayfrosty-app1 ssh-ed25519");
+
+    let io = new ScriptedIo();
+    expect(await runDetachForeign(deps(io), { box: "app1", dryRun: true })).toBe(0);
+    expect(net.firewalls.map((f) => f.id)).toEqual([99, ours]);
+    io = new ScriptedIo();
+    expect(await runDetachForeign(deps(io), { box: "app1", dryRun: false }), io.text()).toBe(0);
+    expect(io.text()).toContain("Detaching firewall ssh-only (id 99) from app1. It stays on 1 other resource(s) and is not deleted.");
+    expect(net.firewalls.map((f) => f.id)).toEqual([ours]);
+    // The other box keeps it, and it still exists.
+    expect((hz.servers[1] as { public_net: { firewalls: { id: number }[] } }).public_net.firewalls.map((f) => f.id)).toEqual([99]);
+    expect(hz.firewalls.some((f) => f["id"] === 99)).toBe(true);
+
+    io = new ScriptedIo();
+    expect(await runAdopt(deps(io), opts({ hostKey: undefined, resume: true })), io.text()).toBe(0);
+  });
+
+  it("detach-foreign refuses until frosty's firewall is attached, and only acts on frosty boxes", async () => {
+    hz.firewalls.push({ id: 99, name: "ssh-only", labels: {}, rules: [], applied_to: [{ type: "server", server: { id: 7 } }] });
+    hz.servers[0] = existingServer({ public_net: { ipv4: { ip: IP }, ipv6: null, firewalls: [{ id: 99, status: "applied" }] } });
+    await expect(runDetachForeign(deps(new ScriptedIo()), { box: "app1", dryRun: false })).rejects.toThrow(/no box named app1/);
+    server()["labels"] = { stayfrosty: "1", "stayfrosty-box": "app1" };
+    await expect(runDetachForeign(deps(new ScriptedIo()), { box: "app1", dryRun: false })).rejects.toThrow(/stayfrosty-app1 is not attached and applied/);
+    expect(hetznerWrites()).toEqual([]);
   });
 
   it("opens the window before scanning when frosty's firewall is already attached and closed", async () => {
@@ -312,6 +339,14 @@ describe("frosty adopt", () => {
     cf.policies.push({ id: "pol-x", name: "stayfrosty-app1", decision: "allow", include: [{ email: { email: "me@example.com" } }, { email: { email: "someone@else.com" } }] });
     await expect(runAdopt(deps(new ScriptedIo()), opts())).rejects.toThrow(/not an allow policy for exactly me@example.com/);
     expect(cf.apps).toEqual([]);
+  });
+
+  it("uses the box's own reboot time from rebootTimes", async () => {
+    const cfg = JSON.parse(readFileSync(join(home, ".config", "stayfrosty", "config.json"), "utf8")) as Record<string, unknown>;
+    writeFileSync(join(home, ".config", "stayfrosty", "config.json"), JSON.stringify({ ...cfg, rebootTimes: { app1: "10:00" } }), { mode: 0o600 });
+    await runAdopt(deps(new ScriptedIo()), opts());
+    const harden = box.calls.find((c) => c.opts.stdin?.includes("stayfrosty-harden-ok") === true);
+    expect(Buffer.from(/Automatic-Reboot-Time[^\n]*/.exec(decodeFiles(harden?.opts.stdin ?? ""))?.[0] ?? "").toString()).toContain('"10:00"');
   });
 
   it("destroy and new both refuse an adopted server", async () => {

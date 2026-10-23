@@ -261,6 +261,35 @@ export class Hetzner {
     return body.actions;
   }
 
+  // Detaches a firewall frosty did not make from one of frosty's boxes, and only while frosty's own
+  // firewall for that box is attached and applied, so the box is never left without one.
+  async detachForeignFirewall(foreignId: number, serverId: number): Promise<HzAction[]> {
+    const server = await this.getServer(serverId);
+    const box = server.labels[LABEL_BOX];
+    const refuse = (why: string): never => {
+      throw new FrostyError(`frosty refused to detach firewall ${foreignId} from ${server.name}: ${why}.`, "Detach it in the Hetzner Cloud Console if you really mean to.");
+    };
+    if (server.labels[LABEL_MANAGED] !== "1" || box === undefined) refuse("the server is not a frosty box");
+    const attached = server.public_net.firewalls ?? [];
+    let ours: HzFirewall | undefined;
+    for (const f of attached.filter((x) => x.status === "applied")) {
+      const fw = await this.getFirewall(f.id);
+      if (fw.name === `stayfrosty-${box as string}` && fw.labels[LABEL_MANAGED] === "1" && fw.labels[LABEL_BOX] === box) ours = fw;
+    }
+    if (ours === undefined) refuse(`frosty's firewall stayfrosty-${box as string} is not attached and applied to it`);
+    if (foreignId === ours!.id) refuse("that is frosty's own firewall");
+    const foreign = await this.getFirewall(foreignId);
+    const direct = foreign.applied_to.some((t) => t.type === "server" && t.server?.id === serverId);
+    if (!direct) refuse(attached.some((f) => f.id === foreignId) ? "it is applied by a label selector, not to the server directly" : "it is not attached to that server");
+    const body = await this.request<{ actions: HzAction[] }>(
+      "POST",
+      `/firewalls/${foreignId}/actions/remove_from_resources`,
+      { remove_from: [{ type: "server", server: { id: serverId } }] },
+      { name: foreign.name, rules: foreign.rules, applied_to: foreign.applied_to },
+    );
+    return body.actions;
+  }
+
   async deleteFirewall(id: number): Promise<void> {
     const live = await this.ourFirewall(id);
     await this.request<unknown>("DELETE", `/firewalls/${id}`, undefined, { name: live.name, rules: live.rules, applied_to: live.applied_to });

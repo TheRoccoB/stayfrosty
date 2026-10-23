@@ -15,6 +15,9 @@ export interface Config {
   serverType: string;
   image: string;
   rebootTime: string;
+  // Per-box reboot times (box local time, which is UTC on Hetzner's images), so boxes that depend on
+  // each other never reboot together. Boxes not listed use rebootTime.
+  rebootTimes?: Record<string, string>;
   accessSessionDuration: string;
   passwordCommand?: string;
   // Optional JSON-lines logs of every API write (see changelog.ts). Absolute paths.
@@ -118,6 +121,18 @@ export function validateConfig(value: unknown): string[] {
   if (rebootTime !== undefined && !isRebootTime(rebootTime)) {
     problems.push(`rebootTime "${rebootTime}" must look like 04:00`);
   }
+  const rebootTimes = c["rebootTimes"];
+  if (rebootTimes !== undefined) {
+    if (rebootTimes === null || typeof rebootTimes !== "object" || Array.isArray(rebootTimes)) {
+      problems.push("rebootTimes must be an object of box name to HH:MM");
+    } else {
+      for (const [box, time] of Object.entries(rebootTimes as Record<string, unknown>)) {
+        if (!/^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$/.test(box) || typeof time !== "string" || !isRebootTime(time)) {
+          problems.push(`rebootTimes.${box} must be a box name mapped to a time like 04:00`);
+        }
+      }
+    }
+  }
   const duration = requireString("accessSessionDuration");
   if (duration !== undefined && !isSessionDuration(duration)) {
     problems.push(`accessSessionDuration "${duration}" must look like 24h or 30m`);
@@ -178,4 +193,8 @@ export async function saveConfig(config: Config, env: Env = process.env): Promis
   await chmod(tmp, 0o600);
   await rename(tmp, path);
   return path;
+}
+
+export function rebootTimeFor(config: Pick<Config, "rebootTime" | "rebootTimes">, box: string): string {
+  return config.rebootTimes?.[box] ?? config.rebootTime;
 }

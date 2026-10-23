@@ -111,6 +111,17 @@ export class FakeHetzner {
         firewall.applied_to.push(...body.apply_to.map((t) => ({ type: "server", server: { id: t.server.id } })));
         return { status: 201, body: { actions: [done("apply_firewall")] } };
       })
+      .on("POST", HZ, "/v1/firewalls/\\d+/actions/remove_from_resources", (call) => {
+        const id = Number(call.url.pathname.split("/")[3]);
+        const body = call.body as { remove_from: { server: { id: number } }[] };
+        for (const target of body.remove_from) {
+          const server = this.servers.find((x) => x["id"] === target.server.id) as { public_net: { firewalls: { id: number }[] } };
+          server.public_net.firewalls = server.public_net.firewalls.filter((f) => f.id !== id);
+          const firewall = this.firewalls.find((f) => f["id"] === id) as { applied_to: { server?: { id: number } }[] };
+          firewall.applied_to = firewall.applied_to.filter((t) => t.server?.id !== target.server.id);
+        }
+        return { status: 201, body: { actions: [done("remove_firewall")] } };
+      })
       .on("PUT", HZ, "/v1/firewalls/\\d+", (call) => {
         const id = Number(call.url.pathname.split("/")[3]);
         const firewall = this.firewalls.find((f) => f["id"] === id) as Record<string, unknown>;

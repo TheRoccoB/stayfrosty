@@ -6,6 +6,7 @@ import { runInit } from "./commands/init.ts";
 import { runAdopt } from "./commands/adopt.ts";
 import { runConsolePassword } from "./commands/console-password.ts";
 import { runDestroy } from "./commands/destroy.ts";
+import { runDetachForeign } from "./commands/detach-foreign.ts";
 import { runLs } from "./commands/ls.ts";
 import { runNew } from "./commands/new.ts";
 import { runVerify } from "./commands/verify.ts";
@@ -18,6 +19,7 @@ Usage:
   frosty new <box> [--type T] [--location L] [--resume]
   frosty adopt <box> --ip <ip> [--user U] (--host-key SHA256:... | --trust-first-use) [--resume]
   frosty verify (<box> | --all)       check a box again, through the tunnel (changes nothing)
+  frosty detach-foreign <box>         detach other firewalls from an adopted box (keeps frosty's)
   frosty breakglass <box> [--minutes N | --close]
   frosty ls
   frosty ssh-config                   rewrite ~/.ssh/stayfrosty.conf from the APIs
@@ -89,6 +91,8 @@ export async function main(argv: string[], io: Io): Promise<number> {
       );
     case "verify":
       return runVerify({ io }, { box: positionals[1], all: values["all"] === true });
+    case "detach-foreign":
+      return runDetachForeign({ io }, { box: positionals[1], dryRun });
     case "destroy":
       return runDestroy({ io }, { box: positionals[1], dryRun });
     case "console-password":

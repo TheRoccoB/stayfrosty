@@ -63,7 +63,7 @@ export function evaluateOnBox(sections: Map<string, string>, want: OnBoxExpectat
     checkUfw(get("ufw"), box),
     checkListeners(get("ss")),
     checkUnattendedUpgrades(
-      { enabled: get("uu-enabled"), aptConfig: get("apt-config"), stamp: get("uu-stamp"), createdAt, now },
+      { enabled: get("uu-enabled"), aptConfig: get("apt-config"), stamp: get("uu-stamp"), createdAt, now, rebootTime },
       box,
     ),
     checkCloudflared(get("cloudflared"), box),

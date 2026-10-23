@@ -57,6 +57,18 @@ For a server that already exists and cannot be recreated, for example one on a p
 - What it does to a running server: once the window closes all inbound stops, web ports included; UFW is reset; only the admin user can SSH; it may reboot once. The plan printed first (and `--dry-run`) says so.
 - It logs in as `--user` (root by default) only to create the admin user, proves the admin user can log in and sudo, and only then hardens sshd. If anything fails it stops with the old login still working, and `--resume` picks up where it stopped.
 
+## `frosty detach-foreign`
+
+```
+frosty detach-foreign <box> [--dry-run]
+```
+
+When adopt stops because the server has a firewall frosty did not make, this detaches that firewall from this one box, and only while frosty's own firewall is attached and applied, so the box is never left without one. The other firewall is not deleted and stays on any other servers. Then run adopt again with `--resume`.
+
+## Reboot times
+
+`rebootTime` is the default. `rebootTimes` (an object of box name to `HH:MM`, box local time, UTC on Hetzner) gives boxes their own, so boxes that depend on each other never reboot at once. adopt and new write the box's time, and `verify` checks it.
+
 ## Change logs and guards
 
 Set `hetznerChangeLog` and `cloudflareChangeLog` in the config to absolute paths, and frosty appends a JSON line before and after every API write (status and ids only, bodies redacted). frosty only creates, changes or deletes Cloudflare tunnels, Access apps, policies and notifications named `stayfrosty-*`, and DNS records commented `stayfrosty box *`, so a broad token cannot reach anything else through it. It never deletes a server that is adopted or protected.

@@ -2,8 +2,9 @@ import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { isIPv4 } from "node:net";
 import { hardenScript, parseCloudInit, userScript } from "../adoptscript.ts";
-import { FRESH_CONNECTION, fingerprintOf, hostKeyAlias, knownHostsPath, runOrFail, waitForSsh, type ScannedKey, type SshTarget } from "../box.ts";
+import { FRESH_CONNECTION, hostKeyAlias, knownHostsPath, runOrFail, waitForSsh, type ScannedKey, type SshTarget } from "../box.ts";
 import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
+import { rebootTimeFor } from "../config.ts";
 import { assertBoxName, buildContext, requireCloudflared, type Context, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { LABEL_ADOPTED, LABEL_BOX, LABEL_MANAGED, LABEL_WINDOW_OPENED, boxLabels, boxSelector, type HzFirewall, type HzServer } from "../hetzner.ts";
@@ -49,7 +50,7 @@ export async function runAdopt(deps: Deps, opts: AdoptOptions): Promise<number> 
   // 1. Preflight, all reads.
   requireCloudflared(ctx);
   // Parse the template first: a template adopt cannot read stops here, before any change.
-  const values = { adminUser: config.adminUser, sshPublicKey: ctx.publicKey, rebootTime: config.rebootTime };
+  const values = { adminUser: config.adminUser, sshPublicKey: ctx.publicKey, rebootTime: rebootTimeFor(config, box) };
   const plan = parseCloudInit(renderCloudInit(loadTemplate(), values), values);
   const laptop = await ctx.laptopIp();
   if (laptop.ipv4 === undefined) {
@@ -77,7 +78,7 @@ export async function runAdopt(deps: Deps, opts: AdoptOptions): Promise<number> 
   const ourAttached = firewall !== undefined && attached.some((f) => f.id === firewall?.id);
   const others = attached.filter((f) => f.id !== firewall?.id);
   const pin = pinnedKey(ctx, box);
-  if (pin !== undefined && opts.hostKey !== undefined && (await fingerprintOf(pin)) !== opts.hostKey) {
+  if (pin !== undefined && opts.hostKey !== undefined && (await ctx.fingerprintOf(pin)) !== opts.hostKey) {
     throw new FrostyError(
       `frosty already pinned a different host key for ${box} than --host-key ${opts.hostKey}.`,
       `Stop here unless you know why. If the box's key really changed, remove the line starting "${hostKeyAlias(box)} " from ${knownHostsPath(ctx.env)} and run adopt again with --host-key.`,
@@ -125,21 +126,22 @@ export async function runAdopt(deps: Deps, opts: AdoptOptions): Promise<number> 
   // 3. The window. Until now the server may have had no firewall at all, so this narrows it.
   firewall = await openWindow(ctx, box, server, firewall, source.cidr);
 
-  // Hetzner firewalls add up: another firewall's allow rules would open what frosty's closes.
-  // frosty's is attached now, so detaching the others never leaves the server with none.
-  if (others.length > 0) {
-    throw new FrostyError(
-      `${box} has ${others.length} firewall(s) frosty did not make (id ${others.map((f) => f.id).join(", ")}). Their allow rules would add to frosty's.`,
-      `frosty's firewall ${firewall.name} is attached now. Detach the others in the Hetzner Cloud Console (Firewalls), never frosty's, then: frosty adopt ${box} --ip ${ip} --resume`,
-    );
-  }
-
-  // 4. Pin the host key before the first login.
+  // 4. Pin the host key now that it is checked, before anything can stop the run, so a resume
+  // never needs --host-key again.
   if (!pinned && hostKey === undefined) {
     hostKey = await scanHostKey(ctx, ip, opts.hostKey);
   }
   if (hostKey !== undefined) {
     await pinHostKey(ctx, box, hostKey, opts.hostKey !== undefined);
+  }
+
+  // Hetzner firewalls add up: another firewall's allow rules would open what frosty's closes.
+  // frosty's is attached now, so detaching the others never leaves the server with none.
+  if (others.length > 0) {
+    throw new FrostyError(
+      `${box} has ${others.length} firewall(s) frosty did not make (id ${others.map((f) => f.id).join(", ")}). Their allow rules would add to frosty's.`,
+      `frosty's firewall ${firewall.name} is attached now. Detach the others with: frosty detach-foreign ${box}\n(or in the Hetzner Cloud Console, never frosty's), then: frosty adopt ${box} --ip ${ip} --resume`,
+    );
   }
 
   // 5. The admin user, through the login that works today. On a resumed run the old login may

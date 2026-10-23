@@ -4,6 +4,7 @@ import { checkOnlyPublickey, checkRootRefused } from "../checks/login.ts";
 import { runOnBoxChecks } from "../checks/onbox.ts";
 import type { CheckResult } from "../checks/types.ts";
 import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
+import { rebootTimeFor } from "../config.ts";
 import { assertBoxName, buildContext, directTarget, requireCloudflared, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
 import { checkAccess, checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
 import { checkTokenNotExposed } from "../checks/token.ts";
@@ -61,7 +62,7 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
 
   // 1. Preflight.
   requireCloudflared(ctx);
-  const userData = renderCloudInit(loadTemplate(), { adminUser: config.adminUser, sshPublicKey: ctx.publicKey, rebootTime: config.rebootTime });
+  const userData = renderCloudInit(loadTemplate(), { adminUser: config.adminUser, sshPublicKey: ctx.publicKey, rebootTime: rebootTimeFor(config, box) });
   const laptop = await ctx.laptopIp();
   const source = windowSource(laptop);
   const [servers, firewalls] = await Promise.all([hetzner.listServers(boxSelector(box)), hetzner.listFirewalls(boxSelector(box))]);
@@ -364,7 +365,7 @@ export async function checkBox(
   const adopted = Number(server.labels[LABEL_ADOPTED]);
   const born = Math.max(Number.isFinite(created) ? Math.floor(created / 1000) : 0, Number.isFinite(adopted) ? adopted : 0);
   const createdAt = born > 0 ? born : undefined;
-  const onBox = await runOnBoxChecks(ctx.ssh, target, { box, adminUser: ctx.config.adminUser, rebootTime: ctx.config.rebootTime, createdAt, tunnel: opts.tunnel });
+  const onBox = await runOnBoxChecks(ctx.ssh, target, { box, adminUser: ctx.config.adminUser, rebootTime: rebootTimeFor(ctx.config, box), createdAt, tunnel: opts.tunnel });
   if (!opts.tunnel) {
     return [...login, ...onBox];
   }

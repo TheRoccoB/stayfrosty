@@ -171,6 +171,31 @@ describe("client guards", () => {
     await expect(h.updateServerLabels(1, { "stayfrosty-adopted": "1", x: "y" })).resolves.toBeDefined();
   });
 
+  it("Hetzner: detaching a foreign firewall needs frosty's own attached and applied, and never detaches frosty's", async () => {
+    const box = { stayfrosty: "1", "stayfrosty-box": "app1" };
+    hz.firewalls.push(
+      { id: 70, name: "stayfrosty-app1", labels: box, rules: [], applied_to: [{ type: "server", server: { id: 1 } }] },
+      { id: 71, name: "ssh-only", labels: {}, rules: [], applied_to: [{ type: "server", server: { id: 1 } }, { type: "server", server: { id: 3 } }] },
+      { id: 72, name: "by-label", labels: {}, rules: [], applied_to: [{ type: "label_selector" }] },
+    );
+    hz.servers.push(
+      { id: 1, name: "app1", labels: box, public_net: { ipv4: null, ipv6: null, firewalls: [{ id: 70, status: "applied" }, { id: 71, status: "applied" }, { id: 72, status: "applied" }] } },
+      { id: 2, name: "pending", labels: { stayfrosty: "1", "stayfrosty-box": "pending" }, public_net: { ipv4: null, ipv6: null, firewalls: [{ id: 71, status: "applied" }] } },
+      { id: 3, name: "web1", labels: {}, public_net: { ipv4: null, ipv6: null, firewalls: [{ id: 71, status: "applied" }] } },
+    );
+    const h = hetzner();
+    await expect(h.detachForeignFirewall(70, 1)).rejects.toThrow(/that is frosty's own firewall/);
+    await expect(h.detachForeignFirewall(72, 1)).rejects.toThrow(/label selector/);
+    await expect(h.detachForeignFirewall(71, 3)).rejects.toThrow(/not a frosty box/);
+    await expect(h.detachForeignFirewall(71, 2)).rejects.toThrow(/stayfrosty-pending is not attached and applied/);
+    (hz.servers[0] as { public_net: { firewalls: { id: number; status: string }[] } }).public_net.firewalls[0]!.status = "pending";
+    await expect(h.detachForeignFirewall(71, 1)).rejects.toThrow(/stayfrosty-app1 is not attached and applied/);
+    expect(http.writes()).toEqual([]);
+    (hz.servers[0] as { public_net: { firewalls: { id: number; status: string }[] } }).public_net.firewalls[0]!.status = "applied";
+    await expect(h.detachForeignFirewall(71, 1)).resolves.toBeDefined();
+    expect(http.writes().map((c) => c.url.pathname)).toEqual(["/v1/firewalls/71/actions/remove_from_resources"]);
+  });
+
   it("change log: an intent line before each write, a done line after, ids only, no secrets", async () => {
     const log = join(dir, "cf.log");
     await cf(log).createTunnel("acc", "stayfrosty-t1");
