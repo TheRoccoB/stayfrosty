@@ -112,6 +112,10 @@ export class FakeCloudflare {
       .on("GET", "ssh-t1.example.com", "/", () => ({
         status: 302,
         headers: { location: `https://${team}/cdn-cgi/access/login/ssh-t1.example.com?kid=abc&redirect_url=%2F` },
+      }))
+      .on("GET", "ssh-app1.example.com", "/", () => ({
+        status: 302,
+        headers: { location: `https://${team}/cdn-cgi/access/login/ssh-app1.example.com?kid=abc&redirect_url=%2F` },
       }));
   }
 

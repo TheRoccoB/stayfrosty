@@ -11,6 +11,8 @@ export const MANAGED_SELECTOR = `${LABEL_MANAGED}=1`;
 // Firewall label set when a window opens, so its age survives across laptops.
 export const LABEL_WINDOW_OPENED = "stayfrosty-window-opened";
 export const WINDOW_DESCRIPTION = "stayfrosty window";
+// Set on a server frosty adopted rather than created. frosty never deletes or rebuilds those.
+export const LABEL_ADOPTED = "stayfrosty-adopted";
 
 export interface HzServer {
   id: number;
@@ -18,6 +20,7 @@ export interface HzServer {
   status: string;
   created: string;
   labels: Record<string, string>;
+  protection?: { delete: boolean; rebuild: boolean };
   server_type: { name: string };
   location?: { name: string };
   public_net: {
@@ -231,6 +234,17 @@ export class Hetzner {
       public_net: { enable_ipv4: true, enable_ipv6: true },
       start_after_create: true,
     });
+  }
+
+  async updateServerLabels(id: number, labels: Record<string, string>): Promise<HzServer> {
+    const body = await this.request<{ server: HzServer }>("PUT", `/servers/${id}`, { labels });
+    return body.server;
+  }
+
+  // Only ever turns protection on. Turning it off is left to the Hetzner Cloud Console.
+  async protectServer(id: number): Promise<HzAction> {
+    const body = await this.request<{ action: HzAction }>("POST", `/servers/${id}/actions/change_protection`, { delete: true, rebuild: true });
+    return body.action;
   }
 
   async getServer(id: number): Promise<HzServer> {

@@ -96,3 +96,18 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
 - [M2] `destroy` does not touch the 1Password item; frosty never knows where a password went. Alt: a `passwordDeleteCommand`.
 - [M2] Acceptance: `ssh t1` through Access worked after one browser login; the window closed; the box IP answered nothing from the laptop; all 16 checks passed through the tunnel; `destroy` removed all 7 resources and `ls` was empty.
 - [M2] `init`'s zone-scope check no longer counts `GET /zones`: that lists every zone in the account even for a token scoped to one zone (seen live: 9 listed, DNS on the others refused with 403). It now tries a read-only DNS list on up to 4 other zones and warns only if one succeeds. Alt: trust the zone list.
+
+## M4 (adopt) and M3 (verify)
+
+- [M4] adopt renders the same `cloud-init.yaml` and turns it into two shell scripts sent over SSH on stdin: phase 1 (the admin user, as the existing login) and phase 2 (packages, files, runcmd, as the admin user with sudo). Why: one source for new and adopt. Hetzner's rebuild takes no user data, and re-running cloud-init on a live box (clean plus a NoCloud seed) would regenerate host keys and could drop Hetzner's network config. Alt: cloud-init clean and reboot.
+- [M4] adopt's reader accepts only the subset `cloud-init.yaml` uses and fails on anything else (a new top-level key, a non-literal content block, odd paths or package names). A test compares it with PyYAML's reading of the shipped template. Why: a key the reader skipped would be a hardening step adopted boxes silently miss. Alt: a YAML dependency.
+- [M4] File contents and the public key travel base64-encoded inside the scripts, so nothing in them is ever parsed as shell. Alt: heredocs with quoted delimiters.
+- [M4] The admin user is proven (`ssh <admin>@ip sudo -n true`, fresh connection) before phase 2 touches sshd, because phase 2's `AllowUsers` and `PermitRootLogin no` close the old login. Alt: one script.
+- [M4] The host key is checked against `--host-key` with `ssh-keyscan` before any change, then pinned under `stayfrosty-<box>`, and adopt's direct connections use `StrictHostKeyChecking yes`. `--trust-first-use` exists but is named for what it is. Why: unlike a minutes-old box from `new`, an adopted server has been on the internet for a while. Alt: accept-new as in `new`.
+- [M4] adopt turns on delete and rebuild protection and sets `stayfrosty-adopted=<unix seconds>` before anything else. `destroy` refuses adopted servers outright, and `new` refuses them too. frosty only ever turns protection on. Why: these are servers you could not get back. Note: Hetzner protection does not block a rescale; frosty has no rescale call. Alt: let destroy delete them after the typed name.
+- [M4] adopt refuses a server with any firewall frosty did not make. Why: Hetzner firewalls add up, so another firewall's allow rules would undo the deny-all. Alt: merge or detach them.
+- [M4] The box name must equal the Hetzner server name. Alt: rename the server.
+- [M4] For an adopted box, the "unattended-upgrades ran within 2 days" check counts from the adoption time in the label, not the server's creation. Alt: a marker file.
+- [M4] adopt reaches the server on IPv4 only, and needs the laptop to have IPv4. Alt: IPv6 as in `new`.
+- [M3] `verify` runs the same `checkBox` as the end of `new` and `adopt`, through the tunnel, read-only. Two checks were added for every box: frosty's firewall is the only one attached, and an adopted server is still delete and rebuild protected. The token search needs the token, so `verify` skips it. Alt: fetch the token again.
+- [M3] The fix for a drifted box now also names `adopt --resume` for adopted boxes, since `destroy` refuses them.

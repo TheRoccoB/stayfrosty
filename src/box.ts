@@ -16,6 +16,9 @@ export interface SshTarget {
   // The key learned through the window is the one the tunnel path must present.
   hostKeyAlias: string;
   proxyCommand?: string;
+  // The key is already pinned (adopt checks it against a fingerprint first), so an unknown or
+  // different key is refused instead of learned.
+  pinned?: boolean;
 }
 
 export function hostKeyAlias(box: string): string {
@@ -64,7 +67,7 @@ export function sshArgs(target: SshTarget, env: Env, extra: string[] = []): stri
     "-o",
     // First contact is through the window, from one IP, to a box minutes old. After that the
     // key is pinned and the tunnel path must match it.
-    `StrictHostKeyChecking=${target.proxyCommand === undefined ? "accept-new" : "yes"}`,
+    `StrictHostKeyChecking=${target.proxyCommand === undefined && target.pinned !== true ? "accept-new" : "yes"}`,
     "-o",
     `UserKnownHostsFile=${knownHostsPath(env)}`,
     "-o",
@@ -231,3 +234,45 @@ export const userSsh: UserSsh = (host, command, onStderr, timeoutMs) =>
       resolve({ code: code ?? 255, stdout, stderr });
     });
   });
+
+export interface ScannedKey {
+  type: string;
+  key: string;
+  fingerprint: string;
+}
+
+export type KeyScanner = (host: string) => Promise<ScannedKey[]>;
+
+// The box's host keys as it presents them, with their SHA256 fingerprints.
+export const keyScan: KeyScanner = (host) =>
+  new Promise((resolve, reject) => {
+    const scan = spawn("ssh-keyscan", ["-T", "10", "-t", "ed25519,ecdsa,rsa", host], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    scan.stdout.on("data", (chunk: Buffer) => {
+      out += chunk.toString("utf8");
+    });
+    scan.on("error", (error) => reject(new FrostyError(`Could not run ssh-keyscan: ${error.message}`, "Install OpenSSH.")));
+    scan.on("close", async () => {
+      const keys: ScannedKey[] = [];
+      for (const line of out.split("\n")) {
+        const [, type, key] = line.trim().split(/\s+/);
+        if (type !== undefined && key !== undefined && !line.startsWith("#")) {
+          keys.push({ type, key, fingerprint: await fingerprintOf(`${type} ${key}`) });
+        }
+      }
+      resolve(keys);
+    });
+  });
+
+function fingerprintOf(publicKey: string): Promise<string> {
+  return new Promise((resolve) => {
+    const child = spawn("ssh-keygen", ["-l", "-E", "sha256", "-f", "-"], { stdio: ["pipe", "pipe", "ignore"] });
+    let out = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      out += chunk.toString("utf8");
+    });
+    child.on("error", () => resolve(""));
+    child.on("close", () => resolve(out.trim().split(/\s+/)[1] ?? ""));
+    child.stdin.end(`${publicKey}\n`);
+  });
+}

@@ -5,12 +5,13 @@ import { runOnBoxChecks } from "../checks/onbox.ts";
 import type { CheckResult } from "../checks/types.ts";
 import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
 import { assertBoxName, buildContext, directTarget, requireCloudflared, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
-import { checkAccess, checkAccessLogin, checkAlert, checkDns, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
+import { checkAccess, checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
 import { checkTokenNotExposed } from "../checks/token.ts";
 import { ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, installConnector, waitForDns, waitForHealthyTunnel } from "../edge.ts";
 import { tildify, writeSshConfig, type SshConfigEntry } from "../sshconfig.ts";
 import { FrostyError } from "../errors.ts";
 import {
+  LABEL_ADOPTED,
   LABEL_BOX,
   LABEL_MANAGED,
   MANAGED_SELECTOR,
@@ -45,7 +46,7 @@ export function windowRule(cidr: string): HzFirewallRule {
   return { direction: "in", protocol: "tcp", port: "22", source_ips: [cidr], description: WINDOW_DESCRIPTION };
 }
 
-function sameRules(a: HzFirewallRule[], b: HzFirewallRule[]): boolean {
+export function sameRules(a: HzFirewallRule[], b: HzFirewallRule[]): boolean {
   const key = (r: HzFirewallRule): string => `${r.direction}|${r.protocol}|${r.port ?? ""}|${[...(r.source_ips ?? [])].sort().join(",")}`;
   return a.length === b.length && a.map(key).sort().join(";") === b.map(key).sort().join(";");
 }
@@ -66,6 +67,9 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   let server = servers[0];
   let firewall = firewalls[0];
   await refuseForeign(ctx, box, server, firewall);
+  if (server !== undefined && server.labels[LABEL_ADOPTED] !== undefined) {
+    throw new FrostyError(`${box} is an adopted server, not one frosty new created.`, `Re-apply its setup with: frosty adopt ${box} --ip ${server.public_net.ipv4?.ip ?? "<ip>"} --resume`);
+  }
   if ((server !== undefined || firewall !== undefined) && !opts.resume) {
     throw new FrostyError(
       `Box ${box} already exists (${[server === undefined ? undefined : "server", firewall === undefined ? undefined : "firewall"].filter(Boolean).join(" and ")}).`,
@@ -140,6 +144,24 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   await waitForCloudInit(ctx, target);
   await rebootIfRequired(ctx, target);
 
+  return finishBox(ctx, { box, server, firewall, target, resume: opts.resume });
+}
+
+export interface FinishInput {
+  box: string;
+  server: HzServer;
+  firewall: HzFirewall;
+  // The box's IP during the window, as the admin user.
+  target: SshTarget;
+  resume: boolean;
+}
+
+// Steps 6 to 16, shared by new and adopt: console password, tunnel, DNS, Access, alert, SSH
+// config, the real ssh through Access, closing the window, then every check.
+export async function finishBox(ctx: Context, input: FinishInput): Promise<number> {
+  const { io, config } = ctx;
+  const { box, server, firewall, target } = input;
+  const opts = { resume: input.resume };
   // 6. Console password, unless a resumed run already set one.
   if (opts.resume && (await hasPassword(ctx.ssh, target, config.adminUser))) {
     io.out(`Console password for ${config.adminUser} is already set; leaving it. Rotate it with: frosty console-password ${box}`);
@@ -177,7 +199,7 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   if (viaTunnel.code !== 0) {
     throw new FrostyError(
       `ssh ${box} through the tunnel failed (exit ${viaTunnel.code}). The window is still open, so nothing is locked out.`,
-      `If the Access login timed out, run: frosty new ${box} --resume`,
+      `If the Access login timed out, run the same command again with --resume.`,
     );
   }
   io.out(`ssh ${box} works through Cloudflare Access.`);
@@ -285,7 +307,7 @@ export function failureExcerpt(log: string, before = 25): string {
 
 // A first-boot upgrade often brings a new kernel. Reboot now rather than at the nightly window,
 // and tell the reboot apart from the old boot by its boot ID.
-async function rebootIfRequired(ctx: Context, target: SshTarget): Promise<void> {
+export async function rebootIfRequired(ctx: Context, target: SshTarget): Promise<void> {
   const probe = await ctx.ssh(target, "test -f /var/run/reboot-required && cat /proc/sys/kernel/random/boot_id || true", { timeoutMs: 30_000 });
   const bootId = probe.stdout.trim();
   if (bootId.length === 0) {
@@ -312,8 +334,11 @@ async function rebootIfRequired(ctx: Context, target: SshTarget): Promise<void> 
 // closed window; with `token`, a search of the box for the tunnel token.
 export async function checkBox(ctx: Context, box: string, target: SshTarget, server: HzServer, opts: { tunnel: boolean; token?: string }): Promise<CheckResult[]> {
   const login = [await checkRootRefused(ctx.ssh, target, box), await checkOnlyPublickey(ctx.ssh, target, box)];
+  // For an adopted server, its life under frosty starts at adoption, not at its creation.
   const created = Date.parse(server.created);
-  const createdAt = Number.isFinite(created) ? Math.floor(created / 1000) : undefined;
+  const adopted = Number(server.labels[LABEL_ADOPTED]);
+  const born = Math.max(Number.isFinite(created) ? Math.floor(created / 1000) : 0, Number.isFinite(adopted) ? adopted : 0);
+  const createdAt = born > 0 ? born : undefined;
   const onBox = await runOnBoxChecks(ctx.ssh, target, { box, adminUser: ctx.config.adminUser, rebootTime: ctx.config.rebootTime, createdAt, tunnel: opts.tunnel });
   if (!opts.tunnel) {
     return [...login, ...onBox];
@@ -325,6 +350,8 @@ export async function checkBox(ctx: Context, box: string, target: SshTarget, ser
   const app = edge.app === undefined ? undefined : await cloudflare.getAccessApp(config.accountId, edge.app.id);
   const api = [
     checkWindowClosed(box, firewalls[0], ctx.now()),
+    checkOnlyOurFirewall(box, server, firewalls[0]),
+    ...[checkProtected(server)].filter((c): c is CheckResult => c !== undefined),
     checkTunnel(box, edge.tunnel, ingress, hostname),
     checkAccess(box, app, edge.policy, hostname, config.accessEmails),
     checkDns(box, records, hostname, edge.tunnel?.id, server.public_net.ipv4?.ip, server.public_net.ipv6?.ip),

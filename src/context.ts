@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { closeSshMaster, hostKeyAlias, systemSsh, forgetHost, userSsh, type SshRunner, type SshTarget, type UserSsh } from "./box.ts";
+import { closeSshMaster, hostKeyAlias, keyScan, systemSsh, forgetHost, userSsh, type KeyScanner, type SshRunner, type SshTarget, type UserSsh } from "./box.ts";
 import { isPublicKey } from "./cloudinit.ts";
 import { Cloudflare } from "./cloudflare.ts";
 import { expandHome, loadConfig, type Config, type Env } from "./config.ts";
@@ -25,6 +25,7 @@ export interface Deps {
   forgetHost?: (host: string) => Promise<void>;
   closeSsh?: (target: SshTarget) => Promise<void>;
   userSsh?: UserSsh;
+  keyScan?: KeyScanner;
   // Whether cloudflared on the laptop already holds an Access token for a hostname.
   hasAccessToken?: (hostname: string) => Promise<boolean>;
   authoritativeResolves?: (hostname: string, domain: string) => Promise<boolean>;
@@ -47,6 +48,7 @@ export interface Context {
   forgetHost: (host: string) => Promise<void>;
   closeSsh: (target: SshTarget) => Promise<void>;
   userSsh: UserSsh;
+  keyScan: KeyScanner;
   hasAccessToken: (hostname: string) => Promise<boolean>;
   authoritativeResolves: (hostname: string, domain: string) => Promise<boolean>;
   systemResolves: (hostname: string) => Promise<boolean>;
@@ -87,6 +89,7 @@ export async function buildContext(deps: Deps): Promise<Context> {
     forgetHost: deps.forgetHost ?? ((host) => forgetHost(host, env)),
     closeSsh: deps.closeSsh ?? ((target) => closeSshMaster(target, env)),
     userSsh: deps.userSsh ?? userSsh,
+    keyScan: deps.keyScan ?? keyScan,
     hasAccessToken: deps.hasAccessToken ?? ((hostname) => cloudflaredHasToken(findCommand("cloudflared", env), hostname)),
     authoritativeResolves: deps.authoritativeResolves ?? authoritativeResolves,
     systemResolves: deps.systemResolves ?? systemResolves,

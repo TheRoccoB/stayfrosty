@@ -1,7 +1,7 @@
 import type { CfAccessApp, CfAccessPolicy, CfAccessRule, CfDnsRecord, CfIngressRule, CfNotificationPolicy, CfTunnel } from "../cloudflare.ts";
 import { expectedIngress, sameIngress } from "../edge.ts";
-import type { HzFirewall } from "../hetzner.ts";
-import { LABEL_WINDOW_OPENED } from "../hetzner.ts";
+import type { HzFirewall, HzServer } from "../hetzner.ts";
+import { LABEL_ADOPTED, LABEL_WINDOW_OPENED } from "../hetzner.ts";
 import type { Fetch } from "../http.ts";
 import { fail, pass, type CheckResult } from "./types.ts";
 
@@ -24,6 +24,31 @@ export function checkWindowClosed(box: string, firewall: HzFirewall | undefined,
     return fail(name, `a window is open (TCP ${inbound.map((r) => r.port ?? "any").join(", ")} from ${sources}${age})`, `Close it with: frosty new ${box} --resume`);
   }
   return pass(name, "deny all inbound");
+}
+
+// Hetzner firewalls add up, so a second firewall's allow rules would undo frosty's deny-all.
+export function checkOnlyOurFirewall(box: string, server: HzServer, firewall: HzFirewall | undefined): CheckResult {
+  const name = "Box firewall is the only one attached";
+  const attached = server.public_net.firewalls ?? [];
+  const ours = firewall !== undefined && attached.some((f) => f.id === firewall.id && f.status !== "pending");
+  const others = attached.filter((f) => f.id !== firewall?.id);
+  if (!ours || others.length > 0) {
+    const problems = [...(ours ? [] : ["frosty's firewall is not attached"]), ...(others.length > 0 ? [`other firewall(s) attached: id ${others.map((f) => f.id).join(", ")}`] : [])];
+    return fail(name, problems.join("; "), `Detach the others in the Hetzner Cloud Console (Firewalls); attach frosty's with the same command that set up ${box} and --resume.`);
+  }
+  return pass(name, `only ${firewall.name}`);
+}
+
+// An adopted server cannot be recreated (that is why it was adopted), so it must stay protected.
+export function checkProtected(server: HzServer): CheckResult | undefined {
+  if (server.labels[LABEL_ADOPTED] === undefined) {
+    return undefined;
+  }
+  const name = "Adopted server: delete and rebuild protection on";
+  if (server.protection?.delete !== true || server.protection.rebuild !== true) {
+    return fail(name, `delete ${String(server.protection?.delete ?? false)}, rebuild ${String(server.protection?.rebuild ?? false)}`, `Run: frosty adopt ${server.name} --ip ${server.public_net.ipv4?.ip ?? "<ip>"} --resume`);
+  }
+  return pass(name, "delete and rebuild protected");
 }
 
 export function checkTunnel(box: string, tunnel: CfTunnel | undefined, ingress: CfIngressRule[], hostname: string): CheckResult {

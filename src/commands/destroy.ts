@@ -2,7 +2,7 @@ import { hostKeyAlias } from "../box.ts";
 import { assertBoxName, buildContext, type Deps } from "../context.ts";
 import { describeEdge, edgeIsEmpty, findEdge, removeEdge, removeTunnel } from "../edge.ts";
 import { ApiError, FrostyError } from "../errors.ts";
-import { boxSelector } from "../hetzner.ts";
+import { LABEL_ADOPTED, boxSelector } from "../hetzner.ts";
 import { tildify, writeSshConfig } from "../sshconfig.ts";
 import { sshConfigEntries } from "./new.ts";
 
@@ -21,6 +21,14 @@ export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<numb
   if (servers.length === 0 && firewalls.length === 0 && edgeIsEmpty(edge)) {
     io.out(`frosty has nothing named ${box}. Nothing to destroy. See what exists with: frosty ls`);
     return 0;
+  }
+
+  const adopted = servers.filter((s) => s.labels[LABEL_ADOPTED] !== undefined);
+  if (adopted.length > 0) {
+    throw new FrostyError(
+      `${box} is an adopted server. frosty never deletes a server it did not create.`,
+      "Delete it yourself in the Hetzner Cloud Console if you really mean to (turn off its protection first).",
+    );
   }
 
   io.out(`${opts.dryRun ? "Would delete" : "This deletes"}, permanently:`);

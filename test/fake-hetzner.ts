@@ -83,6 +83,29 @@ export class FakeHetzner {
         firewall["rules"] = (call.body as { rules: unknown }).rules;
         return { status: 201, body: { actions: [done("set_firewall_rules")] } };
       })
+      .on("PUT", HZ, "/v1/servers/\\d+", (call) => {
+        const id = Number(call.url.pathname.split("/")[3]);
+        const server = this.servers.find((x) => x["id"] === id) as Record<string, unknown>;
+        server["labels"] = (call.body as { labels: unknown }).labels;
+        return { body: { server } };
+      })
+      .on("POST", HZ, "/v1/servers/\\d+/actions/change_protection", (call) => {
+        const id = Number(call.url.pathname.split("/")[3]);
+        const server = this.servers.find((x) => x["id"] === id) as Record<string, unknown>;
+        server["protection"] = call.body;
+        return { status: 201, body: { action: done("change_protection") } };
+      })
+      .on("POST", HZ, "/v1/firewalls/\\d+/actions/apply_to_resources", (call) => {
+        const id = Number(call.url.pathname.split("/")[3]);
+        const body = call.body as { apply_to: { server: { id: number } }[] };
+        for (const target of body.apply_to) {
+          const server = this.servers.find((x) => x["id"] === target.server.id) as { public_net: { firewalls: unknown[] } };
+          server.public_net.firewalls.push({ id, status: "applied" });
+        }
+        const firewall = this.firewalls.find((f) => f["id"] === id) as { applied_to: unknown[] };
+        firewall.applied_to.push(...body.apply_to.map((t) => ({ type: "server", server: { id: t.server.id } })));
+        return { status: 201, body: { actions: [done("apply_firewall")] } };
+      })
       .on("PUT", HZ, "/v1/firewalls/\\d+", (call) => {
         const id = Number(call.url.pathname.split("/")[3]);
         const firewall = this.firewalls.find((f) => f["id"] === id) as Record<string, unknown>;
