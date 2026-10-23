@@ -2,7 +2,7 @@ import { ApiError, FrostyError } from "./errors.ts";
 import { logDone, summarize, type ChangeLog } from "./changelog.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
 import { redact, registerSecret } from "./redact.ts";
-import { accessUri, boxIngress, bypassPaths, frostyProtected, inZones, publicAppName, routeAppName, validateRoutes, type IngressRule, type Route } from "./routes.ts";
+import { accessUri, boxIngress, bypassPaths, frostyProtected, inZones, publicAppName, routeAppName, validateRouteHostnames, validateRoutes, type IngressRule, type Route } from "./routes.ts";
 
 export const CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4";
 
@@ -345,7 +345,7 @@ export class Cloudflare {
     }
     const domain = spec.sshHostname.slice(`ssh-${box}.`.length);
     const routes = spec.routes.map((r) => r.route);
-    const problems = validateRoutes(box, routes, { domain, appZones: spec.appZones, accessTeam: spec.teamName });
+    const problems = [...validateRoutes(box, routes, { domain, appZones: spec.appZones, accessTeam: spec.teamName }), ...validateRouteHostnames({ [box]: routes })];
     if (problems.length > 0 || spec.appZones.some((z) => inZones(z, [domain]))) {
       refuse(problems.join("; ") || "appZones includes the frosty domain");
     }

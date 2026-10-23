@@ -116,7 +116,8 @@ export async function buildContext(deps: Deps): Promise<Context> {
 const BOX_NAME = /^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$/;
 
 export function assertBoxName(box: string | undefined): string {
-  if (box === undefined || !BOX_NAME.test(box)) {
+  // "bypass" is reserved: stayfrosty-bypass is the shared route bypass policy, not a box's.
+  if (box === undefined || !BOX_NAME.test(box) || box === "bypass") {
     throw new FrostyError(
       `"${box ?? ""}" is not a valid box name.`,
       "Use 1 to 30 lowercase letters, digits and dashes, starting with a letter, e.g.: frosty new web1",

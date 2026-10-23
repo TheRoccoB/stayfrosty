@@ -9,7 +9,7 @@ import { assertBoxName, buildContext, directTarget, requireCloudflared, sshHostn
 import { checkAccess, checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
 import { checkTokenNotExposed } from "../checks/token.ts";
 import { checkRouteAccess, checkRouteMissing, checkRouteOutside, checkRoutePorts } from "../checks/routes.ts";
-import { boxRoutes, edgeName, ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, ingressSpec, installConnector, specIngress, waitForDns, waitForHealthyTunnel } from "../edge.ts";
+import { boxRoutes, ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, ingressSpec, installConnector, specIngress, waitForDns, waitForHealthyTunnel } from "../edge.ts";
 import { tildify, writeSshConfig, type SshConfigEntry } from "../sshconfig.ts";
 import { FrostyError } from "../errors.ts";
 import {
@@ -378,14 +378,15 @@ export async function checkBox(
   const ingress = edge.tunnel === undefined ? [] : await cloudflare.getTunnelIngress(config.accountId, edge.tunnel.id);
   const app = edge.app === undefined ? undefined : await cloudflare.getAccessApp(config.accountId, edge.app.id);
   const routes = boxRoutes(ctx, box);
-  // Route apps re-read one by one: the list may leave out destinations and policies.
+  // Every app re-read one by one: the list may leave out destinations and policies, and the bypass
+  // policy must be on no app but the route bypass apps.
   const listed = routes.length === 0 ? [] : await cloudflare.listAccessApps(config.accountId);
-  const apps = await Promise.all(listed.map((a) => (a.name.startsWith(`${edgeName(box)}:`) ? cloudflare.getAccessApp(config.accountId, a.id) : Promise.resolve(a))));
+  const apps = await Promise.all(listed.map((a) => cloudflare.getAccessApp(config.accountId, a.id)));
   const spec = ingressSpec(ctx, box, apps);
   const routeResults: CheckResult[] = [];
   if (routes.length > 0) {
     const policies = await cloudflare.listAccessPolicies(config.accountId);
-    const ss = await runOrFail(ctx.ssh, target, "ss -tlnpH", "Listing listening sockets");
+    const ss = await runOrFail(ctx.ssh, target, "ss -tulnpH", "Listing listening sockets");
     routeResults.push(checkRoutePorts(routes, ss));
     for (const route of routes) {
       routeResults.push(spec.routes.some((r) => r.route === route) ? checkRouteAccess(box, route, apps, policies, edge.policy?.id) : checkRouteMissing(box, route));

@@ -20,11 +20,15 @@ export interface Route {
 
 const ROUTE_NAME = /^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$/;
 const HOSTNAME = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
-const PREFIX = /^\/([a-z0-9_.-]+\/?)*$/;
+// One or more /segments, each starting with a letter, digit, _ or - (so never . or ..), and an
+// optional trailing slash. Linear: each segment starts at its own /.
+const PREFIX = /^(\/[a-z0-9_-][a-z0-9_.-]*)+\/?$/;
 const SERVICE = /^http:\/\/127\.0\.0\.1:(\d{4,5})$/;
 const TEAM = /^[a-z0-9-]{1,63}$/;
 
-// The first rule for every app hostname: 404 anything a path trick could hide in.
+// The first rule for every app hostname: 404 anything a path trick could hide in. cloudflared
+// matches the decoded path, so `%` here only catches double encoding (%25..); encoded dots and
+// slashes decode to `..` and `//`, which are caught as such.
 export const SUSPICIOUS_PATH = String.raw`(\.\.|//|\\|;|%)`;
 
 export function servicePort(service: string): number | undefined {

@@ -170,3 +170,13 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
   - `probe` answers 200 from the app.
 
   The tunnel's 404 is told apart from the app's by its empty body. From inside, verify checks that each route's port listens on 127.0.0.1 only and that nothing listens on 5432.
+
+### From the review of app routes (adversarial reviewer, 2026-10-23)
+
+- verify lists sockets with `ss -tulnpH`, which has the Netid column the parser expects. With `-tlnpH` the port check could never pass.
+- `route sync` deletes a route's `:public` app once nothing needs a bypass, and its protected app once every protected path is external.
+- An `externalAccess` app is re-read and must only let identified people in: allow policies whose includes are email, email domain, IdP group or organization rules. It must have no everyone, IP or token rules. `sync` and verify print what it lets in. Why: frosty trusts that app's audience for the cloudflared check.
+- frosty won't overwrite tunnel rules for a host that is neither the box's SSH host nor in `appZones`. It stops and names the host.
+- verify also sends `/api%2fsettings`, `/api/public` and `/api/publicx`. Each must get the login, the tunnel's 404, or cloudflared's own 403. The tunnel's 403 is told from the app's because it's neither JSON nor HTML. cloudflared stays current through the on-box check (Cloudflare's apt repo, installed within a day), so `originRequest.access` is supported.
+- DNS order: `route sync`, then the CNAME, then `verify`. Adding the CNAME before verify passes is safe, because both Access and cloudflared's own check are already in front. Without the CNAME, verify says the record is missing.
+- The box name `bypass` is reserved. `ls` attributes `stayfrosty-<box>:<route>` apps to their box and never lists the shared bypass policy as a leftover. Path segments can't be `.` or `..`, and the path pattern is linear.

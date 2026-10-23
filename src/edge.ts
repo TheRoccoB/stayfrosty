@@ -1,5 +1,5 @@
 import { BYPASS_POLICY_NAME, DNS_COMMENT_PREFIX, NAME_PREFIX, isOurBypassPolicy, isOurEmailPolicy, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel, type IngressSpec } from "./cloudflare.ts";
-import { accessUri, boxIngress, bypassPaths, frostyProtected, isRouteAppOf, publicAppName, routeAppName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
+import { accessUri, boxIngress, bypassPaths, frostyProtected, inZones, isRouteAppOf, publicAppName, routeAppName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
 import { runOrFail, type SshTarget } from "./box.ts";
 import { sshHostname, type Context } from "./context.ts";
 import { FrostyError } from "./errors.ts";
@@ -128,6 +128,15 @@ export async function ensureIngress(ctx: Context, box: string, tunnel: CfTunnel)
   const { cloudflare, config, io } = ctx;
   const spec = boxRoutes(ctx, box).length === 0 ? ingressSpec(ctx, box, []) : ingressSpec(ctx, box, await cloudflare.listAccessApps(config.accountId));
   const have = await cloudflare.getTunnelIngress(config.accountId, tunnel.id);
+  // Rules frosty could have written: the SSH host, app hosts in appZones (current or removed
+  // routes), and the catch-all. Anything else came from someone else, and frosty won't overwrite it.
+  const foreign = have.filter((r) => r.hostname !== undefined && r.hostname !== spec.sshHostname && !inZones(r.hostname, spec.appZones));
+  if (foreign.length > 0) {
+    throw new FrostyError(
+      `Tunnel ${tunnel.name} routes ${[...new Set(foreign.map((r) => r.hostname))].join(", ")}, which frosty didn't set up.`,
+      "Remove those rules in the Cloudflare dashboard (Zero Trust, Networks, Tunnels), or add the hostname to appZones and routes, then run the command again.",
+    );
+  }
   if (!sameIngressRules(have, specIngress(spec))) {
     const routes = spec.routes.map((r) => `${r.route.hostname} (${[...r.route.public, ...r.route.protected].length} paths)`);
     io.out(`Setting the tunnel's ingress: ${sshHostname(ctx, box)} to ssh://localhost:22${routes.length > 0 ? `, ${routes.join(", ")}` : ""}, everything else 404.`);
@@ -157,10 +166,16 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
   for (const route of routes) {
     const have = routeApps(apps, box, route);
     for (const [prefix, name] of Object.entries(route.externalAccess ?? {})) {
-      const ext = have.external[prefix];
+      const listedExt = have.external[prefix];
+      const ext = listedExt === undefined ? undefined : await cloudflare.getAccessApp(config.accountId, listedExt.id);
       if (ext === undefined || !appCovers(ext, accessUri(route.hostname, prefix))) {
         throw new FrostyError(`Access app ${name} must exist and cover ${accessUri(route.hostname, prefix)} (externalAccess for ${route.name}).`, "frosty doesn't change that app. Fix it in the Cloudflare dashboard, or take the path out of externalAccess.");
       }
+      const bad = externalPolicyProblems(ext);
+      if (bad.length > 0) {
+        throw new FrostyError(`Access app ${name} doesn't only let identified people in: ${bad.join("; ")}.`, "frosty doesn't change that app. Fix its policies in the Cloudflare dashboard, or take the path out of externalAccess.");
+      }
+      io.out(`Access app ${name} (not frosty's) covers ${accessUri(route.hostname, prefix)} and lets in ${describeIncludes(ext)}.`);
     }
     if (frostyProtected(route).length > 0) {
       const want = frostyProtected(route).map((p) => accessUri(route.hostname, p));
@@ -182,7 +197,7 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
     }
   }
   await ensureIngress(ctx, box, tunnel);
-  const wanted = new Set(routes.flatMap((r) => [routeAppName(box, r), publicAppName(box, r)]));
+  const wanted = new Set(routes.flatMap((r) => [...(frostyProtected(r).length > 0 ? [routeAppName(box, r)] : []), ...(bypassPaths(r).length > 0 ? [publicAppName(box, r)] : [])]));
   for (const app of apps.filter((a) => isRouteAppOf(box, a.name) && !wanted.has(a.name))) {
     io.out(`Deleting Access application ${app.name}: its route is no longer in config.`);
     await cloudflare.deleteAccessApp(config.accountId, app);
@@ -192,6 +207,40 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
 function appUris(app: CfAccessApp): string[] {
   const uris = (app.destinations ?? []).map((d) => d.uri).filter((u): u is string => u !== undefined);
   return uris.length > 0 ? uris : app.domain === undefined ? [] : [app.domain];
+}
+
+// What's wrong with an external app's policies for guarding a protected path: frosty doesn't own
+// it, but it must still only let identified people in (allow, no everyone, IP ranges or tokens).
+export function externalPolicyProblems(app: CfAccessApp): string[] {
+  const problems: string[] = [];
+  const policies = app.policies ?? [];
+  if (policies.length === 0) {
+    problems.push(`${app.name} has no policies`);
+  }
+  for (const p of policies) {
+    if (p.decision !== "allow") {
+      problems.push(`${app.name} policy ${p.name ?? p.id} decides ${p.decision ?? "?"}`);
+    }
+    for (const rule of p.include ?? []) {
+      const kind = Object.keys(rule).join("/");
+      if (!["email", "email_domain", "github-organization", "group", "gsuite", "okta", "azureAD", "saml", "oidc"].includes(kind)) {
+        problems.push(`${app.name} policy ${p.name ?? p.id} includes a ${kind} rule`);
+      }
+    }
+  }
+  return problems;
+}
+
+// "email: 2, github-organization: 1": what an external app lets in, for verify and plan.
+export function describeIncludes(app: CfAccessApp): string {
+  const counts = new Map<string, number>();
+  for (const p of app.policies ?? []) {
+    for (const rule of p.include ?? []) {
+      const kind = Object.keys(rule).join("/");
+      counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    }
+  }
+  return [...counts].map(([k, n]) => `${k}: ${n}`).join(", ") || "nobody";
 }
 
 // An app covers a URI if one of its destinations is that URI or a path prefix of it.

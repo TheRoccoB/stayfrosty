@@ -1,4 +1,4 @@
-import { Cloudflare, NAME_PREFIX, type CfTunnel } from "../cloudflare.ts";
+import { Cloudflare, NAME_PREFIX, type CfTunnel, BYPASS_POLICY_NAME } from "../cloudflare.ts";
 import { loadConfig, type Env } from "../config.ts";
 import { Hetzner, LABEL_BOX, LABEL_WINDOW_OPENED, MANAGED_SELECTOR, serverLocation, type HzFirewall } from "../hetzner.ts";
 import type { Fetch, Sleep } from "../http.ts";
@@ -67,7 +67,9 @@ export async function runLs(deps: LsDeps): Promise<number> {
       leftovers.push(`Hetzner firewall ${firewall.name}`);
     }
   }
-  const orphan = (name: string): boolean => name.startsWith(NAME_PREFIX) && !boxNames.has(name.slice(NAME_PREFIX.length));
+  // stayfrosty-<box>, or a route app stayfrosty-<box>:<route>[:public]. The shared bypass policy
+  // belongs to no box.
+  const orphan = (name: string): boolean => name.startsWith(NAME_PREFIX) && name !== BYPASS_POLICY_NAME && !boxNames.has(name.slice(NAME_PREFIX.length).split(":")[0] as string);
   for (const tunnel of tunnels.filter((t) => orphan(t.name))) {
     leftovers.push(`Cloudflare tunnel ${tunnel.name}`);
   }

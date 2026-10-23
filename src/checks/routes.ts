@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { BYPASS_POLICY_NAME, isOurBypassPolicy, isOurEmailPolicy, type CfAccessApp, type CfAccessPolicy } from "../cloudflare.ts";
-import { appCovers, appMatches, routeApps } from "../edge.ts";
+import { appCovers, appMatches, describeIncludes, externalPolicyProblems, routeApps } from "../edge.ts";
 import { accessUri, bypassPaths, frostyProtected, publicAppName, routeAppName, servicePort, type Route } from "../routes.ts";
 import type { RawGet, RawResponse } from "../rawget.ts";
 import { parseSs, type Listener } from "./listeners.ts";
@@ -9,7 +9,7 @@ import { fail, pass, type CheckResult } from "./types.ts";
 // Checks of a box's app routes (routes.ts). The outside checks send each path exactly as written
 // (no dot-segment cleanup, like curl --path-as-is), with no credentials.
 
-type Answer = "access" | "tunnel-404" | "origin";
+type Answer = "access" | "tunnel-404" | "tunnel-403" | "origin";
 
 export function classify(r: RawResponse, team: string): Answer {
   if (r.status >= 300 && r.status < 400 && r.location !== null) {
@@ -22,8 +22,15 @@ export function classify(r: RawResponse, team: string): Answer {
       // not a URL: falls through to origin
     }
   }
-  // cloudflared's http_status:404 answers with an empty body. Anything else came from the app.
-  return r.status === 404 && r.body.trim() === "" ? "tunnel-404" : "origin";
+  // cloudflared's http_status:404 answers with an empty body, and its own Access check (a protected
+  // rule reached without a token) with a 403 that isn't JSON or HTML. Anything else came from the app.
+  if (r.status === 404 && r.body.trim() === "") {
+    return "tunnel-404";
+  }
+  if (r.status === 403 && !/^\s*[{[<]/.test(r.body)) {
+    return "tunnel-403";
+  }
+  return "origin";
 }
 
 // Paths that try to slip past Access or the ingress allowlist (the-bouncer's list).
@@ -37,6 +44,11 @@ const TRICKS = [
   "/API/settings",
   "/admin%2f..",
   "/api;/settings",
+  // Not under /api to the edge, but cloudflared decodes it to /api/settings: its own check must stop it.
+  "/api%2fsettings",
+  // The bypass is /api/public/... only.
+  "/api/public",
+  "/api/publicx",
 ];
 
 export async function checkRouteOutside(get: RawGet, route: Route, team: string): Promise<CheckResult> {
@@ -47,7 +59,8 @@ export async function checkRouteOutside(get: RawGet, route: Route, team: string)
     try {
       return classify(await get(route.hostname, path), team);
     } catch (error) {
-      return `request failed (${error instanceof Error ? error.message : String(error)})`;
+      const code = (error as NodeJS.ErrnoException).code;
+      return code === "ENOTFOUND" ? "no DNS record yet (add the CNAME from frosty route plan)" : `request failed (${error instanceof Error ? error.message : String(error)})`;
     }
   };
   const expect = async (path: string, ok: Answer[], why: string): Promise<void> => {
@@ -64,7 +77,7 @@ export async function checkRouteOutside(get: RawGet, route: Route, team: string)
     await expect("/api/settings", ["access"], "protected");
   }
   for (const t of TRICKS) {
-    await expect(t, ["access", "tunnel-404"], "path trick");
+    await expect(t, ["access", "tunnel-404", "tunnel-403"], "path trick");
   }
   for (const p of [`/${rand}`, "/install", `${(route.protected[0] ?? route.public[0] ?? "/x").replace(/\/$/, "")}${rand}`]) {
     await expect(p, ["tunnel-404"], "not listed");
@@ -108,6 +121,7 @@ export function checkRouteAccess(box: string, route: Route, apps: CfAccessApp[],
   } else if (have.app !== undefined) {
     problems.push(`${routeAppName(box, route)} exists but covers nothing`);
   }
+  const externals: string[] = [];
   const bp = bypassPaths(route);
   if (bp.length > 0) {
     const want = bp.map((p) => accessUri(route.hostname, p));
@@ -121,6 +135,9 @@ export function checkRouteAccess(box: string, route: Route, apps: CfAccessApp[],
     const ext = have.external[prefix];
     if (ext === undefined || !appCovers(ext, accessUri(route.hostname, prefix))) {
       problems.push(`external app ${appName} doesn't cover ${accessUri(route.hostname, prefix)}`);
+    } else {
+      problems.push(...externalPolicyProblems(ext));
+      externals.push(`${appName} on ${prefix} lets in ${describeIncludes(ext)}`);
     }
   }
   if (bypass !== undefined) {
@@ -133,7 +150,7 @@ export function checkRouteAccess(box: string, route: Route, apps: CfAccessApp[],
   if (problems.length > 0) {
     return fail(name, problems.join("; "), `Run: frosty route sync ${box}`);
   }
-  return pass(name, `${[prot.length > 0 ? routeAppName(box, route) : "", bp.length > 0 ? publicAppName(box, route) : ""].filter((x) => x !== "").join(" and ") || "external apps only"} as configured`);
+  return pass(name, [`${[prot.length > 0 ? routeAppName(box, route) : "", bp.length > 0 ? publicAppName(box, route) : ""].filter((x) => x !== "").join(" and ") || "external apps only"} as configured`, ...externals].join("; "));
 }
 
 // On the box: the app's port listens on 127.0.0.1 only, and nothing listens on Postgres's port.

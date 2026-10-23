@@ -3,7 +3,8 @@ import { BYPASS_POLICY_NAME, Cloudflare } from "../src/cloudflare.ts";
 import { validateConfig } from "../src/config.ts";
 import type { Context } from "../src/context.ts";
 import { syncRoutes } from "../src/edge.ts";
-import { checkRouteAccess, checkRouteOutside, checkRoutePorts } from "../src/checks/routes.ts";
+import { checkRouteAccess, checkRouteOutside, checkRoutePorts, classify } from "../src/checks/routes.ts";
+import { assertBoxName } from "../src/context.ts";
 import type { RawGet } from "../src/rawget.ts";
 import { SUSPICIOUS_PATH, boxIngress, bypassPaths, prefixRegex, routeIngress, validateRoutes, type Route } from "../src/routes.ts";
 import { FakeCloudflare } from "./fake-cloudflare.ts";
@@ -198,8 +199,13 @@ describe("route guards and sync", () => {
     const s = setup([route]);
     const { tunnel } = await seedBox(s);
     await expect(syncRoutes(s.ctx, "svc1", tunnel)).rejects.toThrow(/Access app other-app must exist and cover news.example.net\/admin/);
-    s.fcf.apps.push({ id: "app-other-app", name: "other-app", aud: "b".repeat(64), type: "self_hosted", domain: "other.example.net", destinations: [{ type: "public", uri: "other.example.net" }, { type: "public", uri: "news.example.net/admin" }], policies: [] });
+    s.fcf.policies.push({ id: "pol-other-app", name: "gh-policy", decision: "allow", include: [{ everyone: {} }] });
+    s.fcf.apps.push({ id: "app-other-app", name: "other-app", aud: "b".repeat(64), type: "self_hosted", domain: "other.example.net", destinations: [{ type: "public", uri: "other.example.net" }, { type: "public", uri: "news.example.net/admin" }], policies: [{ id: "pol-other-app", precedence: 1 }] });
+    // An external app that lets everyone in can't guard a protected path.
+    await expect(syncRoutes(s.ctx, "svc1", tunnel)).rejects.toThrow(/includes a everyone rule/);
+    (s.fcf.policies.find((p) => p["id"] === "pol-other-app") as Record<string, unknown>)["include"] = [{ email: { email: "a@b.co" } }, { "github-organization": { name: "example-org" } }];
     await syncRoutes(s.ctx, "svc1", tunnel);
+    expect(s.io.text()).toContain("Access app other-app (not frosty's) covers news.example.net/admin and lets in email: 1, github-organization: 1.");
     const own = s.fcf.apps.find((a) => a["name"] === "stayfrosty-svc1:listmonk") as Record<string, unknown>;
     expect((own["destinations"] as { uri: string }[]).map((d) => d.uri)).toEqual(["news.example.net/api"]);
     const tags = (s.fcf.ingress.get(tunnel.id) as { path?: string; originRequest?: { access: { audTag: string[] } } }[]).filter((r) => r.originRequest !== undefined).map((r) => [r.path, r.originRequest?.access.audTag[0]]);
@@ -278,5 +284,49 @@ describe("route verify checks", () => {
     expect(checkRouteAccess("svc1", listmonk, tampered as never, policies, policy.id).detail).toContain("attached to other app");
     const widened = fcf.apps.map((a) => (a["name"] === "stayfrosty-svc1:listmonk" ? { ...a, destinations: [{ uri: "news.example.net" }] } : a));
     expect(checkRouteAccess("svc1", listmonk, widened as never, policies, policy.id).ok).toBe(false);
+  });
+});
+
+describe("route review fixes", () => {
+  const setup = () => {
+    const http = new FakeHttp();
+    const fcf = new FakeCloudflare(http);
+    const cloudflare = new Cloudflare({ token: "cf-token-0123456789", fetch: http.fetch, sleep: noSleep });
+    const config = { ...sampleConfig, appZones: ["example.net"], accessTeam: "team", routes: { svc1: [listmonk] as Route[] } };
+    const ctx = { cloudflare, config, io: new ScriptedIo() } as unknown as Context;
+    return { http, fcf, cloudflare, config, ctx };
+  };
+
+  it("deletes a bypass app no longer needed, and keeps the protected one", async () => {
+    const s = setup();
+    const tunnel = await s.cloudflare.createTunnel("acc123", "stayfrosty-svc1");
+    await s.cloudflare.createAccessPolicy("acc123", { name: "stayfrosty-svc1", decision: "allow", include: [{ email: { email: "me@example.com" } }] });
+    await syncRoutes(s.ctx, "svc1", tunnel);
+    s.config.routes.svc1 = [{ ...listmonk, public: listmonk.public.filter((p) => p !== "/api/public/") }];
+    await syncRoutes(s.ctx, "svc1", tunnel);
+    expect(s.fcf.apps.map((a) => a["name"]).filter((n) => String(n).startsWith("stayfrosty-svc1:"))).toEqual(["stayfrosty-svc1:listmonk"]);
+  });
+
+  it("won't overwrite tunnel rules for hosts frosty didn't set up", async () => {
+    const s = setup();
+    const tunnel = await s.cloudflare.createTunnel("acc123", "stayfrosty-svc1");
+    await s.cloudflare.createAccessPolicy("acc123", { name: "stayfrosty-svc1", decision: "allow", include: [{ email: { email: "me@example.com" } }] });
+    s.fcf.ingress.set(tunnel.id, [{ hostname: "ssh-svc1.example.com", service: "ssh://localhost:22" }, { hostname: "grafana.example.org", service: "http://127.0.0.1:3000" }, { service: "http_status:404" }]);
+    await expect(syncRoutes(s.ctx, "svc1", tunnel)).rejects.toThrow(/routes grafana.example.org, which frosty didn't set up/);
+  });
+
+  it("tells cloudflared's own 403 from the app's", () => {
+    expect(classify({ status: 403, location: null, body: "Forbidden" }, "team")).toBe("tunnel-403");
+    expect(classify({ status: 403, location: null, body: '{"message":"forbidden"}' }, "team")).toBe("origin");
+    expect(classify({ status: 403, location: null, body: "<html>no</html>" }, "team")).toBe("origin");
+    expect(classify({ status: 404, location: null, body: "" }, "team")).toBe("tunnel-404");
+    expect(classify({ status: 302, location: "https://team.cloudflareaccess.com/cdn-cgi/access/login/x", body: "" }, "team")).toBe("access");
+  });
+
+  it("reserves the box name bypass, and rejects . and .. path segments", () => {
+    expect(() => assertBoxName("bypass")).toThrow(/not a valid box name/);
+    expect(validateRoutes("svc1", [{ ...listmonk, public: ["/a/../b"] }], opts)).not.toEqual([]);
+    expect(validateRoutes("svc1", [{ ...listmonk, public: ["/."] }], opts)).not.toEqual([]);
+    expect(validateRoutes("svc1", [{ ...listmonk, public: ["/public/static.v2/"] }], opts)).toEqual([expect.stringMatching(/probe/)]);
   });
 });
