@@ -196,9 +196,11 @@ export async function finishBox(ctx: Context, input: FinishInput): Promise<numbe
   if (!(await ctx.hasAccessToken(hostname))) {
     io.out("");
     io.out(`A browser window opens for the Cloudflare Access login to ${hostname}. Log in there to continue.`);
-    io.out("(This click is the human in the loop. frosty waits up to 5 minutes.)");
+    io.out("(This click is the human in the loop. frosty waits up to 15 minutes.)");
   }
-  const viaTunnel = await ctx.userSsh(box, "true", (line) => io.err(`  ${line}`), 5 * 60_000);
+  // Long enough for someone called away from the screen; the window stays open meanwhile, for
+  // this laptop's IP only.
+  const viaTunnel = await ctx.userSsh(box, "true", (line) => io.err(`  ${line}`), 15 * 60_000);
   if (viaTunnel.code !== 0) {
     throw new FrostyError(
       `ssh ${box} through the tunnel failed (exit ${viaTunnel.code}). The window is still open, so nothing is locked out.`,
