@@ -17,6 +17,7 @@ It replaces [cloudflared-vps-lockdown](https://github.com/TheRoccoB/cloudflared-
 | M2 | Through the tunnel: Access, DNS, SSH config | done |
 | M3 | `verify`, `breakglass`, `ssh-config` | `verify` done |
 | M4 | `adopt`, full docs, first release | `adopt` done |
+| Extra | `route`: serve a web app through the tunnel (beyond the original scope, optional) | done |
 
 When it is released, it will install from a tagged version, never from `main`, and never with `curl | bash`. Test it yourself, run `verify`, and do not trust some guy on the internet.
 
@@ -64,6 +65,40 @@ frosty detach-foreign <box> [--dry-run]
 ```
 
 When adopt stops because the server has a firewall frosty did not make, this detaches that firewall from this one box, and only while frosty's own firewall is attached and applied, so the box is never left without one. The other firewall is not deleted and stays on any other servers. Then run adopt again with `--resume`.
+
+## `frosty route` (optional)
+
+Serve a web app on a no-front-door box. Some paths are public, and the rest sit behind Access. The app listens on `127.0.0.1` only and is reached through the box's existing tunnel, so no port opens. Every path is listed as `protected` or `public`, and every other path gets a 404 at the tunnel and never reaches the app. On protected paths, cloudflared on the box also checks the Access token itself, so a mistake at the edge still doesn't open them.
+
+```json
+"appZones": ["example.net"],
+"accessTeam": "yourteam",
+"routes": {
+  "box1": [{
+    "name": "app",
+    "hostname": "app.example.net",
+    "service": "http://127.0.0.1:9000",
+    "protected": ["/admin", "/api"],
+    "public": ["/static/", "/hooks/incoming", "/api/public/"],
+    "probe": "/static/ok.txt"
+  }]
+}
+```
+
+- `appZones` lists the zones where route hostnames may live. It never includes frosty's own `domain`.
+- `accessTeam` is your Access team name, as in `<team>.cloudflareaccess.com`.
+- `probe` (optional) is a public path that answers 200 from the app. It lets `verify` tell the app apart from the tunnel's 404.
+
+Two options cover common setups:
+- **A public subpath inside a protected prefix.** Here that's `/api/public/` inside `/api`. frosty gives those paths their own Access app with a bypass policy, and that is the only place it ever uses a bypass.
+- **`externalAccess`.** Map protected prefixes to an Access app you already manage outside frosty, for example `"externalAccess": {"/admin": "my-app", "/api": "my-app"}`. frosty only reads that app. It must cover those paths and may only let identified people in: no everyone, IP-range or service-token rules. Map **every** protected prefix of a hostname to the same app (frosty enforces this). Two Access apps on one hostname fight over the same login cookie, and a single-page app that calls its API from the browser breaks.
+
+Commands:
+- `frosty route plan box1` shows what the routes need, including the DNS record to add for each hostname. frosty doesn't write DNS outside its own domain.
+- `frosty route sync box1` creates or updates the Access apps first, then the tunnel's ingress, and removes routes no longer in config.
+- `frosty verify box1` then checks every path from outside: it tries the protected paths, a set of path tricks (`..`, `%2f`, `//`, case changes) and unlisted paths, all without credentials. On the box, it checks that the app listens on 127.0.0.1 only.
+
+See DECISIONS.md, "App routes".
 
 ## Reboot times
 

@@ -1,5 +1,5 @@
 import type { CfAccessApp, CfAccessPolicy, CfAccessRule, CfDnsRecord, CfIngressRule, CfNotificationPolicy, CfTunnel } from "../cloudflare.ts";
-import { expectedIngress, sameIngress } from "../edge.ts";
+import { sameIngress } from "../edge.ts";
 import type { HzFirewall, HzServer } from "../hetzner.ts";
 import { LABEL_ADOPTED, LABEL_WINDOW_OPENED } from "../hetzner.ts";
 import type { Fetch } from "../http.ts";
@@ -51,8 +51,8 @@ export function checkProtected(server: HzServer): CheckResult | undefined {
   return pass(name, "delete and rebuild protected");
 }
 
-export function checkTunnel(box: string, tunnel: CfTunnel | undefined, ingress: CfIngressRule[], hostname: string): CheckResult {
-  const name = "Tunnel healthy, ingress exactly SSH";
+export function checkTunnel(box: string, tunnel: CfTunnel | undefined, ingress: CfIngressRule[], hostname: string, expected: CfIngressRule[], routes = 0): CheckResult {
+  const name = routes === 0 ? "Tunnel healthy, ingress exactly SSH" : "Tunnel healthy, ingress exactly SSH and the routes";
   if (tunnel === undefined) {
     return fail(name, "no tunnel", rebuild(box));
   }
@@ -60,13 +60,13 @@ export function checkTunnel(box: string, tunnel: CfTunnel | undefined, ingress: 
   if (tunnel.status !== "healthy") {
     problems.push(`status is ${tunnel.status}`);
   }
-  if (!sameIngress(ingress, expectedIngress(hostname))) {
-    problems.push(`ingress is ${ingress.map((r) => `${r.hostname ?? "*"} -> ${r.service}`).join(", ") || "empty"}`);
+  if (!sameIngress(ingress, expected)) {
+    problems.push(`ingress is ${ingress.map((r) => `${r.hostname ?? "*"}${r.path === undefined ? "" : ` ${r.path}`} -> ${r.service}`).join(", ") || "empty"}`);
   }
   if (problems.length > 0) {
     return fail(name, problems.join("; "), tunnel.status !== "healthy" ? `Look at cloudflared on the box: ssh ${box} sudo journalctl -u cloudflared -n 50` : rebuild(box));
   }
-  return pass(name, `healthy; ${hostname} to ssh://localhost:22, everything else 404`);
+  return pass(name, `healthy; ${hostname} to ssh://localhost:22${routes === 0 ? "" : `, ${routes} route(s) as generated`}, everything else 404`);
 }
 
 function ruleProblems(rules: CfAccessRule[] | undefined, emails: string[]): string[] {

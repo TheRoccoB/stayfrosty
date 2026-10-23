@@ -41,7 +41,7 @@ describe("client guards", () => {
     const c = cf();
     // A frosty-looking name paired with a foreign id must not get through.
     await expect(c.deleteTunnel("acc", { id: "11111111-1111-4111-8111-111111111111", name: "stayfrosty-x" })).rejects.toThrow(/"other-tunnel"/);
-    await expect(c.putTunnelIngress("acc", { id: "11111111-1111-4111-8111-111111111111", name: "stayfrosty-x" }, [])).rejects.toThrow(/"other-tunnel"/);
+    await expect(c.putTunnelIngress("acc", { id: "11111111-1111-4111-8111-111111111111", name: "stayfrosty-x" }, { sshHostname: "ssh-x.example.com", teamName: "team", appZones: [], routes: [] })).rejects.toThrow(/"other-tunnel"/);
     await expect(c.deleteAccessApp("acc", { id: "app-wild", name: "stayfrosty-x" })).rejects.toThrow(/"example ssh"/);
     await expect(c.deleteAccessPolicy("acc", { id: "pol-gh", name: "stayfrosty-x" })).rejects.toThrow(/"gh-policy"/);
     await expect(c.deleteNotificationPolicy("acc", { id: "al-1", name: "stayfrosty-x" })).rejects.toThrow(/"other alert"/);
@@ -51,20 +51,15 @@ describe("client guards", () => {
     expect(http.writes()).toEqual([]);
   });
 
-  it("Cloudflare: tunnel ingress is only the box's SSH hostname and a 404", async () => {
+  it("Cloudflare: tunnel ingress is only the box's SSH hostname, its validated routes and 404s", async () => {
     const c = cf();
     const t = await c.createTunnel("acc", "stayfrosty-app1");
-    const good = [{ hostname: "ssh-app1.example.com", service: "ssh://localhost:22" }, { service: "http_status:404" }];
-    for (const bad of [
-      [{ hostname: "ssh-app1.example.com", service: "http://localhost:80" }, { service: "http_status:404" }],
-      [{ hostname: "*.example.com", service: "ssh://localhost:22" }, { service: "http_status:404" }],
-      [{ hostname: "ssh-other.example.com", service: "ssh://localhost:22" }, { service: "http_status:404" }],
-      [...good, { service: "http_status:404" }],
-      [good[0]],
-    ]) {
-      await expect(c.putTunnelIngress("acc", t, bad as never)).rejects.toThrow(/only sets ssh-app1/);
+    const spec = { sshHostname: "ssh-app1.example.com", teamName: "team", appZones: ["example.net"], routes: [] };
+    for (const host of ["*.example.com", "ssh-other.example.com", "app1.example.com"]) {
+      await expect(c.putTunnelIngress("acc", t, { ...spec, sshHostname: host })).rejects.toThrow(/refused to set ingress/);
     }
-    await expect(c.putTunnelIngress("acc", t, good)).resolves.toBeUndefined();
+    expect(await c.putTunnelIngress("acc", t, spec)).toEqual([{ hostname: "ssh-app1.example.com", service: "ssh://localhost:22" }, { service: "http_status:404" }]);
+    expect(fcf.ingress.get(t.id)).toEqual([{ hostname: "ssh-app1.example.com", service: "ssh://localhost:22" }, { service: "http_status:404" }]);
   });
 
   it("Cloudflare: Access policies are allow, plain email rules only", async () => {

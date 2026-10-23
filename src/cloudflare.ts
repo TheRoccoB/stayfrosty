@@ -2,6 +2,7 @@ import { ApiError, FrostyError } from "./errors.ts";
 import { logDone, summarize, type ChangeLog } from "./changelog.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
 import { redact, registerSecret } from "./redact.ts";
+import { accessUri, boxIngress, bypassPaths, frostyProtected, inZones, publicAppName, routeAppName, validateRouteHostnames, validateRoutes, type IngressRule, type Route } from "./routes.ts";
 
 export const CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4";
 
@@ -20,6 +21,23 @@ function ours(kind: string, name: string | undefined): void {
 
 function emailOnly(rules: CfAccessRule[] | undefined): boolean {
   return (rules ?? []).length > 0 && (rules ?? []).every((r) => Object.keys(r).length === 1 && typeof r.email?.email === "string");
+}
+
+// The one bypass policy frosty makes, for public paths under a protected prefix (routes.ts). It may
+// only ever be attached to a stayfrosty-<box>:<route>:public app.
+export const BYPASS_POLICY_NAME = "stayfrosty-bypass";
+
+export function isOurBypassPolicy(policy: { name?: string; decision?: string; include?: CfAccessRule[]; require?: CfAccessRule[]; exclude?: CfAccessRule[] }): boolean {
+  const include = policy.include ?? [];
+  return (
+    policy.name === BYPASS_POLICY_NAME &&
+    policy.decision === "bypass" &&
+    include.length === 1 &&
+    Object.keys(include[0] ?? {}).join() === "everyone" &&
+    Object.keys(include[0]?.everyone ?? {}).length === 0 &&
+    (policy.require ?? []).length === 0 &&
+    (policy.exclude ?? []).length === 0
+  );
 }
 
 // frosty's own kind of policy: its name, allow, only email includes, no require or exclude.
@@ -83,7 +101,18 @@ export interface CfTunnel {
 
 export interface CfIngressRule {
   hostname?: string;
+  path?: string;
   service: string;
+  originRequest?: Record<string, unknown>;
+}
+
+// What putTunnelIngress builds the ingress from. It generates the rules itself, so no caller can
+// hand it a rule frosty doesn't make.
+export interface IngressSpec {
+  sshHostname: string;
+  teamName: string;
+  appZones: string[];
+  routes: { route: Route; auds: Record<string, string[]> }[];
 }
 
 export interface CfAccessRule {
@@ -104,7 +133,9 @@ export interface CfAccessPolicy {
 export interface CfAccessApp {
   id: string;
   name: string;
+  aud?: string;
   domain?: string;
+  destinations?: { type?: string; uri?: string }[];
   type: string;
   session_duration?: string;
   policies?: { id: string; name?: string; decision?: string; precedence?: number; include?: CfAccessRule[] }[];
@@ -301,24 +332,34 @@ export class Cloudflare {
     return token;
   }
 
-  // Only frosty's own shape: its box's SSH hostname to the box's sshd, everything else 404.
-  async putTunnelIngress(accountId: string, tunnel: { id: string; name: string }, ingress: CfIngressRule[]): Promise<void> {
+  // Only frosty's own shape: its box's SSH hostname to the box's sshd, then each validated route's
+  // generated rules (routes.ts), then a 404 catch-all. The rules are built here from the spec.
+  async putTunnelIngress(accountId: string, tunnel: { id: string; name: string }, spec: IngressSpec): Promise<IngressRule[]> {
     const live = await this.getTunnel(accountId, tunnel.id);
     const box = boxOf("tunnel", live.name);
-    const [first, last, ...rest] = ingress;
-    if (
-      rest.length > 0 ||
-      first === undefined ||
-      last === undefined ||
-      Object.keys(first).sort().join() !== "hostname,service" ||
-      first.service !== "ssh://localhost:22" ||
-      !isSshHostname(first.hostname, box) ||
-      Object.keys(last).join() !== "service" ||
-      last.service !== "http_status:404"
-    ) {
-      throw new FrostyError(`frosty refused to set ingress on tunnel ${live.name}: it only sets ssh-${box}.<domain> to ssh://localhost:22 and a 404 catch-all.`, "This is a bug in frosty. Please report it.");
+    const refuse = (why: string): never => {
+      throw new FrostyError(`frosty refused to set ingress on tunnel ${live.name}: ${why}.`, "This is a bug in frosty. Please report it.");
+    };
+    if (!isSshHostname(spec.sshHostname, box)) {
+      refuse(`${spec.sshHostname} is not ssh-${box}.<domain>`);
     }
+    const domain = spec.sshHostname.slice(`ssh-${box}.`.length);
+    const routes = spec.routes.map((r) => r.route);
+    const problems = [...validateRoutes(box, routes, { domain, appZones: spec.appZones, accessTeam: spec.teamName }), ...validateRouteHostnames({ [box]: routes })];
+    if (problems.length > 0 || spec.appZones.some((z) => inZones(z, [domain]))) {
+      refuse(problems.join("; ") || "appZones includes the frosty domain");
+    }
+    for (const { route, auds } of spec.routes) {
+      for (const prefix of route.protected) {
+        const tags = auds[prefix] ?? [];
+        if (tags.length === 0 || tags.some((t) => !/^[0-9a-f]{64}$/.test(t))) {
+          refuse(`protected ${route.hostname}${prefix} has no Access audience to check`);
+        }
+      }
+    }
+    const ingress = boxIngress(spec.sshHostname, spec.routes.map(({ route, auds }) => ({ route, audFor: (p: string) => auds[p] ?? [] })), spec.teamName);
     await this.request<unknown>("PUT", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(live.id)}/configurations`, { config: { ingress } }, pick(live));
+    return ingress;
   }
 
   async getTunnelIngress(accountId: string, tunnelId: string): Promise<CfIngressRule[]> {
@@ -373,6 +414,15 @@ export class Cloudflare {
     return this.request<CfAccessPolicy>("POST", `${acct(accountId)}/access/policies`, policy);
   }
 
+  // The single bypass policy (BYPASS_POLICY_NAME): decision bypass, include everyone, nothing else.
+  async createBypassPolicy(accountId: string): Promise<CfAccessPolicy> {
+    const policy = { name: BYPASS_POLICY_NAME, decision: "bypass", include: [{ everyone: {} }] };
+    if (!isOurBypassPolicy(policy)) {
+      throw new FrostyError("frosty refused to create its bypass policy: wrong shape.", "This is a bug in frosty. Please report it.");
+    }
+    return this.request<CfAccessPolicy>("POST", `${acct(accountId)}/access/policies`, policy);
+  }
+
   getAccessPolicy(accountId: string, policyId: string): Promise<CfAccessPolicy> {
     return this.request<CfAccessPolicy>("GET", `${acct(accountId)}/access/policies/${encodeURIComponent(policyId)}`);
   }
@@ -407,6 +457,58 @@ export class Cloudflare {
       }
     }
     return this.request<CfAccessApp>("POST", `${acct(accountId)}/access/apps`, app);
+  }
+
+  // A route's Access app (routes.ts). "protected": stayfrosty-<box>:<route> on the route's own
+  // protected prefixes, with only frosty's email policies. "public": stayfrosty-<box>:<route>:public
+  // on the route's public paths under a protected prefix, with only the bypass policy. The body is
+  // built here; with appId it replaces that app (re-read and checked to be frosty's first).
+  async putRouteAccessApp(
+    accountId: string,
+    spec: { box: string; route: Route; kind: "protected" | "public"; appZones: string[]; domain: string; sessionDuration: string; policyIds: string[] },
+    appId?: string,
+  ): Promise<CfAccessApp> {
+    const { box, route, kind } = spec;
+    const name = kind === "protected" ? routeAppName(box, route) : publicAppName(box, route);
+    const refuse = (why: string): never => {
+      throw new FrostyError(`frosty refused to write Access application ${name}: ${why}.`, "This is a bug in frosty. Please report it.");
+    };
+    if (boxOf("Access application", `${NAME_PREFIX}${box}`) !== box) {
+      refuse("bad box name");
+    }
+    const problems = validateRoutes(box, [route], { domain: spec.domain, appZones: spec.appZones, accessTeam: "checked-elsewhere" });
+    if (problems.length > 0 || inZones(route.hostname, [spec.domain]) || route.hostname.startsWith("ssh-")) {
+      refuse(problems.join("; ") || `${route.hostname} is not an app hostname`);
+    }
+    const paths = kind === "protected" ? frostyProtected(route) : bypassPaths(route);
+    if (paths.length === 0 || spec.policyIds.length === 0 || (kind === "public" && spec.policyIds.length !== 1) || !/^\d+(m|h)$/.test(spec.sessionDuration)) {
+      refuse("nothing to cover, or the wrong number of policies");
+    }
+    for (const id of spec.policyIds) {
+      const live = await this.getAccessPolicy(accountId, id);
+      const ok = kind === "public" ? isOurBypassPolicy(live) : isOurEmailPolicy(live);
+      if (!ok) {
+        refuse(`policy ${live.name} is not ${kind === "public" ? "frosty's bypass policy" : "one of frosty's allow-by-email policies"}`);
+      }
+    }
+    const uris = paths.map((p) => accessUri(route.hostname, p));
+    const body = {
+      name,
+      type: "self_hosted",
+      domain: uris[0] as string,
+      destinations: uris.map((uri) => ({ type: "public", uri })),
+      session_duration: spec.sessionDuration,
+      app_launcher_visible: false,
+      policies: spec.policyIds.map((id, i) => ({ id, precedence: i + 1 })),
+    };
+    if (appId === undefined) {
+      return this.request<CfAccessApp>("POST", `${acct(accountId)}/access/apps`, body);
+    }
+    const live = await this.getAccessApp(accountId, appId);
+    if (live.name !== name) {
+      refuse(`app ${appId} is named ${live.name}`);
+    }
+    return this.request<CfAccessApp>("PUT", `${acct(accountId)}/access/apps/${encodeURIComponent(live.id)}`, body, live);
   }
 
   async deleteAccessApp(accountId: string, app: { id: string; name: string }): Promise<void> {

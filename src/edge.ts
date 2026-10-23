@@ -1,4 +1,5 @@
-import { DNS_COMMENT_PREFIX, NAME_PREFIX, isOurEmailPolicy, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel } from "./cloudflare.ts";
+import { BYPASS_POLICY_NAME, DNS_COMMENT_PREFIX, NAME_PREFIX, isOurBypassPolicy, isOurEmailPolicy, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel, type IngressSpec } from "./cloudflare.ts";
+import { accessUri, boxIngress, bypassPaths, frostyProtected, inZones, isRouteAppOf, publicAppName, routeAppName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
 import { runOrFail, type SshTarget } from "./box.ts";
 import { sshHostname, type Context } from "./context.ts";
 import { FrostyError } from "./errors.ts";
@@ -18,11 +19,68 @@ export function expectedIngress(hostname: string): CfIngressRule[] {
   return [{ hostname, service: "ssh://localhost:22" }, { service: "http_status:404" }];
 }
 
+export function boxRoutes(ctx: Context, box: string): Route[] {
+  return ctx.config.routes?.[box] ?? [];
+}
+
+// The Access apps a route needs: frosty's (protected prefixes), frosty's public one (bypasses), and
+// any external app named in externalAccess. Missing ones are undefined.
+export interface RouteApps {
+  route: Route;
+  app: CfAccessApp | undefined;
+  publicApp: CfAccessApp | undefined;
+  external: Record<string, CfAccessApp | undefined>;
+}
+
+export function routeApps(apps: CfAccessApp[], box: string, route: Route): RouteApps {
+  const byName = (name: string): CfAccessApp | undefined => apps.find((a) => a.name === name);
+  return {
+    route,
+    app: byName(routeAppName(box, route)),
+    publicApp: byName(publicAppName(box, route)),
+    external: Object.fromEntries(Object.entries(route.externalAccess ?? {}).map(([p, name]) => [p, byName(name)])),
+  };
+}
+
+// The Access audience cloudflared checks for each protected prefix, or undefined while any app the
+// route needs is missing (then the route stays out of the ingress: its paths 404).
+export function routeAuds(r: RouteApps): Record<string, string[]> | undefined {
+  const auds: Record<string, string[]> = {};
+  for (const prefix of r.route.protected) {
+    const app = r.route.externalAccess?.[prefix] !== undefined ? r.external[prefix] : r.app;
+    if (app?.aud === undefined) {
+      return undefined;
+    }
+    auds[prefix] = [app.aud];
+  }
+  if (bypassPaths(r.route).length > 0 && r.publicApp === undefined) {
+    return undefined;
+  }
+  return auds;
+}
+
+export function ingressSpec(ctx: Context, box: string, apps: CfAccessApp[]): IngressSpec {
+  const routes: IngressSpec["routes"] = [];
+  for (const route of boxRoutes(ctx, box)) {
+    const auds = routeAuds(routeApps(apps, box, route));
+    if (auds !== undefined) {
+      routes.push({ route, auds });
+    }
+  }
+  return { sshHostname: sshHostname(ctx, box), teamName: ctx.config.accessTeam ?? "", appZones: ctx.config.appZones ?? [], routes };
+}
+
+export function specIngress(spec: IngressSpec): IngressRule[] {
+  return boxIngress(spec.sshHostname, spec.routes.map(({ route, auds }) => ({ route, audFor: (p: string) => auds[p] ?? [] })), spec.teamName);
+}
+
 export interface Edge {
   tunnel: CfTunnel | undefined;
   dns: CfDnsRecord[];
   foreignDns: CfDnsRecord[];
   app: CfAccessApp | undefined;
+  // stayfrosty-<box>:<route>[:public]: Access apps of the box's app routes.
+  routeApps: CfAccessApp[];
   policy: CfAccessPolicy | undefined;
   alert: CfNotificationPolicy | undefined;
 }
@@ -43,13 +101,14 @@ export async function findEdge(ctx: Context, box: string): Promise<Edge> {
     dns: records.filter((r) => r.comment === dnsComment(box)),
     foreignDns: records.filter((r) => r.comment !== dnsComment(box)),
     app: apps.find((a) => a.name === name),
+    routeApps: apps.filter((a) => isRouteAppOf(box, a.name)),
     policy: policies.find((p) => p.name === name),
     alert: alerts.find((a) => a.name === name),
   };
 }
 
 export function edgeIsEmpty(edge: Edge): boolean {
-  return edge.tunnel === undefined && edge.dns.length === 0 && edge.app === undefined && edge.policy === undefined && edge.alert === undefined;
+  return edge.tunnel === undefined && edge.dns.length === 0 && edge.app === undefined && edge.routeApps.length === 0 && edge.policy === undefined && edge.alert === undefined;
 }
 
 // Step 7: the tunnel and its ingress, managed from Cloudflare.
@@ -60,18 +119,138 @@ export async function ensureTunnel(ctx: Context, box: string, existing: CfTunnel
     io.out(`Creating tunnel ${edgeName(box)}.`);
     tunnel = await cloudflare.createTunnel(config.accountId, edgeName(box));
   }
-  const want = expectedIngress(sshHostname(ctx, box));
-  const have = await cloudflare.getTunnelIngress(config.accountId, tunnel.id);
-  if (!sameIngress(have, want)) {
-    io.out(`Setting the tunnel's ingress: ${sshHostname(ctx, box)} to ssh://localhost:22, everything else 404.`);
-    await cloudflare.putTunnelIngress(config.accountId, tunnel, want);
-  }
+  await ensureIngress(ctx, box, tunnel);
   return tunnel;
 }
 
+// SSH, plus every configured route whose Access apps exist, plus the 404s. Idempotent.
+export async function ensureIngress(ctx: Context, box: string, tunnel: CfTunnel): Promise<void> {
+  const { cloudflare, config, io } = ctx;
+  const spec = boxRoutes(ctx, box).length === 0 ? ingressSpec(ctx, box, []) : ingressSpec(ctx, box, await cloudflare.listAccessApps(config.accountId));
+  const have = await cloudflare.getTunnelIngress(config.accountId, tunnel.id);
+  // Rules frosty could have written: the SSH host, app hosts in appZones (current or removed
+  // routes), and the catch-all. Anything else came from someone else, and frosty won't overwrite it.
+  const foreign = have.filter((r) => r.hostname !== undefined && r.hostname !== spec.sshHostname && !inZones(r.hostname, spec.appZones));
+  if (foreign.length > 0) {
+    throw new FrostyError(
+      `Tunnel ${tunnel.name} routes ${[...new Set(foreign.map((r) => r.hostname))].join(", ")}, which frosty didn't set up.`,
+      "Remove those rules in the Cloudflare dashboard (Zero Trust, Networks, Tunnels), or add the hostname to appZones and routes, then run the command again.",
+    );
+  }
+  if (!sameIngressRules(have, specIngress(spec))) {
+    const routes = spec.routes.map((r) => `${r.route.hostname} (${[...r.route.public, ...r.route.protected].length} paths)`);
+    io.out(`Setting the tunnel's ingress: ${sshHostname(ctx, box)} to ssh://localhost:22${routes.length > 0 ? `, ${routes.join(", ")}` : ""}, everything else 404.`);
+    await cloudflare.putTunnelIngress(config.accountId, tunnel, spec);
+  }
+}
+
 export function sameIngress(a: CfIngressRule[], b: CfIngressRule[]): boolean {
-  const key = (r: CfIngressRule): string => `${r.hostname ?? ""}|${r.service}`;
-  return a.length === b.length && a.every((r, i) => key(r) === key(b[i] as CfIngressRule));
+  return sameIngressRules(a, b as IngressRule[]);
+}
+
+// frosty route sync: each route's Access apps first, then the ingress that routes their paths, then
+// remove apps of routes no longer in config (their paths already left the ingress).
+export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): Promise<void> {
+  const { cloudflare, config, io } = ctx;
+  const routes = boxRoutes(ctx, box);
+  const [apps, policies] = await Promise.all([cloudflare.listAccessApps(config.accountId), cloudflare.listAccessPolicies(config.accountId)]);
+  const emailPolicy = policies.find((p) => p.name === edgeName(box));
+  if (routes.length > 0 && (emailPolicy === undefined || !isOurEmailPolicy(emailPolicy) || !sameEmails(emailPolicy.include.map((r) => r.email?.email ?? ""), config.accessEmails))) {
+    throw new FrostyError(`Access policy ${edgeName(box)} is missing or not an allow policy for exactly ${config.accessEmails.join(", ")}.`, `Run: frosty verify ${box}, and fix the box's own Access first.`);
+  }
+  let bypass = policies.find((p) => p.name === BYPASS_POLICY_NAME);
+  if (bypass !== undefined && !isOurBypassPolicy(bypass)) {
+    throw new FrostyError(`Access policy ${BYPASS_POLICY_NAME} is not frosty's bypass shape (decision bypass, include everyone, nothing else).`, "Delete it in the Cloudflare dashboard, then run the command again.");
+  }
+  const base = { box, appZones: config.appZones ?? [], domain: config.domain, sessionDuration: config.accessSessionDuration };
+  for (const route of routes) {
+    const have = routeApps(apps, box, route);
+    for (const [prefix, name] of Object.entries(route.externalAccess ?? {})) {
+      const listedExt = have.external[prefix];
+      const ext = listedExt === undefined ? undefined : await cloudflare.getAccessApp(config.accountId, listedExt.id);
+      if (ext === undefined || !appCovers(ext, accessUri(route.hostname, prefix))) {
+        throw new FrostyError(`Access app ${name} must exist and cover ${accessUri(route.hostname, prefix)} (externalAccess for ${route.name}).`, "frosty doesn't change that app. Fix it in the Cloudflare dashboard, or take the path out of externalAccess.");
+      }
+      const bad = externalPolicyProblems(ext);
+      if (bad.length > 0) {
+        throw new FrostyError(`Access app ${name} doesn't only let identified people in: ${bad.join("; ")}.`, "frosty doesn't change that app. Fix its policies in the Cloudflare dashboard, or take the path out of externalAccess.");
+      }
+      io.out(`Access app ${name} (not frosty's) covers ${accessUri(route.hostname, prefix)} and lets in ${describeIncludes(ext)}.`);
+    }
+    if (frostyProtected(route).length > 0) {
+      const want = frostyProtected(route).map((p) => accessUri(route.hostname, p));
+      if (have.app === undefined || !appMatches(await cloudflare.getAccessApp(config.accountId, have.app.id), want, [(emailPolicy as CfAccessPolicy).id])) {
+        io.out(`${have.app === undefined ? "Creating" : "Updating"} Access application ${routeAppName(box, route)} for ${want.join(", ")}.`);
+        await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "protected", policyIds: [(emailPolicy as CfAccessPolicy).id] }, have.app?.id);
+      }
+    }
+    if (bypassPaths(route).length > 0) {
+      if (bypass === undefined) {
+        io.out(`Creating Access policy ${BYPASS_POLICY_NAME} (for public paths under a protected prefix only).`);
+        bypass = await cloudflare.createBypassPolicy(config.accountId);
+      }
+      const want = bypassPaths(route).map((p) => accessUri(route.hostname, p));
+      if (have.publicApp === undefined || !appMatches(await cloudflare.getAccessApp(config.accountId, have.publicApp.id), want, [bypass.id])) {
+        io.out(`${have.publicApp === undefined ? "Creating" : "Updating"} Access application ${publicAppName(box, route)} (bypass) for ${want.join(", ")}.`);
+        await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "public", policyIds: [bypass.id] }, have.publicApp?.id);
+      }
+    }
+  }
+  await ensureIngress(ctx, box, tunnel);
+  const wanted = new Set(routes.flatMap((r) => [...(frostyProtected(r).length > 0 ? [routeAppName(box, r)] : []), ...(bypassPaths(r).length > 0 ? [publicAppName(box, r)] : [])]));
+  for (const app of apps.filter((a) => isRouteAppOf(box, a.name) && !wanted.has(a.name))) {
+    io.out(`Deleting Access application ${app.name}: its route is no longer in config.`);
+    await cloudflare.deleteAccessApp(config.accountId, app);
+  }
+}
+
+function appUris(app: CfAccessApp): string[] {
+  const uris = (app.destinations ?? []).map((d) => d.uri).filter((u): u is string => u !== undefined);
+  return uris.length > 0 ? uris : app.domain === undefined ? [] : [app.domain];
+}
+
+// What's wrong with an external app's policies for guarding a protected path: frosty doesn't own
+// it, but it must still only let identified people in (allow, no everyone, IP ranges or tokens).
+export function externalPolicyProblems(app: CfAccessApp): string[] {
+  const problems: string[] = [];
+  const policies = app.policies ?? [];
+  if (policies.length === 0) {
+    problems.push(`${app.name} has no policies`);
+  }
+  for (const p of policies) {
+    if (p.decision !== "allow") {
+      problems.push(`${app.name} policy ${p.name ?? p.id} decides ${p.decision ?? "?"}`);
+    }
+    for (const rule of p.include ?? []) {
+      const kind = Object.keys(rule).join("/");
+      if (!["email", "email_domain", "github-organization", "group", "gsuite", "okta", "azureAD", "saml", "oidc"].includes(kind)) {
+        problems.push(`${app.name} policy ${p.name ?? p.id} includes a ${kind} rule`);
+      }
+    }
+  }
+  return problems;
+}
+
+// "email: 2, github-organization: 1": what an external app lets in, for verify and plan.
+export function describeIncludes(app: CfAccessApp): string {
+  const counts = new Map<string, number>();
+  for (const p of app.policies ?? []) {
+    for (const rule of p.include ?? []) {
+      const kind = Object.keys(rule).join("/");
+      counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    }
+  }
+  return [...counts].map(([k, n]) => `${k}: ${n}`).join(", ") || "nobody";
+}
+
+// An app covers a URI if one of its destinations is that URI or a path prefix of it.
+export function appCovers(app: CfAccessApp, uri: string): boolean {
+  return appUris(app).some((u) => uri === u || uri.startsWith(`${u}/`));
+}
+
+export function appMatches(app: CfAccessApp, uris: string[], policyIds: string[]): boolean {
+  const same = (a: string[], b: string[]): boolean => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i]);
+  return app.type === "self_hosted" && same(appUris(app), uris) && same((app.policies ?? []).map((p) => p.id), policyIds);
 }
 
 // Step 8: the token goes over SSH on stdin into a root-only file. systemd hands it to
@@ -193,6 +372,10 @@ export async function removeEdge(ctx: Context, edge: Edge): Promise<void> {
     io.out(`Deleting Access application ${edge.app.name}.`);
     await cloudflare.deleteAccessApp(config.accountId, edge.app);
   }
+  for (const app of edge.routeApps) {
+    io.out(`Deleting Access application ${app.name}.`);
+    await cloudflare.deleteAccessApp(config.accountId, app);
+  }
   if (edge.policy !== undefined) {
     io.out(`Deleting Access policy ${edge.policy.name}.`);
     await cloudflare.deleteAccessPolicy(config.accountId, edge.policy);
@@ -220,6 +403,9 @@ export function describeEdge(edge: Edge): string[] {
   }
   if (edge.app !== undefined) {
     lines.push(`Cloudflare Access application ${edge.app.name}`);
+  }
+  for (const app of edge.routeApps) {
+    lines.push(`Cloudflare Access application ${app.name}`);
   }
   if (edge.policy !== undefined) {
     lines.push(`Cloudflare Access policy ${edge.policy.name}`);

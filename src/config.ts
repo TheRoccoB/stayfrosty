@@ -2,6 +2,7 @@ import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promise
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { FrostyError } from "./errors.ts";
+import { validateRouteHostnames, validateRoutes, type Route } from "./routes.ts";
 
 export interface Config {
   domain: string;
@@ -23,6 +24,11 @@ export interface Config {
   // Optional JSON-lines logs of every API write (see changelog.ts). Absolute paths.
   hetznerChangeLog?: string;
   cloudflareChangeLog?: string;
+  // Web apps served through a box's tunnel (routes.ts), by box. Their hostnames must be in appZones.
+  routes?: Record<string, Route[]>;
+  appZones?: string[];
+  // The Access team name (<team>.cloudflareaccess.com), for cloudflared's own token check.
+  accessTeam?: string;
 }
 
 export const DEFAULTS = {
@@ -140,6 +146,29 @@ export function validateConfig(value: unknown): string[] {
   const passwordCommand = c["passwordCommand"];
   if (passwordCommand !== undefined && typeof passwordCommand !== "string") {
     problems.push("passwordCommand must be a string");
+  }
+  const appZones = c["appZones"];
+  if (appZones !== undefined && (!Array.isArray(appZones) || appZones.some((z) => typeof z !== "string" || !isDomain(z) || z === domain))) {
+    problems.push("appZones must be a list of domain names, not including domain");
+  }
+  const routes = c["routes"];
+  if (routes !== undefined) {
+    if (routes === null || typeof routes !== "object" || Array.isArray(routes)) {
+      problems.push("routes must be an object of box name to a list of routes");
+    } else {
+      const zones = Array.isArray(appZones) ? appZones.filter((z): z is string => typeof z === "string") : [];
+      const team = typeof c["accessTeam"] === "string" ? c["accessTeam"] : undefined;
+      for (const [box, list] of Object.entries(routes as Record<string, unknown>)) {
+        if (!/^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$/.test(box)) {
+          problems.push(`routes.${box}: not a box name`);
+          continue;
+        }
+        problems.push(...validateRoutes(box, list, { domain: domain ?? "", appZones: zones, accessTeam: team }));
+      }
+      if (problems.length === 0) {
+        problems.push(...validateRouteHostnames(routes as Record<string, Route[]>));
+      }
+    }
   }
   for (const key of ["hetznerChangeLog", "cloudflareChangeLog"]) {
     const v = c[key];
