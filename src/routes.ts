@@ -62,7 +62,7 @@ export function frostyProtected(route: Route): string[] {
 }
 
 // stayfrosty-<box>:<route> and stayfrosty-<box>:<route>:public. The colon can't be in a box name,
-// so a route app is never mistaken for another box's app (box "svc1-x" vs route "x" of "svc1").
+// so a route app is never mistaken for another box's app (box "web1-x" vs route "x" of "web1").
 export function routeAppName(box: string, route: Pick<Route, "name">): string {
   return `stayfrosty-${box}:${route.name}`;
 }
@@ -160,6 +160,13 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
             problems.push(`${where}.externalAccess.${p} must be a protected path mapped to the name of an Access app frosty doesn't own`);
           }
         }
+      }
+    }
+    // One Access app per hostname: all protected prefixes on frosty's app, or all on one external app.
+    if (external !== null && typeof external === "object" && !Array.isArray(external)) {
+      const apps = new Set(prot.map((p) => (external as Record<string, unknown>)[p] ?? "(frosty's own app)"));
+      if (apps.size > 1) {
+        problems.push(`${where}: protected paths must all use one Access app (two apps on one hostname share a login cookie and break apps that call their API from the browser)`);
       }
     }
     const probe = r["probe"];

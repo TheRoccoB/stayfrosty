@@ -195,21 +195,23 @@ describe("route guards and sync", () => {
   });
 
   it("an external Access app must exist and cover its path; frosty only reads it", async () => {
-    const route = { ...listmonk, externalAccess: { "/admin": "other-app" } };
+    const route = { ...listmonk, externalAccess: { "/admin": "other-app", "/api": "other-app" } };
     const s = setup([route]);
     const { tunnel } = await seedBox(s);
     await expect(syncRoutes(s.ctx, "svc1", tunnel)).rejects.toThrow(/Access app other-app must exist and cover news.example.net\/admin/);
+    expect(validateRoutes("svc1", [{ ...listmonk, externalAccess: { "/admin": "other-app" } }], opts)).toEqual([expect.stringMatching(/must all use one Access app/)]);
     s.fcf.policies.push({ id: "pol-other-app", name: "gh-policy", decision: "allow", include: [{ everyone: {} }] });
-    s.fcf.apps.push({ id: "app-other-app", name: "other-app", aud: "b".repeat(64), type: "self_hosted", domain: "other.example.net", destinations: [{ type: "public", uri: "other.example.net" }, { type: "public", uri: "news.example.net/admin" }], policies: [{ id: "pol-other-app", precedence: 1 }] });
+    s.fcf.apps.push({ id: "app-other-app", name: "other-app", aud: "b".repeat(64), type: "self_hosted", domain: "other.example.net", destinations: [{ type: "public", uri: "other.example.net" }, { type: "public", uri: "news.example.net/admin" }, { type: "public", uri: "news.example.net/api" }], policies: [{ id: "pol-other-app", precedence: 1 }] });
     // An external app that lets everyone in can't guard a protected path.
     await expect(syncRoutes(s.ctx, "svc1", tunnel)).rejects.toThrow(/includes a everyone rule/);
     (s.fcf.policies.find((p) => p["id"] === "pol-other-app") as Record<string, unknown>)["include"] = [{ email: { email: "a@b.co" } }, { "github-organization": { name: "example-org" } }];
     await syncRoutes(s.ctx, "svc1", tunnel);
     expect(s.io.text()).toContain("Access app other-app (not frosty's) covers news.example.net/admin and lets in email: 1, github-organization: 1.");
-    const own = s.fcf.apps.find((a) => a["name"] === "stayfrosty-svc1:listmonk") as Record<string, unknown>;
-    expect((own["destinations"] as { uri: string }[]).map((d) => d.uri)).toEqual(["news.example.net/api"]);
+    // frosty makes no app of its own for the protected paths: one app, one login cookie on the host.
+    expect(s.fcf.apps.find((a) => a["name"] === "stayfrosty-svc1:listmonk")).toBeUndefined();
+    expect(s.fcf.apps.find((a) => a["name"] === "stayfrosty-svc1:listmonk:public")).toBeDefined();
     const tags = (s.fcf.ingress.get(tunnel.id) as { path?: string; originRequest?: { access: { audTag: string[] } } }[]).filter((r) => r.originRequest !== undefined).map((r) => [r.path, r.originRequest?.access.audTag[0]]);
-    expect(tags).toEqual([[prefixRegex("/admin"), "b".repeat(64)], [prefixRegex("/api"), own["aud"]]]);
+    expect(tags).toEqual([[prefixRegex("/admin"), "b".repeat(64)], [prefixRegex("/api"), "b".repeat(64)]]);
     expect(s.http.writes().some((w) => w.url.pathname.includes("app-other-app"))).toBe(false);
   });
 

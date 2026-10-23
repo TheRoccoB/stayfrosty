@@ -145,6 +145,7 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
 
 ## App routes (`frosty route`)
 
+- Routes are in scope, though beyond the original plan, because `verify` keeps checking the whole box's exposure in one place. Every hostname and path that reaches the box goes through frosty's generated ingress and is checked from outside on every run. Why: Rocco, 2026-10-23. stayfrosty stays a general tool for setting up a server, with no special cases for any one app. Alt: route apps with a separate tool, which `verify` couldn't see.
 - `routes.<box>` in config lists web apps served through the box's tunnel: a hostname, a service (`http://127.0.0.1:<port>` only, not `localhost`, which can resolve to `::1`), and every path as `protected` (behind Access) or `public`. Hostnames must be in `appZones`, never in `domain` or an `ssh-*` name, and each belongs to one route of one box. Why: one place says what is open, and frosty generates everything from it. Alt: hand-written ingress.
 - The tunnel ingress is the allowlist. For each app host it has, in order:
   - a 404 for any path containing `..`, `//`, a backslash, `;` or `%`;
@@ -158,8 +159,14 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
   - `stayfrosty-<box>:<route>` covers the protected prefixes, with the box's own email policy.
   - `stayfrosty-<box>:<route>:public` covers the public paths under a protected prefix, with `stayfrosty-bypass` (decision bypass, include everyone, nothing else). It's the only bypass frosty ever makes. The client refuses it on every other app, including the SSH app, and verify checks it's on no other app.
 
-  The colon can't be in a box name, so a route app is never taken for another box's app. Why: the-bouncer's must-fix H. Alt: protect the whole host and bypass each public path, which Rocco turned down.
-- `externalAccess` maps a protected prefix to an Access app frosty doesn't own (on svc1, `/admin` stays on an Access app Rocco already had). frosty only reads it: the app must exist and cover the prefix, and its audience goes into the `/admin` rule's token check. Why: Rocco's choice B, 2026-10-23. Alt: frosty takes over `/admin`.
+  The colon can't be in a box name, so a route app is never taken for another box's app. Why: the-bouncer's must-fix H. Alt: protect the whole host and bypass each public path, which was turned down.
+- `externalAccess` maps protected prefixes to an Access app the user manages outside frosty.
+  - **Read-only:** frosty never writes or deletes that app.
+  - **Refused:** any app whose policies are not allow, or that include an everyone, IP-range or service-token rule. Only identified people may get in.
+  - **Token check:** its audience (AUD) goes into the cloudflared check on those prefixes' rules, so cloudflared on the box still verifies the token.
+
+  Why: an existing app with its own people and policy shouldn't have to move under frosty to be served. Alt: frosty takes the paths over.
+- **One Access app per hostname for protected paths.** A route's protected prefixes are either all frosty's own app or all one `externalAccess` app, never a mix, and validation refuses a mix. Why: two Access apps on one hostname share the `CF_Authorization` cookie, so logging in to one replaces the other's token. A single-page app that calls its API from the browser then gets redirected to the login and breaks (CORS), and cloudflared's check sees the other app's AUD. Found in review before going live. Alt: two apps and two logins.
 - `frosty route sync` writes the Access apps before the ingress that routes their paths. A route whose apps are missing stays out of the ingress, so its paths 404. A route removed from config leaves the ingress first, and its apps are deleted after. `new` and `adopt --resume` keep the routes whose apps exist. Why: a protected path is never reachable without Access in front, even for a moment.
 - DNS for route hostnames isn't frosty's to write. Its token stays limited to the frosty domain, and `route plan` prints the CNAME to add elsewhere.
 - verify, per route, from outside with no credentials, sending each path exactly as written:
