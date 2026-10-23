@@ -196,5 +196,5 @@ export async function saveConfig(config: Config, env: Env = process.env): Promis
 }
 
 export function rebootTimeFor(config: Pick<Config, "rebootTime" | "rebootTimes">, box: string): string {
-  return config.rebootTimes?.[box] ?? config.rebootTime;
+  return config.rebootTimes !== undefined && Object.hasOwn(config.rebootTimes, box) ? (config.rebootTimes[box] as string) : config.rebootTime;
 }

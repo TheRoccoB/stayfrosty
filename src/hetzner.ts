@@ -274,7 +274,9 @@ export class Hetzner {
     let ours: HzFirewall | undefined;
     for (const f of attached.filter((x) => x.status === "applied")) {
       const fw = await this.getFirewall(f.id);
-      if (fw.name === `stayfrosty-${box as string}` && fw.labels[LABEL_MANAGED] === "1" && fw.labels[LABEL_BOX] === box) ours = fw;
+      // Applied to this server directly: a label-selector attachment would vanish if labels changed.
+      const direct = fw.applied_to.some((t) => t.type === "server" && t.server?.id === serverId);
+      if (fw.name === `stayfrosty-${box as string}` && fw.labels[LABEL_MANAGED] === "1" && fw.labels[LABEL_BOX] === box && direct) ours = fw;
     }
     if (ours === undefined) refuse(`frosty's firewall stayfrosty-${box as string} is not attached and applied to it`);
     if (foreignId === ours!.id) refuse("that is frosty's own firewall");

@@ -230,5 +230,11 @@ describe("per-box reboot times", () => {
     const wrong = checkUnattendedUpgrades({ ...input, rebootTime: "10:00" }, "t1");
     expect(wrong.ok).toBe(false);
     expect(wrong.detail).toContain("reboot time is 04:00, want 10:00");
+    const pacific = checkUnattendedUpgrades({ ...input, rebootTime: "04:00", timezone: "America/Los_Angeles\n" }, "t1");
+    expect(pacific.ok).toBe(false);
+    expect(pacific.detail).toContain("timezone is America/Los_Angeles, not UTC");
+    expect(checkUnattendedUpgrades({ ...input, rebootTime: "04:00", timezone: "Etc/UTC\n" }, "t1").ok).toBe(true);
+    // A key that is only in the prototype chain is not a box.
+    expect(rebootTimeFor({ rebootTime: "04:00", rebootTimes: {} }, "constructor")).toBe("04:00");
   });
 });

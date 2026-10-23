@@ -19,6 +19,7 @@ section uu-stamp; stat -c %Y /var/lib/apt/periodic/unattended-upgrades-stamp 2>/
 section reboot-required; stat -c %Y /var/run/reboot-required 2>/dev/null || echo none
 section cloudflared; apt-cache policy cloudflared 2>&1 || true
 section connector; systemctl is-active cloudflared.service 2>&1; systemctl is-enabled cloudflared.service 2>&1; stat -c '%a %U' /etc/cloudflared/token 2>&1 || true
+section timezone; timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true
 section now; date +%s
 section end
 `;
@@ -63,7 +64,7 @@ export function evaluateOnBox(sections: Map<string, string>, want: OnBoxExpectat
     checkUfw(get("ufw"), box),
     checkListeners(get("ss")),
     checkUnattendedUpgrades(
-      { enabled: get("uu-enabled"), aptConfig: get("apt-config"), stamp: get("uu-stamp"), createdAt, now, rebootTime },
+      { enabled: get("uu-enabled"), aptConfig: get("apt-config"), stamp: get("uu-stamp"), createdAt, now, rebootTime, timezone: get("timezone") },
       box,
     ),
     checkCloudflared(get("cloudflared"), box),

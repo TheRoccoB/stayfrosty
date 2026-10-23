@@ -184,6 +184,10 @@ describe("client guards", () => {
       { id: 3, name: "web1", labels: {}, public_net: { ipv4: null, ipv6: null, firewalls: [{ id: 71, status: "applied" }] } },
     );
     const h = hetzner();
+    // Right name, wrong labels: not frosty's, so nothing is detached.
+    (hz.firewalls[0] as { labels: Record<string, string> }).labels = { stayfrosty: "1", "stayfrosty-box": "other" };
+    await expect(h.detachForeignFirewall(71, 1)).rejects.toThrow(/stayfrosty-app1 is not attached and applied/);
+    (hz.firewalls[0] as { labels: Record<string, string> }).labels = box;
     await expect(h.detachForeignFirewall(70, 1)).rejects.toThrow(/that is frosty's own firewall/);
     await expect(h.detachForeignFirewall(72, 1)).rejects.toThrow(/label selector/);
     await expect(h.detachForeignFirewall(71, 3)).rejects.toThrow(/not a frosty box/);

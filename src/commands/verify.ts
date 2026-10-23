@@ -21,6 +21,14 @@ export async function runVerify(deps: Deps, opts: VerifyOptions): Promise<number
   if (servers.length === 0) {
     throw new FrostyError(box === undefined ? "frosty manages no boxes in this project." : `frosty has no box named ${box}.`, "See what exists with: frosty ls");
   }
+  // A rebootTimes key that names no box would silently leave that box on the default time.
+  if (box === undefined) {
+    const names = new Set(servers.map((s) => s.labels[LABEL_BOX] ?? s.name));
+    const unknown = Object.keys(ctx.config.rebootTimes ?? {}).filter((b) => !names.has(b));
+    if (unknown.length > 0) {
+      ctx.io.err(`Warning: rebootTimes names ${unknown.join(", ")}, which frosty does not manage. A typo? Those boxes use rebootTime.`);
+    }
+  }
   let failed = 0;
   for (const server of servers) {
     const name = server.labels[LABEL_BOX] ?? server.name;

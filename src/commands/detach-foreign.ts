@@ -47,7 +47,12 @@ export async function runDetachForeign(deps: Deps, opts: DetachForeignOptions): 
     return 0;
   }
   const after = await hetzner.getServer(server.id);
-  const left = (after.public_net.firewalls ?? []).map((f) => `${f.id}=${f.status}`);
-  io.out(`${box} now has: ${left.join(", ")} (frosty's is ${ours.id}).`);
+  const left = after.public_net.firewalls ?? [];
+  io.out(`${box} now has: ${left.map((f) => `${f.id}=${f.status}`).join(", ")} (frosty's is ${ours.id}).`);
+  const still = left.filter((f) => f.id !== ours.id);
+  if (still.length > 0) {
+    io.err(`${still.length} other firewall(s) are still on ${box} (applied another way, e.g. by a label selector). Remove them in the Hetzner Cloud Console.`);
+    return 1;
+  }
   return 0;
 }

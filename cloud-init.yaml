@@ -128,6 +128,9 @@ write_files:
         apt-get -o DPkg::Lock::Timeout=600 purge -y -q fail2ban
       fi
 
+      # Reboot times are box local time; keep every box on UTC so rebootTimes mean the same everywhere.
+      timedatectl set-timezone Etc/UTC
+
       # UFW is the second layer behind the Hetzner firewall. Port 22 stays allowed here or
       # break-glass cannot work; the Hetzner firewall is what keeps it closed.
       ufw --force reset >/dev/null
