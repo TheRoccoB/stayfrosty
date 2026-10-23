@@ -185,9 +185,53 @@ describe("frosty adopt", () => {
     expect(io.text()).toContain(`Pinned app1's host key ssh-ed25519 ${HOST_FP} (trusted on first use).`);
   });
 
-  it("refuses a server with a firewall it did not make", async () => {
+  it("with a foreign firewall attached, attaches frosty's first, stops, and resumes once it is detached", async () => {
     hz.servers[0] = existingServer({ public_net: { ipv4: { ip: IP }, ipv6: null, firewalls: [{ id: 99, status: "applied" }] } });
-    await refusesBeforeAnyChange({}, /1 firewall\(s\) frosty did not make \(id 99\)/);
+    await expect(runAdopt(deps(new ScriptedIo()), opts())).rejects.toThrow(/1 firewall\(s\) frosty did not make \(id 99\)/);
+    const net = server()["public_net"] as { firewalls: { id: number }[] };
+    const ours = (hz.firewalls[0] as { id: number }).id;
+    expect(net.firewalls.map((f) => f.id)).toEqual([99, ours]);
+    expect(box.calls).toEqual([]);
+    net.firewalls = net.firewalls.filter((f) => f.id !== 99);
+    const io = new ScriptedIo();
+    expect(await runAdopt(deps(io), opts({ resume: true })), io.text()).toBe(0);
+  });
+
+  it("opens the window before scanning when frosty's firewall is already attached and closed", async () => {
+    await runAdopt(deps(new ScriptedIo()), opts());
+    rmSync(knownHostsPath(env));
+    const order: string[] = [];
+    http.on("POST", "api.hetzner.cloud", "/v1/firewalls/\\d+/actions/set_rules", (call) => {
+      const fw = hz.firewalls[0] as Record<string, unknown>;
+      fw["rules"] = (call.body as { rules: unknown[] }).rules;
+      order.push((call.body as { rules: unknown[] }).rules.length > 0 ? "open" : "close");
+      return { status: 201, body: { actions: [] } };
+    });
+    const scan = deps(new ScriptedIo()).keyScan;
+    const io = new ScriptedIo();
+    const code = await runAdopt(deps(io, { keyScan: async (h) => (order.push("scan"), (scan as NonNullable<typeof scan>)(h)) }), opts({ resume: true }));
+    expect(code, io.text()).toBe(0);
+    expect(order).toEqual(["open", "scan", "close"]);
+  });
+
+  it("refuses --host-key that differs from the key it already pinned", async () => {
+    await runAdopt(deps(new ScriptedIo()), opts());
+    const writes = hetznerWrites().length;
+    await expect(runAdopt(deps(new ScriptedIo()), opts({ hostKey: OTHER_FP, resume: true }))).rejects.toThrow(/already pinned a different host key/);
+    expect(hetznerWrites()).toHaveLength(writes);
+  });
+
+  it("refuses to run again on an adopted box without --resume", async () => {
+    await runAdopt(deps(new ScriptedIo()), opts());
+    await expect(runAdopt(deps(new ScriptedIo()), opts())).rejects.toThrow(/already adopted/);
+  });
+
+  it("refuses a second server with the same box label, and a box firewall applied elsewhere", async () => {
+    hz.servers.push({ ...existingServer({ id: 8, name: "other", labels: { stayfrosty: "1", "stayfrosty-box": "app1" } }) });
+    await refusesBeforeAnyChange({}, /already labeled as box app1/);
+    hz.servers.pop();
+    hz.firewalls.push({ id: 50, name: "stayfrosty-app1", labels: { stayfrosty: "1", "stayfrosty-box": "app1" }, rules: [], applied_to: [{ type: "label_selector" }] });
+    await refusesBeforeAnyChange({}, /applied to more than app1/);
   });
 
   it("refuses a name that is not the server's, an unknown IP, and a box frosty new made", async () => {
@@ -246,10 +290,19 @@ describe("frosty adopt", () => {
     await expect(runVerify(deps(new ScriptedIo()), { box: "nope", all: false })).rejects.toThrow(/no box named nope/);
   });
 
+  it("destroy refuses a protected server even without the adopted label, before touching Cloudflare", async () => {
+    await runAdopt(deps(new ScriptedIo()), opts());
+    const labels = server()["labels"] as Record<string, string>;
+    delete labels["stayfrosty-adopted"];
+    const before = http.writes().length;
+    await expect(runDestroy(deps(new ScriptedIo(["app1"])), { box: "app1", dryRun: false })).rejects.toThrow(/protected server/);
+    expect(http.writes()).toHaveLength(before);
+  });
+
   it("destroy and new both refuse an adopted server", async () => {
     await runAdopt(deps(new ScriptedIo()), opts());
     await expect(runDestroy(deps(new ScriptedIo(["app1"])), { box: "app1", dryRun: false })).rejects.toThrow(/never deletes a server it did not create/);
-    await expect(runNew(deps(new ScriptedIo()), { box: "app1", resume: true, dryRun: false })).rejects.toThrow(/adopted server/);
+    await expect(runNew(deps(new ScriptedIo()), { box: "app1", resume: true, dryRun: false })).rejects.toThrow(/adopted or protected server/);
     expect(hz.servers).toHaveLength(1);
   });
 });

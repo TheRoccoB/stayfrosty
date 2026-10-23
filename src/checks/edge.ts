@@ -30,7 +30,7 @@ export function checkWindowClosed(box: string, firewall: HzFirewall | undefined,
 export function checkOnlyOurFirewall(box: string, server: HzServer, firewall: HzFirewall | undefined): CheckResult {
   const name = "Box firewall is the only one attached";
   const attached = server.public_net.firewalls ?? [];
-  const ours = firewall !== undefined && attached.some((f) => f.id === firewall.id && f.status !== "pending");
+  const ours = firewall !== undefined && attached.some((f) => f.id === firewall.id && f.status === "applied");
   const others = attached.filter((f) => f.id !== firewall?.id);
   if (!ours || others.length > 0) {
     const problems = [...(ours ? [] : ["frosty's firewall is not attached"]), ...(others.length > 0 ? [`other firewall(s) attached: id ${others.map((f) => f.id).join(", ")}`] : [])];

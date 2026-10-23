@@ -1,4 +1,5 @@
 import { ApiError, FrostyError } from "./errors.ts";
+import { summarize, type ChangeLog } from "./changelog.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
 import { redact } from "./redact.ts";
 
@@ -110,15 +111,21 @@ export class Hetzner {
   private readonly fetchImpl: Fetch;
   private readonly sleep: Sleep;
   private readonly baseUrl: string;
+  private readonly changeLog: ChangeLog | undefined;
 
-  constructor(opts: { token: string; fetch?: Fetch; sleep?: Sleep; baseUrl?: string }) {
+  constructor(opts: { token: string; fetch?: Fetch; sleep?: Sleep; baseUrl?: string; changeLog?: ChangeLog | undefined }) {
     this.token = opts.token;
+    this.changeLog = opts.changeLog;
     this.fetchImpl = opts.fetch ?? globalThis.fetch;
     this.sleep = opts.sleep ?? realSleep;
     this.baseUrl = opts.baseUrl ?? HETZNER_BASE_URL;
   }
 
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const write = method !== "GET";
+    if (write) {
+      this.changeLog?.({ phase: "intent", action: `hetzner ${method}`, target: path, request: body });
+    }
     const response = await sendJson({
       api: "hetzner",
       fetch: this.fetchImpl,
@@ -128,6 +135,9 @@ export class Hetzner {
       token: this.token,
       body,
     });
+    if (write) {
+      this.changeLog?.({ phase: "done", action: `hetzner ${method}`, target: path, result: summarize(response.status, response.body) });
+    }
     if (response.status >= 200 && response.status < 300) {
       return response.body as T;
     }
@@ -236,7 +246,13 @@ export class Hetzner {
     });
   }
 
+  // Never drops or changes the adopted label: that label is what keeps destroy and new away.
   async updateServerLabels(id: number, labels: Record<string, string>): Promise<HzServer> {
+    const current = await this.getServer(id);
+    const adopted = current.labels[LABEL_ADOPTED];
+    if (adopted !== undefined && labels[LABEL_ADOPTED] !== adopted) {
+      throw new FrostyError(`frosty refused to change the adopted label of ${current.name}.`, "This is a bug in frosty. Please report it.");
+    }
     const body = await this.request<{ server: HzServer }>("PUT", `/servers/${id}`, { labels });
     return body.server;
   }
@@ -252,7 +268,13 @@ export class Hetzner {
     return body.server;
   }
 
+  // Re-reads the server first: an adopted or protected server is never deleted, whatever the
+  // caller thinks it is.
   async deleteServer(id: number): Promise<HzAction> {
+    const current = await this.getServer(id);
+    if (isUntouchable(current)) {
+      throw new FrostyError(`frosty refused to delete ${current.name}: it is adopted or delete/rebuild protected.`, "Delete it yourself in the Hetzner Cloud Console if you really mean to.");
+    }
     const body = await this.request<{ action: HzAction }>("DELETE", `/servers/${id}`);
     return body.action;
   }
@@ -310,4 +332,9 @@ export function boxSelector(box: string): string {
 
 export function serverLocation(server: HzServer): string {
   return server.location?.name ?? "?";
+}
+
+// A server frosty must never delete or recreate: adopted, or protected by its owner.
+export function isUntouchable(server: HzServer): boolean {
+  return server.labels[LABEL_ADOPTED] !== undefined || server.protection?.delete === true || server.protection?.rebuild === true;
 }

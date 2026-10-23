@@ -1,4 +1,4 @@
-import { NAME_PREFIX, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel } from "./cloudflare.ts";
+import { DNS_COMMENT_PREFIX, NAME_PREFIX, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel } from "./cloudflare.ts";
 import { runOrFail, type SshTarget } from "./box.ts";
 import { sshHostname, type Context } from "./context.ts";
 import { FrostyError } from "./errors.ts";
@@ -11,7 +11,7 @@ export function edgeName(box: string): string {
 }
 
 export function dnsComment(box: string): string {
-  return `stayfrosty box ${box}`;
+  return `${DNS_COMMENT_PREFIX}${box}`;
 }
 
 export function expectedIngress(hostname: string): CfIngressRule[] {
@@ -64,7 +64,7 @@ export async function ensureTunnel(ctx: Context, box: string, existing: CfTunnel
   const have = await cloudflare.getTunnelIngress(config.accountId, tunnel.id);
   if (!sameIngress(have, want)) {
     io.out(`Setting the tunnel's ingress: ${sshHostname(ctx, box)} to ssh://localhost:22, everything else 404.`);
-    await cloudflare.putTunnelIngress(config.accountId, tunnel.id, want);
+    await cloudflare.putTunnelIngress(config.accountId, tunnel, want);
   }
   return tunnel;
 }
@@ -104,7 +104,7 @@ export async function ensureDns(ctx: Context, box: string, tunnelId: string, edg
   const good = edge.dns.find((r) => r.type === "CNAME" && r.content === content && r.proxied === true);
   for (const stale of edge.dns.filter((r) => r !== good)) {
     io.out(`Removing stale DNS record ${stale.type} ${stale.name}.`);
-    await cloudflare.deleteDnsRecord(config.zoneId, stale.id);
+    await cloudflare.deleteDnsRecord(config.zoneId, stale);
   }
   if (good !== undefined) {
     return good;
@@ -180,26 +180,26 @@ export async function removeEdge(ctx: Context, edge: Edge): Promise<void> {
   const { cloudflare, config, io } = ctx;
   if (edge.alert !== undefined) {
     io.out(`Deleting notification ${edge.alert.name}.`);
-    await cloudflare.deleteNotificationPolicy(config.accountId, edge.alert.id);
+    await cloudflare.deleteNotificationPolicy(config.accountId, edge.alert);
   }
   if (edge.app !== undefined) {
     io.out(`Deleting Access application ${edge.app.name}.`);
-    await cloudflare.deleteAccessApp(config.accountId, edge.app.id);
+    await cloudflare.deleteAccessApp(config.accountId, edge.app);
   }
   if (edge.policy !== undefined) {
     io.out(`Deleting Access policy ${edge.policy.name}.`);
-    await cloudflare.deleteAccessPolicy(config.accountId, edge.policy.id);
+    await cloudflare.deleteAccessPolicy(config.accountId, edge.policy);
   }
   for (const record of edge.dns) {
     io.out(`Deleting DNS record ${record.type} ${record.name}.`);
-    await cloudflare.deleteDnsRecord(config.zoneId, record.id);
+    await cloudflare.deleteDnsRecord(config.zoneId, record);
   }
 }
 
 export async function removeTunnel(ctx: Context, edge: Edge): Promise<void> {
   if (edge.tunnel !== undefined) {
     ctx.io.out(`Deleting tunnel ${edge.tunnel.name}.`);
-    await ctx.cloudflare.deleteTunnel(ctx.config.accountId, edge.tunnel.id);
+    await ctx.cloudflare.deleteTunnel(ctx.config.accountId, edge.tunnel);
   }
 }
 

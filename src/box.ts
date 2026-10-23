@@ -182,7 +182,7 @@ export async function waitForSsh(opts: {
     if (/REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed/i.test(result.stderr)) {
       throw new FrostyError(
         `The SSH host key of ${opts.target.host} does not match the one frosty pinned for this box (${opts.target.hostKeyAlias}).`,
-        "Stop here: something may be intercepting the connection. If you rebuilt the box outside frosty, destroy it with frosty destroy and create it again.",
+        `Stop here: something may be intercepting the connection. If the box was rebuilt outside frosty: a box frosty created, destroy and new it; an adopted box, check its fingerprint in the Hetzner web console, remove the line starting "${opts.target.hostKeyAlias} " from frosty's known_hosts, and run adopt again with --host-key.`,
       );
     }
     if (opts.now() >= deadline) {
@@ -264,7 +264,7 @@ export const keyScan: KeyScanner = (host) =>
     });
   });
 
-function fingerprintOf(publicKey: string): Promise<string> {
+export function fingerprintOf(publicKey: string): Promise<string> {
   return new Promise((resolve) => {
     const child = spawn("ssh-keygen", ["-l", "-E", "sha256", "-f", "-"], { stdio: ["pipe", "pipe", "ignore"] });
     let out = "";

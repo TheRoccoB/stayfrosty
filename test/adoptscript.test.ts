@@ -7,6 +7,7 @@ import { hardenScript, parseCloudInit, userScript } from "../src/adoptscript.ts"
 import { loadTemplate, renderCloudInit } from "../src/cloudinit.ts";
 
 const KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeFakeFakeFakeFakeFakeFakeFakeFakeFake me@laptop";
+const VALUES = { adminUser: "ops", sshPublicKey: KEY };
 const rendered = (): string => renderCloudInit(loadTemplate(), { adminUser: "ops", sshPublicKey: KEY, rebootTime: "04:00" });
 
 const hasPyYaml = spawnSync("python3", ["-I", "-c", "import yaml"]).status === 0;
@@ -17,7 +18,7 @@ describe("adopt's reading of cloud-init.yaml", () => {
     const yaml = JSON.parse(
       execFileSync("python3", ["-I", "-c", "import json,sys,yaml; print(json.dumps(yaml.safe_load(sys.stdin.read())))"], { input: text }).toString(),
     ) as Record<string, unknown>;
-    const plan = parseCloudInit(text);
+    const plan = parseCloudInit(text, VALUES);
     expect(plan.packages).toEqual(yaml["packages"]);
     expect(plan.runcmd).toEqual((yaml["runcmd"] as string[][]).map((c) => c[0]));
     expect(plan.files).toEqual(yaml["write_files"]);
@@ -29,7 +30,7 @@ describe("adopt's reading of cloud-init.yaml", () => {
   });
 
   it("finds every file the hardening needs", () => {
-    const plan = parseCloudInit(rendered());
+    const plan = parseCloudInit(rendered(), VALUES);
     expect(plan.files.map((f) => f.path)).toEqual([
       "/etc/ssh/sshd_config.d/00-stayfrosty.conf",
       "/etc/apt/apt.conf.d/20auto-upgrades",
@@ -42,7 +43,7 @@ describe("adopt's reading of cloud-init.yaml", () => {
   });
 
   const refuses = (text: string, what: RegExp): void => {
-    expect(() => parseCloudInit(text)).toThrow(what);
+    expect(() => parseCloudInit(text, VALUES)).toThrow(what);
   };
 
   it("refuses keys and shapes it does not know, so the template cannot drift past adopt", () => {
@@ -57,10 +58,15 @@ describe("adopt's reading of cloud-init.yaml", () => {
     refuses(text.replace("runcmd:\n  - [/usr/local/sbin/stayfrosty-harden]", "runcmd:\n  - [/bin/sh, -c, x]"), /runcmd/);
     refuses(text.replace("write_files:", "write_files:\n  - path: /etc/x\n    encoding: b64\n    content: |\n      x"), /without owner|write_files line/);
     refuses(text.replace(/^packages:[\s\S]*?(?=^write_files:)/m, ""), /no packages/);
+    refuses(text.replace("    groups: [sudo]", "    groups: [sudo, docker]"), /users block/);
+    refuses(text.replace("    lock_passwd: true", "    lock_passwd: true\n  - name: other"), /users block/);
+    refuses(text.replace("    shell: /bin/bash\n", "    shell: /bin/bash\n    passwd: x\n"), /users block/);
+    expect(() => parseCloudInit(text, { adminUser: "admin", sshPublicKey: KEY })).toThrow(/users block/);
+    refuses(text.replace("      # Managed by stayfrosty. Change it in the stayfrosty repo, not here.", "        # Managed by stayfrosty. Change it in the stayfrosty repo, not here."), /indented more than 6/);
   });
 
   it("builds a phase-2 script that bash accepts and that writes the files byte for byte", () => {
-    const plan = parseCloudInit(rendered());
+    const plan = parseCloudInit(rendered(), VALUES);
     const script = hardenScript(plan);
     expect(spawnSync("bash", ["-n"], { input: script }).status).toBe(0);
     // Run only the file-writing part, rooted in a temp dir, and compare.
@@ -80,13 +86,18 @@ describe("adopt's reading of cloud-init.yaml", () => {
       rmSync(root, { recursive: true, force: true });
     }
     expect(script.indexOf("apt-get \"${apt_opts[@]}\" install ufw")).toBeLessThan(script.indexOf("/etc/ssh/sshd_config.d/00-stayfrosty.conf"));
-    expect(script.trimEnd().split("\n").slice(-2)).toEqual(["/usr/local/sbin/stayfrosty-harden", "echo stayfrosty-harden-ok"]);
+    expect(script.trimEnd().split("\n").slice(-4)).toEqual(["/usr/local/sbin/stayfrosty-harden", "echo stayfrosty-harden-ok", "}", "main </dev/null"]);
+    expect(script).toContain("dist-upgrade");
+    expect(script).toContain("dpkg --configure -a");
+    expect(script).toContain("UCF_FORCE_CONFFOLD=1");
   });
 
   it("builds a phase-1 script that creates the user without touching sshd", () => {
     const script = userScript("ops", KEY);
     expect(spawnSync("bash", ["-n"], { input: script }).status).toBe(0);
-    expect(script).not.toMatch(/sshd|ufw|systemctl/);
+    // It may read sshd_config, never write it or restart anything.
+    expect(script).not.toMatch(/ufw|systemctl|sshd -t|>\s*\/etc\/ssh|sed -i/);
+    expect((script.match(/\/etc\/ssh\/\S+/g) ?? []).every((p) => p.startsWith("/etc/ssh/sshd_config"))).toBe(true);
     expect(script).toContain("visudo -cqf");
     expect(script).not.toContain(KEY);
     // Any comment character is safe: the key is decoded on the box.

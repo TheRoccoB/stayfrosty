@@ -43,8 +43,23 @@ function bad(what: string, line: number): never {
   throw new FrostyError(`cloud-init.yaml line ${line + 1}: ${what}, which adopt cannot read.`, "This is a bug in frosty. Please report it.");
 }
 
+// The users block adopt reproduces with userScript. Anything else in it (another group, key,
+// user or option) would be something new applies and adopt silently does not, so it must match.
+export function expectedUsers(adminUser: string, sshPublicKey: string): string[] {
+  return [
+    `  - name: "${adminUser}"`,
+    "    groups: [sudo]",
+    "    shell: /bin/bash",
+    "    # Access plus the SSH key is the gate. A sudo password would break unattended operation.",
+    '    sudo: "ALL=(ALL) NOPASSWD:ALL"',
+    "    lock_passwd: true",
+    "    ssh_authorized_keys:",
+    `      - "${sshPublicKey}"`,
+  ];
+}
+
 // Parses the rendered cloud-init.yaml.
-export function parseCloudInit(text: string): AdoptPlan {
+export function parseCloudInit(text: string, values: { adminUser: string; sshPublicKey: string }): AdoptPlan {
   const lines = text.split("\n");
   if (lines[0] !== "#cloud-config") {
     bad("the first line is not #cloud-config", 0);
@@ -101,8 +116,12 @@ export function parseCloudInit(text: string): AdoptPlan {
       });
     } else if (key === "write_files") {
       plan.files = writeFiles(block, start);
+    } else if (key === "users") {
+      const got = block.filter((l) => l.trim() !== "");
+      if (JSON.stringify(got) !== JSON.stringify(expectedUsers(values.adminUser, values.sshPublicKey))) {
+        bad("a users block that is not the one adopt reproduces", start);
+      }
     }
-    // users: adopt creates the admin user itself (userScript) from the same config values.
   }
   for (const key of ["users", "packages", "write_files", "runcmd"]) {
     if (!seen.has(key)) {
@@ -161,6 +180,10 @@ function writeFiles(block: string[], offset: number): WriteFile[] {
       }
       // A literal block: lines indented 6 spaces, blank lines kept, ending with one newline.
       const body: string[] = [];
+      const first = block.slice(n).find((l) => l.trim() !== "");
+      if (first !== undefined && /^ {7}/.test(first)) {
+        bad("a content block indented more than 6 spaces", offset + n);
+      }
       while (n < block.length && (/^ {6}/.test(block[n] as string) || (block[n] as string).trim() === "")) {
         body.push((block[n] as string).slice(6));
         n += 1;
@@ -193,26 +216,37 @@ export function userScript(adminUser: string, publicKey: string): string {
   }
   // The key travels base64-encoded: a comment may hold any character.
   const b64 = Buffer.from(publicKey.trim(), "utf8").toString("base64");
-  return `set -euo pipefail
+  return `main() {
+set -euo pipefail
+. /etc/os-release
+if [ "\${ID:-}" != ubuntu ] || ! dpkg --compare-versions "\${VERSION_ID:-0}" ge 24.04; then
+  echo "stayfrosty-adopt: needs Ubuntu 24.04 or later, this is \${PRETTY_NAME:-unknown}" >&2
+  exit 1
+fi
+grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\\.d/\\*\\.conf' /etc/ssh/sshd_config || { echo "stayfrosty-adopt: /etc/ssh/sshd_config does not include sshd_config.d" >&2; exit 1; }
 u=${adminUser}
 key=$(printf '%s' '${b64}' | base64 -d)
 case $key in *$'\n'*|'') echo "stayfrosty-adopt: bad key" >&2; exit 1 ;; esac
 if ! id "$u" >/dev/null 2>&1; then
-  useradd -m -s /bin/bash -G sudo "$u"
+  useradd -m -U -s /bin/bash -G sudo "$u"
   passwd -l "$u" >/dev/null
 fi
-usermod -aG sudo "$u"
+usermod -aG sudo -s /bin/bash "$u"
+g=$(id -gn "$u")
 home=$(getent passwd "$u" | cut -d: -f6)
-install -d -m 0700 -o "$u" -g "$u" "$home/.ssh"
+install -d -m 0700 -o "$u" -g "$g" "$home/.ssh"
 touch "$home/.ssh/authorized_keys"
-grep -qxF "$key" "$home/.ssh/authorized_keys" || printf '%s\\n' "$key" >> "$home/.ssh/authorized_keys"
-chown "$u:$u" "$home/.ssh/authorized_keys"
+grep -qxF -- "$key" "$home/.ssh/authorized_keys" || printf '%s\\n' "$key" >> "$home/.ssh/authorized_keys"
+chown "$u:$g" "$home/.ssh/authorized_keys"
 chmod 0600 "$home/.ssh/authorized_keys"
 printf '%s ALL=(ALL) NOPASSWD:ALL\\n' "$u" > /etc/sudoers.d/90-stayfrosty.new
 chmod 0440 /etc/sudoers.d/90-stayfrosty.new
 visudo -cqf /etc/sudoers.d/90-stayfrosty.new
 mv /etc/sudoers.d/90-stayfrosty.new /etc/sudoers.d/90-stayfrosty
 echo stayfrosty-user-ok
+}
+# Parsed whole before it runs, and nothing it starts can read the rest of it from stdin.
+main </dev/null
 `;
 }
 
@@ -242,15 +276,21 @@ mv '${f.path}.stayfrosty-new' '${f.path}'`;
     }
     return c;
   });
-  return `set -euo pipefail
+  return `main() {
+set -euo pipefail
 trap 'echo "stayfrosty-adopt: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
-export DEBIAN_FRONTEND=noninteractive
-apt_opts=(-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-apt-get update -q
-apt-get "\${apt_opts[@]}" upgrade
+export DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 NEEDRESTART_MODE=a
+# A long-lived box may be mid unattended-upgrade, or left half-configured by an earlier run.
+apt_opts=(-y -q -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+dpkg --configure -a
+for i in 1 2 3 4 5; do apt-get -q -o DPkg::Lock::Timeout=600 update && break; [ "$i" = 5 ] && exit 1; sleep 30; done
+# cloud-init's package_upgrade is a dist-upgrade, so new kernels come in too.
+apt-get "\${apt_opts[@]}" dist-upgrade
 apt-get "\${apt_opts[@]}" install ${packages.join(" ")}
 ${files}
 ${runcmd.join("\n")}
 echo stayfrosty-harden-ok
+}
+main </dev/null
 `;
 }

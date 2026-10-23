@@ -45,7 +45,8 @@ export function checkUnattendedUpgrades(input: UpdatesInput, box: string): Check
   if (!/^Unattended-Upgrade::Automatic-Reboot "true";/m.test(input.aptConfig)) {
     problems.push("automatic reboot is off");
   }
-  const born = input.createdAt;
+  // A birth time in the future (a bad label) must not make "never ran" pass forever.
+  const born = input.createdAt === undefined ? undefined : Math.min(input.createdAt, input.now);
   const rawStamp = parseEpoch(input.stamp);
   const stamp = rawStamp !== undefined && born !== undefined && rawStamp < born ? undefined : rawStamp;
   if (stamp === undefined) {

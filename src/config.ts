@@ -17,6 +17,9 @@ export interface Config {
   rebootTime: string;
   accessSessionDuration: string;
   passwordCommand?: string;
+  // Optional JSON-lines logs of every API write (see changelog.ts). Absolute paths.
+  hetznerChangeLog?: string;
+  cloudflareChangeLog?: string;
 }
 
 export const DEFAULTS = {
@@ -122,6 +125,12 @@ export function validateConfig(value: unknown): string[] {
   const passwordCommand = c["passwordCommand"];
   if (passwordCommand !== undefined && typeof passwordCommand !== "string") {
     problems.push("passwordCommand must be a string");
+  }
+  for (const key of ["hetznerChangeLog", "cloudflareChangeLog"]) {
+    const v = c[key];
+    if (v !== undefined && (typeof v !== "string" || !v.startsWith("/"))) {
+      problems.push(`${key} must be an absolute path`);
+    }
   }
   return problems;
 }

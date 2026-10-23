@@ -1,4 +1,5 @@
 import { ApiError, FrostyError } from "./errors.ts";
+import { summarize, type ChangeLog } from "./changelog.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
 import { redact, registerSecret } from "./redact.ts";
 
@@ -6,6 +7,20 @@ export const CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4";
 
 // Names of everything frosty creates in Cloudflare start with this.
 export const NAME_PREFIX = "stayfrosty-";
+// And its DNS records carry this comment.
+export const DNS_COMMENT_PREFIX = "stayfrosty box ";
+
+// The token frosty uses can change any tunnel or Access app in the account. These guards keep
+// it to frosty's own: every create, change and delete checks the name on the object itself.
+function ours(kind: string, name: string | undefined): void {
+  if (name === undefined || !name.startsWith(NAME_PREFIX) || name.length === NAME_PREFIX.length) {
+    throw new FrostyError(`frosty refused to change the ${kind} "${name ?? "?"}": it only touches names starting with ${NAME_PREFIX}.`, "This is a bug in frosty. Please report it.");
+  }
+}
+
+function emailOnly(rules: CfAccessRule[] | undefined): boolean {
+  return (rules ?? []).length > 0 && (rules ?? []).every((r) => Object.keys(r).length === 1 && typeof r.email?.email === "string");
+}
 
 interface Envelope<T> {
   success: boolean;
@@ -93,14 +108,21 @@ export class Cloudflare {
   private readonly sleep: Sleep;
   private readonly baseUrl: string;
 
-  constructor(opts: { token: string; fetch?: Fetch; sleep?: Sleep; baseUrl?: string }) {
+  private readonly changeLog: ChangeLog | undefined;
+
+  constructor(opts: { token: string; fetch?: Fetch; sleep?: Sleep; baseUrl?: string; changeLog?: ChangeLog | undefined }) {
     this.token = opts.token;
+    this.changeLog = opts.changeLog;
     this.fetchImpl = opts.fetch ?? globalThis.fetch;
     this.sleep = opts.sleep ?? realSleep;
     this.baseUrl = opts.baseUrl ?? CLOUDFLARE_BASE_URL;
   }
 
   async envelope<T>(method: string, path: string, body?: unknown): Promise<Envelope<T>> {
+    const write = method !== "GET";
+    if (write) {
+      this.changeLog?.({ phase: "intent", action: `cloudflare ${method}`, target: path, request: body });
+    }
     const response = await sendJson({
       api: "cloudflare",
       fetch: this.fetchImpl,
@@ -111,6 +133,9 @@ export class Cloudflare {
       body,
     });
     const env = response.body as Envelope<T> | undefined;
+    if (write) {
+      this.changeLog?.({ phase: "done", action: `cloudflare ${method}`, target: path, result: summarize(response.status, env?.result) });
+    }
     if (response.status >= 200 && response.status < 300 && env?.success === true) {
       return env;
     }
@@ -221,6 +246,7 @@ export class Cloudflare {
   // Tunnels.
 
   async createTunnel(accountId: string, name: string): Promise<CfTunnel> {
+    ours("tunnel", name);
     return this.request<CfTunnel>("POST", `${acct(accountId)}/cfd_tunnel`, { name, config_src: "cloudflare" });
   }
 
@@ -235,8 +261,9 @@ export class Cloudflare {
     return token;
   }
 
-  async putTunnelIngress(accountId: string, tunnelId: string, ingress: CfIngressRule[]): Promise<void> {
-    await this.request<unknown>("PUT", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/configurations`, { config: { ingress } });
+  async putTunnelIngress(accountId: string, tunnel: { id: string; name: string }, ingress: CfIngressRule[]): Promise<void> {
+    ours("tunnel", tunnel.name);
+    await this.request<unknown>("PUT", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnel.id)}/configurations`, { config: { ingress } });
   }
 
   async getTunnelIngress(accountId: string, tunnelId: string): Promise<CfIngressRule[]> {
@@ -244,7 +271,9 @@ export class Cloudflare {
     return result.config?.ingress ?? [];
   }
 
-  async deleteTunnel(accountId: string, tunnelId: string): Promise<void> {
+  async deleteTunnel(accountId: string, tunnel: { id: string; name: string }): Promise<void> {
+    ours("tunnel", tunnel.name);
+    const tunnelId = tunnel.id;
     // A tunnel with live connections cannot be deleted; drop them first.
     await this.request<unknown>("DELETE", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/connections`);
     await this.request<unknown>("DELETE", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}`);
@@ -252,12 +281,18 @@ export class Cloudflare {
 
   // DNS.
 
-  createDnsRecord(zoneId: string, record: { type: string; name: string; content: string; proxied: boolean; comment: string }): Promise<CfDnsRecord> {
+  async createDnsRecord(zoneId: string, record: { type: string; name: string; content: string; proxied: boolean; comment: string }): Promise<CfDnsRecord> {
+    if (!record.comment.startsWith(DNS_COMMENT_PREFIX) || record.type !== "CNAME" || !record.proxied) {
+      throw new FrostyError(`frosty refused to create DNS record ${record.name}: it only creates proxied CNAMEs commented "${DNS_COMMENT_PREFIX}...".`, "This is a bug in frosty. Please report it.");
+    }
     return this.request<CfDnsRecord>("POST", `/zones/${encodeURIComponent(zoneId)}/dns_records`, { ...record, ttl: 1 });
   }
 
-  async deleteDnsRecord(zoneId: string, recordId: string): Promise<void> {
-    await this.request<unknown>("DELETE", `/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(recordId)}`);
+  async deleteDnsRecord(zoneId: string, record: { id: string; name: string; comment?: string | null }): Promise<void> {
+    if (record.comment?.startsWith(DNS_COMMENT_PREFIX) !== true) {
+      throw new FrostyError(`frosty refused to delete DNS record ${record.name}: it is not commented "${DNS_COMMENT_PREFIX}...".`, "This is a bug in frosty. Please report it.");
+    }
+    await this.request<unknown>("DELETE", `/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(record.id)}`);
   }
 
   // Access.
@@ -266,34 +301,44 @@ export class Cloudflare {
     return this.listAll<CfAccessPolicy>(`${acct(accountId)}/access/policies`);
   }
 
-  createAccessPolicy(accountId: string, policy: { name: string; decision: string; include: CfAccessRule[]; session_duration?: string }): Promise<CfAccessPolicy> {
+  async createAccessPolicy(accountId: string, policy: { name: string; decision: string; include: CfAccessRule[]; session_duration?: string }): Promise<CfAccessPolicy> {
+    ours("Access policy", policy.name);
+    // Only "allow these emails": never bypass, everyone, groups, IdP orgs, IP ranges or service tokens.
+    if (policy.decision !== "allow" || !emailOnly(policy.include) || Object.keys(policy).some((k) => !["name", "decision", "include", "session_duration"].includes(k))) {
+      throw new FrostyError(`frosty refused to create Access policy ${policy.name}: it only creates allow policies of plain email rules.`, "This is a bug in frosty. Please report it.");
+    }
     return this.request<CfAccessPolicy>("POST", `${acct(accountId)}/access/policies`, policy);
   }
 
-  async deleteAccessPolicy(accountId: string, policyId: string): Promise<void> {
-    await this.request<unknown>("DELETE", `${acct(accountId)}/access/policies/${encodeURIComponent(policyId)}`);
+  async deleteAccessPolicy(accountId: string, policy: { id: string; name: string }): Promise<void> {
+    ours("Access policy", policy.name);
+    await this.request<unknown>("DELETE", `${acct(accountId)}/access/policies/${encodeURIComponent(policy.id)}`);
   }
 
   getAccessApp(accountId: string, appId: string): Promise<CfAccessApp> {
     return this.request<CfAccessApp>("GET", `${acct(accountId)}/access/apps/${encodeURIComponent(appId)}`);
   }
 
-  createAccessApp(accountId: string, app: Record<string, unknown>): Promise<CfAccessApp> {
+  async createAccessApp(accountId: string, app: Record<string, unknown>): Promise<CfAccessApp> {
+    ours("Access application", typeof app["name"] === "string" ? app["name"] : undefined);
     return this.request<CfAccessApp>("POST", `${acct(accountId)}/access/apps`, app);
   }
 
-  async deleteAccessApp(accountId: string, appId: string): Promise<void> {
-    await this.request<unknown>("DELETE", `${acct(accountId)}/access/apps/${encodeURIComponent(appId)}`);
+  async deleteAccessApp(accountId: string, app: { id: string; name: string }): Promise<void> {
+    ours("Access application", app.name);
+    await this.request<unknown>("DELETE", `${acct(accountId)}/access/apps/${encodeURIComponent(app.id)}`);
   }
 
   // Notifications.
 
-  createNotificationPolicy(accountId: string, policy: Record<string, unknown>): Promise<{ id: string }> {
+  async createNotificationPolicy(accountId: string, policy: Record<string, unknown>): Promise<{ id: string }> {
+    ours("notification", typeof policy["name"] === "string" ? policy["name"] : undefined);
     return this.request<{ id: string }>("POST", `${acct(accountId)}/alerting/v3/policies`, policy);
   }
 
-  async deleteNotificationPolicy(accountId: string, policyId: string): Promise<void> {
-    await this.request<unknown>("DELETE", `${acct(accountId)}/alerting/v3/policies/${encodeURIComponent(policyId)}`);
+  async deleteNotificationPolicy(accountId: string, policy: { id: string; name: string }): Promise<void> {
+    ours("notification", policy.name);
+    await this.request<unknown>("DELETE", `${acct(accountId)}/alerting/v3/policies/${encodeURIComponent(policy.id)}`);
   }
 
   async countDnsRecords(zoneId: string): Promise<number> {

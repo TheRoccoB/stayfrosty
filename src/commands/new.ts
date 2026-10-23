@@ -19,6 +19,7 @@ import {
   WINDOW_DESCRIPTION,
   boxLabels,
   boxSelector,
+  isUntouchable,
   type HzFirewall,
   type HzFirewallRule,
   type HzServer,
@@ -67,8 +68,8 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   let server = servers[0];
   let firewall = firewalls[0];
   await refuseForeign(ctx, box, server, firewall);
-  if (server !== undefined && server.labels[LABEL_ADOPTED] !== undefined) {
-    throw new FrostyError(`${box} is an adopted server, not one frosty new created.`, `Re-apply its setup with: frosty adopt ${box} --ip ${server.public_net.ipv4?.ip ?? "<ip>"} --resume`);
+  if (server !== undefined && isUntouchable(server)) {
+    throw new FrostyError(`${box} is an adopted or protected server, which frosty new never touches.`, `Re-apply its setup with: frosty adopt ${box} --ip ${server.public_net.ipv4?.ip ?? "<ip>"} --resume`);
   }
   if ((server !== undefined || firewall !== undefined) && !opts.resume) {
     throw new FrostyError(
@@ -204,12 +205,23 @@ export async function finishBox(ctx: Context, input: FinishInput): Promise<numbe
   }
   io.out(`ssh ${box} works through Cloudflare Access.`);
 
-  // 15. Only now close the window.
+  // 15. Every check except the window's, through the tunnel. The window closes only if they pass,
+  // so a box that is not right yet stays reachable (from this laptop's IP only) to fix.
+  const before = await checkBox(ctx, box, tunnelTarget(ctx, box), server, { tunnel: true, token, window: false });
+  const beforeFailed = before.filter((r) => !r.ok);
+  if (beforeFailed.length > 0) {
+    printResults(ctx, before);
+    io.out("");
+    io.err(`${beforeFailed.length} check(s) failed on ${box}, so the window stays open for this laptop's IP only. Fix them (see above), then run the same command again with --resume.`);
+    return 1;
+  }
+
+  // 16. Close the window: no rules on frosty's firewall, which stays attached, so the box denies
+  // all inbound. Then check the window and the firewall again.
   await closeWindow(ctx, firewall);
   io.out(`Closed the window. The box firewall now admits nothing.`);
-
-  // 16. Everything, checked through the tunnel.
-  const results = await checkBox(ctx, box, tunnelTarget(ctx, box), server, { tunnel: true, token });
+  const after = await windowChecks(ctx, box, await ctx.hetzner.getServer(server.id));
+  const results = [...before, ...after];
   printResults(ctx, results);
   const failed = results.filter((r) => !r.ok);
   io.out("");
@@ -332,7 +344,19 @@ export async function rebootIfRequired(ctx: Context, target: SshTarget): Promise
 
 // The checks of section 6 that exist so far. With `tunnel`, also the Cloudflare side and the
 // closed window; with `token`, a search of the box for the tunnel token.
-export async function checkBox(ctx: Context, box: string, target: SshTarget, server: HzServer, opts: { tunnel: boolean; token?: string }): Promise<CheckResult[]> {
+// The checks that close (or would catch an open) front door on the Hetzner side.
+async function windowChecks(ctx: Context, box: string, server: HzServer): Promise<CheckResult[]> {
+  const firewalls = await ctx.hetzner.listFirewalls(boxSelector(box));
+  return [checkWindowClosed(box, firewalls[0], ctx.now()), checkOnlyOurFirewall(box, server, firewalls[0])];
+}
+
+export async function checkBox(
+  ctx: Context,
+  box: string,
+  target: SshTarget,
+  server: HzServer,
+  opts: { tunnel: boolean; token?: string; window?: boolean },
+): Promise<CheckResult[]> {
   const login = [await checkRootRefused(ctx.ssh, target, box), await checkOnlyPublickey(ctx.ssh, target, box)];
   // For an adopted server, its life under frosty starts at adoption, not at its creation.
   const created = Date.parse(server.created);
@@ -345,12 +369,11 @@ export async function checkBox(ctx: Context, box: string, target: SshTarget, ser
   }
   const { config, cloudflare } = ctx;
   const hostname = sshHostname(ctx, box);
-  const [edge, firewalls, records] = await Promise.all([findEdge(ctx, box), ctx.hetzner.listFirewalls(boxSelector(box)), cloudflare.listDnsRecords(config.zoneId)]);
+  const [edge, records] = await Promise.all([findEdge(ctx, box), cloudflare.listDnsRecords(config.zoneId)]);
   const ingress = edge.tunnel === undefined ? [] : await cloudflare.getTunnelIngress(config.accountId, edge.tunnel.id);
   const app = edge.app === undefined ? undefined : await cloudflare.getAccessApp(config.accountId, edge.app.id);
   const api = [
-    checkWindowClosed(box, firewalls[0], ctx.now()),
-    checkOnlyOurFirewall(box, server, firewalls[0]),
+    ...(opts.window === false ? [] : await windowChecks(ctx, box, server)),
     ...[checkProtected(server)].filter((c): c is CheckResult => c !== undefined),
     checkTunnel(box, edge.tunnel, ingress, hostname),
     checkAccess(box, app, edge.policy, hostname, config.accessEmails),

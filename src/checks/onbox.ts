@@ -10,6 +10,7 @@ import { checkPendingReboot, checkUnattendedUpgrades } from "./updates.ts";
 export const GATHER_SCRIPT = `set -u
 section() { echo "### $1"; }
 section sshd; sshd -T 2>&1 || true
+section sshd-match; grep -hiE '^[[:space:]]*Match[[:space:]]' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
 section ufw; ufw status verbose 2>&1 || true
 section ss; ss -tulnpH 2>&1 || true
 section uu-enabled; systemctl is-enabled unattended-upgrades.service 2>&1 || true
@@ -58,7 +59,7 @@ export function evaluateOnBox(sections: Map<string, string>, want: OnBoxExpectat
   const get = (key: string): string => sections.get(key) ?? "";
   const now = Number(get("now").trim()) || Math.floor(Date.now() / 1000);
   return [
-    checkSshd(get("sshd"), box, adminUser),
+    checkSshd(get("sshd"), box, adminUser, get("sshd-match")),
     checkUfw(get("ufw"), box),
     checkListeners(get("ss")),
     checkUnattendedUpgrades(

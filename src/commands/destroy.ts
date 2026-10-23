@@ -2,7 +2,7 @@ import { hostKeyAlias } from "../box.ts";
 import { assertBoxName, buildContext, type Deps } from "../context.ts";
 import { describeEdge, edgeIsEmpty, findEdge, removeEdge, removeTunnel } from "../edge.ts";
 import { ApiError, FrostyError } from "../errors.ts";
-import { LABEL_ADOPTED, boxSelector } from "../hetzner.ts";
+import { boxSelector, isUntouchable } from "../hetzner.ts";
 import { tildify, writeSshConfig } from "../sshconfig.ts";
 import { sshConfigEntries } from "./new.ts";
 
@@ -23,10 +23,12 @@ export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<numb
     return 0;
   }
 
-  const adopted = servers.filter((s) => s.labels[LABEL_ADOPTED] !== undefined);
+  // Before anything is removed, Cloudflare side included: a protected or adopted server keeps
+  // its whole setup.
+  const adopted = servers.filter((s) => isUntouchable(s));
   if (adopted.length > 0) {
     throw new FrostyError(
-      `${box} is an adopted server. frosty never deletes a server it did not create.`,
+      `${box} is an adopted or delete/rebuild protected server. frosty never deletes a server it did not create, or one you protected.`,
       "Delete it yourself in the Hetzner Cloud Console if you really mean to (turn off its protection first).",
     );
   }

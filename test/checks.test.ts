@@ -13,6 +13,10 @@ const NOW = 1_790_000_000;
 describe("sshd check", () => {
   it("passes the hardened config", () => {
     expect(checkSshd(SSHD_T_GOOD, "t1", "ops").ok).toBe(true);
+    expect(checkSshd(SSHD_T_GOOD, "t1", "ops", "\n").ok).toBe(true);
+    const match = checkSshd(SSHD_T_GOOD, "t1", "ops", "Match Address 10.0.0.0/8\n");
+    expect(match.ok).toBe(false);
+    expect(match.detail).toContain("Match blocks (Match Address 10.0.0.0/8)");
   });
 
   it("names every wrong value", () => {
