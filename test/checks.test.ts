@@ -200,6 +200,9 @@ describe("edge checks", () => {
     const policy = { id: "p", name: "stayfrosty-t1", decision: "allow", include: [{ email: { email: "me@example.com" } }] };
     const app = { id: "a", name: "stayfrosty-t1", type: "self_hosted", domain: "ssh-t1.example.com", policies: [{ ...policy, precedence: 1 }] };
     expect(checkAccess("t1", app, policy, "ssh-t1.example.com", ["me@example.com"]).ok).toBe(true);
+    const short = checkAccess("t1", app, policy, "ssh-t1.example.com", ["me@example.com", "two@example.com"]);
+    expect(short.ok).toBe(false);
+    expect(short.detail).toContain("does not include two@example.com");
     const open = { ...policy, decision: "bypass", include: [{ everyone: {} }] };
     const result = checkAccess("t1", { ...app, policies: [{ ...open, precedence: 1 }] }, open, "ssh-t1.example.com", ["me@example.com"]);
     expect(result.ok).toBe(false);

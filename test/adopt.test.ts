@@ -28,6 +28,7 @@ describe("frosty adopt", () => {
   let env: Record<string, string>;
   let http: FakeHttp;
   let hz: FakeHetzner;
+  let cf: FakeCloudflare;
   let box: FakeBox;
   let scanned: string[];
   let adminExists: boolean;
@@ -92,7 +93,7 @@ describe("frosty adopt", () => {
     await saveConfig(sampleConfig, env);
     http = new FakeHttp();
     hz = new FakeHetzner(http);
-    new FakeCloudflare(http);
+    cf = new FakeCloudflare(http);
     hz.servers.push(existingServer());
     box = new FakeBox();
     scanned = [];
@@ -305,6 +306,12 @@ describe("frosty adopt", () => {
     const before = http.writes().length;
     await expect(runDestroy(deps(new ScriptedIo(["app1"])), { box: "app1", dryRun: false })).rejects.toThrow(/protected server/);
     expect(http.writes()).toHaveLength(before);
+  });
+
+  it("never reuses a stayfrosty- policy whose emails are not exactly accessEmails", async () => {
+    cf.policies.push({ id: "pol-x", name: "stayfrosty-app1", decision: "allow", include: [{ email: { email: "me@example.com" } }, { email: { email: "someone@else.com" } }] });
+    await expect(runAdopt(deps(new ScriptedIo()), opts())).rejects.toThrow(/not an allow policy for exactly me@example.com/);
+    expect(cf.apps).toEqual([]);
   });
 
   it("destroy and new both refuse an adopted server", async () => {

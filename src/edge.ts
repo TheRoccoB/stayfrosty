@@ -119,9 +119,9 @@ export async function ensureAccess(ctx: Context, box: string, edge: Edge): Promi
   const { cloudflare, config, io } = ctx;
   let policy = edge.policy;
   // A policy with frosty's name is reused only if it is still frosty's kind: allow, emails only.
-  if (policy !== undefined && !isOurEmailPolicy(policy)) {
+  if (policy !== undefined && (!isOurEmailPolicy(policy) || !sameEmails(policy.include.map((r) => r.email?.email ?? ""), config.accessEmails))) {
     throw new FrostyError(
-      `Access policy ${policy.name} is no longer an allow-by-email policy, so frosty will not attach it.`,
+      `Access policy ${policy.name} is not an allow policy for exactly ${config.accessEmails.join(", ")}, so frosty will not attach it.`,
       "Delete it in the Cloudflare dashboard (Access, Policies), then run the command again with --resume. frosty creates a fresh one.",
     );
   }
@@ -251,4 +251,9 @@ export async function waitForDns(ctx: Context, hostname: string): Promise<void> 
     }
     await ctx.sleep(5000);
   }
+}
+
+export function sameEmails(a: string[], b: string[]): boolean {
+  const norm = (list: string[]): string => [...new Set(list.map((e) => e.toLowerCase()))].sort().join(",");
+  return norm(a) === norm(b);
 }

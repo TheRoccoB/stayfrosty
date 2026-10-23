@@ -102,6 +102,11 @@ export function checkAccess(box: string, app: CfAccessApp | undefined, policy: C
     }
   }
   problems.push(...ruleProblems(policy.include, emails));
+  const listed = new Set((policy.include ?? []).map((r) => r.email?.email.toLowerCase()).filter((e): e is string => e !== undefined));
+  const missing = emails.filter((e) => !listed.has(e.toLowerCase()));
+  if (missing.length > 0) {
+    problems.push(`the policy does not include ${missing.join(", ")}`);
+  }
   if ((policy.include ?? []).length === 0) {
     problems.push("the policy includes nobody");
   }
