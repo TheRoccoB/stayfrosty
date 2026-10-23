@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { cfOk, type Call, type FakeHttp } from "./fake-http.ts";
 
 const CF = "api.cloudflare.com";
@@ -83,8 +84,17 @@ export class FakeCloudflare {
       })
       .on("GET", CF, `${ACCT}/access/apps`, () => cfOk(this.apps, { total_pages: 1 }))
       .on("POST", CF, `${ACCT}/access/apps`, (call) => {
-        const app = { id: `app-${this.id()}`, ...body(call) };
+        const id = `app-${this.id()}`;
+        // Cloudflare gives every app a 64-hex audience tag.
+        const app = { id, aud: createHash("sha256").update(id).digest("hex"), ...body(call) };
         this.apps.push(app);
+        return cfOk(app);
+      })
+      .on("PUT", CF, `${ACCT}/access/apps/[^/]+`, (call) => {
+        const i = this.apps.findIndex((a) => a["id"] === lastId(call));
+        const old = this.apps[i] as Item;
+        const app = { id: old["id"], aud: old["aud"], ...body(call) };
+        this.apps[i] = app;
         return cfOk(app);
       })
       .on("GET", CF, `${ACCT}/access/apps/[^/]+`, (call) => {

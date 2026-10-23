@@ -13,6 +13,7 @@ import type { Io } from "./io.ts";
 import { findLaptopIp, type LaptopIp } from "./ip.ts";
 import { shellPasswordCommand, type PasswordCommandRunner } from "./password.ts";
 import { loadTokens } from "./tokens.ts";
+import { rawGet, type RawGet } from "./rawget.ts";
 import { findCommand } from "./which.ts";
 
 // Everything a command touches in the outside world, injectable for tests.
@@ -36,6 +37,8 @@ export interface Deps {
   cloudflaredPath?: string | undefined;
   isTty?: boolean;
   runPasswordCommand?: PasswordCommandRunner;
+  // HTTPS GET with the path sent exactly as written (verify's route checks).
+  rawGet?: RawGet;
 }
 
 export interface Context {
@@ -62,6 +65,7 @@ export interface Context {
   keyPath: string;
   publicKey: string;
   cloudflaredPath: string | undefined;
+  rawGet: RawGet;
 }
 
 export async function buildContext(deps: Deps): Promise<Context> {
@@ -98,6 +102,7 @@ export async function buildContext(deps: Deps): Promise<Context> {
     authoritativeResolves: deps.authoritativeResolves ?? authoritativeResolves,
     systemResolves: deps.systemResolves ?? systemResolves,
     fetch: fetchImpl,
+    rawGet: deps.rawGet ?? rawGet,
     laptopIp: deps.laptopIp ?? (() => findLaptopIp(fetchImpl)),
     isTty: deps.isTty ?? (process.stdin.isTTY === true && process.stdout.isTTY === true),
     runPasswordCommand: deps.runPasswordCommand ?? shellPasswordCommand,

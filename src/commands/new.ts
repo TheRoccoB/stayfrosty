@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { FRESH_CONNECTION, hostKeyAlias, knownHostsPath, lastLines, waitForSsh, type SshTarget } from "../box.ts";
+import { FRESH_CONNECTION, hostKeyAlias, knownHostsPath, lastLines, runOrFail, waitForSsh, type SshTarget } from "../box.ts";
 import { checkOnlyPublickey, checkRootRefused } from "../checks/login.ts";
 import { runOnBoxChecks } from "../checks/onbox.ts";
 import type { CheckResult } from "../checks/types.ts";
@@ -8,7 +8,8 @@ import { rebootTimeFor } from "../config.ts";
 import { assertBoxName, buildContext, directTarget, requireCloudflared, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
 import { checkAccess, checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
 import { checkTokenNotExposed } from "../checks/token.ts";
-import { ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, installConnector, waitForDns, waitForHealthyTunnel } from "../edge.ts";
+import { checkRouteAccess, checkRouteMissing, checkRouteOutside, checkRoutePorts } from "../checks/routes.ts";
+import { boxRoutes, edgeName, ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, ingressSpec, installConnector, specIngress, waitForDns, waitForHealthyTunnel } from "../edge.ts";
 import { tildify, writeSshConfig, type SshConfigEntry } from "../sshconfig.ts";
 import { FrostyError } from "../errors.ts";
 import {
@@ -376,14 +377,30 @@ export async function checkBox(
   const [edge, records] = await Promise.all([findEdge(ctx, box), cloudflare.listDnsRecords(config.zoneId)]);
   const ingress = edge.tunnel === undefined ? [] : await cloudflare.getTunnelIngress(config.accountId, edge.tunnel.id);
   const app = edge.app === undefined ? undefined : await cloudflare.getAccessApp(config.accountId, edge.app.id);
+  const routes = boxRoutes(ctx, box);
+  // Route apps re-read one by one: the list may leave out destinations and policies.
+  const listed = routes.length === 0 ? [] : await cloudflare.listAccessApps(config.accountId);
+  const apps = await Promise.all(listed.map((a) => (a.name.startsWith(`${edgeName(box)}:`) ? cloudflare.getAccessApp(config.accountId, a.id) : Promise.resolve(a))));
+  const spec = ingressSpec(ctx, box, apps);
+  const routeResults: CheckResult[] = [];
+  if (routes.length > 0) {
+    const policies = await cloudflare.listAccessPolicies(config.accountId);
+    const ss = await runOrFail(ctx.ssh, target, "ss -tlnpH", "Listing listening sockets");
+    routeResults.push(checkRoutePorts(routes, ss));
+    for (const route of routes) {
+      routeResults.push(spec.routes.some((r) => r.route === route) ? checkRouteAccess(box, route, apps, policies, edge.policy?.id) : checkRouteMissing(box, route));
+      routeResults.push(await checkRouteOutside(ctx.rawGet, route, config.accessTeam ?? ""));
+    }
+  }
   const api = [
     ...(opts.window === false ? [] : await windowChecks(ctx, box, server)),
     ...[checkProtected(server)].filter((c): c is CheckResult => c !== undefined),
-    checkTunnel(box, edge.tunnel, ingress, hostname),
+    checkTunnel(box, edge.tunnel, ingress, hostname, specIngress(spec), spec.routes.length),
     checkAccess(box, app, edge.policy, hostname, config.accessEmails),
     checkDns(box, records, hostname, edge.tunnel?.id, server.public_net.ipv4?.ip, server.public_net.ipv6?.ip),
     checkAlert(box, edge.alert, edge.tunnel?.id),
     await checkAccessLogin(ctx.fetch, hostname),
+    ...routeResults,
   ];
   const tokenCheck = opts.token === undefined ? [] : [await checkTokenNotExposed(ctx.ssh, target, opts.token)];
   return [...login, ...onBox, ...tokenCheck, ...api];
