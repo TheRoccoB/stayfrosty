@@ -88,7 +88,9 @@ describe("adopt's reading of cloud-init.yaml", () => {
     expect(script.indexOf("apt-get \"${apt_opts[@]}\" install ufw")).toBeLessThan(script.indexOf("/etc/ssh/sshd_config.d/00-stayfrosty.conf"));
     expect(script.trimEnd().split("\n").slice(-4)).toEqual(["/usr/local/sbin/stayfrosty-harden", "echo stayfrosty-harden-ok", "}", "main </dev/null"]);
     expect(script).toContain("dist-upgrade");
-    expect(script).toContain("dpkg --configure -a");
+    expect(script).toContain("dpkg --force-confdef --force-confold --configure -a");
+    expect(script).toContain("--no-remove dist-upgrade");
+    expect(script.indexOf("/etc/os-release")).toBeLessThan(script.indexOf("apt-get"));
     expect(script).toContain("UCF_FORCE_CONFFOLD=1");
   });
 

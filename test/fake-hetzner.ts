@@ -31,6 +31,11 @@ export class FakeHetzner {
       .on("GET", HZ, "/v1/servers", (call) => hzPage("servers", byName(this.servers, call)))
       .on("GET", HZ, "/v1/firewalls", (call) => hzPage("firewalls", byName(this.firewalls, call)))
       .on("GET", HZ, "/v1/ssh_keys", () => hzPage("ssh_keys", this.sshKeys))
+      .on("GET", HZ, "/v1/firewalls/\\d+", (call) => {
+        const id = Number(call.url.pathname.split("/").pop());
+        const firewall = this.firewalls.find((f) => f["id"] === id);
+        return firewall === undefined ? { status: 404, body: { error: { code: "not_found", message: "no firewall" } } } : { body: { firewall } };
+      })
       .on("POST", HZ, "/v1/ssh_keys", (call) => {
         const key = { id: this.id(), fingerprint: "x", ...(call.body as Record<string, unknown>) };
         this.sshKeys.push(key);

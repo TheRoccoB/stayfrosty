@@ -12,12 +12,13 @@ import { FakeHttp, noSleep } from "./fake-http.ts";
 describe("client guards", () => {
   let http: FakeHttp;
   let hz: FakeHetzner;
+  let fcf: FakeCloudflare;
   let dir: string;
 
   beforeEach(() => {
     http = new FakeHttp();
     hz = new FakeHetzner(http);
-    new FakeCloudflare(http);
+    fcf = new FakeCloudflare(http);
     dir = mkdtempSync(join(tmpdir(), "frosty-guards-"));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -25,19 +26,45 @@ describe("client guards", () => {
   const cf = (log?: string): Cloudflare => new Cloudflare({ token: "cf-token-0123456789", fetch: http.fetch, sleep: noSleep, changeLog: log === undefined ? undefined : fileChangeLog(log) });
   const hetzner = (): Hetzner => new Hetzner({ token: "hz-token-0123456789", fetch: http.fetch, sleep: noSleep });
 
-  it("Cloudflare: never touches a tunnel, app, policy or alert without frosty's prefix", async () => {
+  const seedForeign = (): void => {
+    fcf.tunnels.push({ id: "11111111-1111-4111-8111-111111111111", name: "other-tunnel", status: "healthy" });
+    fcf.apps.push({ id: "app-wild", name: "example ssh", domain: "*.example.com", type: "self_hosted", policies: [{ id: "pol-gh", precedence: 1 }] });
+    fcf.policies.push({ id: "pol-gh", name: "gh-policy", decision: "allow", include: [{ email: { email: "a@b.co" } }, { "github-organization": { name: "example-org" } }] });
+    fcf.policies.push({ id: "pol-bad", name: "stayfrosty-x", decision: "bypass", include: [{ everyone: {} }] });
+    fcf.policies.push({ id: "pol-ok", name: "stayfrosty-x", decision: "allow", include: [{ email: { email: "a@b.co" } }] });
+    fcf.alerts.push({ id: "al-1", name: "other alert" });
+    fcf.dns.push({ id: "dns-1", name: "sshother.example.com", type: "CNAME", content: "x.cfargotunnel.com", proxied: true, comment: null });
+  };
+
+  it("Cloudflare: deletes and changes check the live object's name, not the caller's", async () => {
+    seedForeign();
     const c = cf();
-    const foreign = { id: "x", name: "other-tunnel" };
+    // A frosty-looking name paired with a foreign id must not get through.
+    await expect(c.deleteTunnel("acc", { id: "11111111-1111-4111-8111-111111111111", name: "stayfrosty-x" })).rejects.toThrow(/"other-tunnel"/);
+    await expect(c.putTunnelIngress("acc", { id: "11111111-1111-4111-8111-111111111111", name: "stayfrosty-x" }, [])).rejects.toThrow(/"other-tunnel"/);
+    await expect(c.deleteAccessApp("acc", { id: "app-wild", name: "stayfrosty-x" })).rejects.toThrow(/"example ssh"/);
+    await expect(c.deleteAccessPolicy("acc", { id: "pol-gh", name: "stayfrosty-x" })).rejects.toThrow(/"gh-policy"/);
+    await expect(c.deleteNotificationPolicy("acc", { id: "al-1", name: "stayfrosty-x" })).rejects.toThrow(/"other alert"/);
+    await expect(c.deleteDnsRecord("z", { id: "dns-1", name: "x", comment: "stayfrosty box x" })).rejects.toThrow(/not commented/);
     await expect(c.createTunnel("acc", "other-tunnel")).rejects.toThrow(/only touches names starting with stayfrosty-/);
     await expect(c.createTunnel("acc", "stayfrosty-")).rejects.toThrow(/only touches/);
-    await expect(c.deleteTunnel("acc", foreign)).rejects.toThrow(/only touches/);
-    await expect(c.putTunnelIngress("acc", foreign, [])).rejects.toThrow(/only touches/);
-    await expect(c.deleteAccessApp("acc", { id: "a", name: "*.example.com" })).rejects.toThrow(/only touches/);
-    await expect(c.createAccessApp("acc", { name: "ssh-bigbox" })).rejects.toThrow(/only touches/);
-    await expect(c.deleteAccessPolicy("acc", { id: "p", name: "gh-policy" })).rejects.toThrow(/only touches/);
-    await expect(c.createNotificationPolicy("acc", { name: "other" })).rejects.toThrow(/only touches/);
-    await expect(c.deleteNotificationPolicy("acc", { id: "n", name: "other" })).rejects.toThrow(/only touches/);
     expect(http.writes()).toEqual([]);
+  });
+
+  it("Cloudflare: tunnel ingress is only the box's SSH hostname and a 404", async () => {
+    const c = cf();
+    const t = await c.createTunnel("acc", "stayfrosty-app1");
+    const good = [{ hostname: "ssh-app1.example.com", service: "ssh://localhost:22" }, { service: "http_status:404" }];
+    for (const bad of [
+      [{ hostname: "ssh-app1.example.com", service: "http://localhost:80" }, { service: "http_status:404" }],
+      [{ hostname: "*.example.com", service: "ssh://localhost:22" }, { service: "http_status:404" }],
+      [{ hostname: "ssh-other.example.com", service: "ssh://localhost:22" }, { service: "http_status:404" }],
+      [...good, { service: "http_status:404" }],
+      [good[0]],
+    ]) {
+      await expect(c.putTunnelIngress("acc", t, bad as never)).rejects.toThrow(/only sets ssh-app1/);
+    }
+    await expect(c.putTunnelIngress("acc", t, good)).resolves.toBeUndefined();
   });
 
   it("Cloudflare: Access policies are allow, plain email rules only", async () => {
@@ -49,16 +76,83 @@ describe("client guards", () => {
     await expect(make({ include: [{ email: { email: "a@b.co" }, ip: { ip: "0.0.0.0/0" } }] })).rejects.toThrow(/plain email rules/);
     await expect(make({ include: [] })).rejects.toThrow(/plain email rules/);
     await expect(make({ require: [{ email: { email: "a@b.co" } }] })).rejects.toThrow(/plain email rules/);
+    await expect(make({ name: "gh-policy" })).rejects.toThrow(/plain email rules/);
     expect(http.writes()).toEqual([]);
     await expect(make({})).resolves.toBeDefined();
   });
 
-  it("Cloudflare: DNS writes only for frosty's commented, proxied CNAMEs", async () => {
+  it("Cloudflare: an Access app is self-hosted, for exactly ssh-<box>, with only frosty's email policies", async () => {
+    seedForeign();
     const c = cf();
-    await expect(c.createDnsRecord("z", { type: "A", name: "ssh-x.example.com", content: "192.0.2.1", proxied: false, comment: "stayfrosty box x" })).rejects.toThrow(/only creates proxied CNAMEs/);
-    await expect(c.createDnsRecord("z", { type: "CNAME", name: "x", content: "y", proxied: true, comment: "mine" })).rejects.toThrow(/only creates proxied CNAMEs/);
-    await expect(c.deleteDnsRecord("z", { id: "r", name: "sshother.example.com", comment: null })).rejects.toThrow(/not commented/);
+    const app = { name: "stayfrosty-x", type: "self_hosted", domain: "ssh-x.example.com", session_duration: "24h", app_launcher_visible: false, policies: [{ id: "pol-ok", precedence: 1 }] };
+    const make = (p: Record<string, unknown>) => c.createAccessApp("acc", { ...app, ...p } as never);
+    await expect(make({ policies: [{ decision: "bypass", include: [{ everyone: {} }] }] })).rejects.toThrow(/only creates a self-hosted app/);
+    await expect(make({ policies: [{ id: "pol-ok", precedence: 1, decision: "bypass" }] })).rejects.toThrow(/only creates a self-hosted app/);
+    await expect(make({ domain: "*.example.com" })).rejects.toThrow(/only creates a self-hosted app/);
+    await expect(make({ domain: "ssh-other.example.com" })).rejects.toThrow(/only creates a self-hosted app/);
+    await expect(make({ destinations: [{ uri: "sshother.example.com" }] })).rejects.toThrow(/only creates a self-hosted app/);
+    await expect(make({ self_hosted_domains: ["sshother.example.com"] })).rejects.toThrow(/only creates a self-hosted app/);
+    await expect(make({ type: "infrastructure" })).rejects.toThrow(/only creates a self-hosted app/);
+    await expect(make({ policies: [] })).rejects.toThrow(/only creates a self-hosted app/);
+    await expect(make({ policies: [{ id: "pol-gh", precedence: 1 }] })).rejects.toThrow(/refused to attach Access policy gh-policy/);
+    await expect(make({ policies: [{ id: "pol-bad", precedence: 1 }] })).rejects.toThrow(/refused to attach Access policy stayfrosty-x/);
     expect(http.writes()).toEqual([]);
+    await expect(make({})).resolves.toBeDefined();
+  });
+
+  it("Cloudflare: notifications only email one address", async () => {
+    const c = cf();
+    const alert = { name: "stayfrosty-x", description: "d", alert_type: "tunnel_health_event", enabled: true, mechanisms: { email: [{ id: "me@example.com" }] }, filters: { tunnel_id: ["t"] } };
+    await expect(c.createNotificationPolicy("acc", { ...alert, mechanisms: { email: [{ id: "me@example.com" }], webhooks: [{ id: "w" }] } } as never)).rejects.toThrow(/only sends email/);
+    await expect(c.createNotificationPolicy("acc", { ...alert, mechanisms: { email: [{ id: "a@b.co" }, { id: "c@d.co" }] } })).rejects.toThrow(/only sends email/);
+    await expect(c.createNotificationPolicy("acc", { ...alert, name: "other" })).rejects.toThrow(/only touches/);
+    expect(http.writes()).toEqual([]);
+  });
+
+  it("Cloudflare: DNS writes only for frosty's commented, proxied CNAMEs to a tunnel", async () => {
+    seedForeign();
+    const c = cf();
+    const rec = { type: "CNAME", name: "ssh-x.example.com", content: "00000000-0000-4000-8000-000000000001.cfargotunnel.com", proxied: true, comment: "stayfrosty box x" };
+    for (const bad of [{ type: "A", content: "192.0.2.1" }, { proxied: false }, { comment: "mine" }, { name: "example.com" }, { name: "*.example.com" }, { name: "ssh-y.example.com" }, { content: "evil.example.net" }]) {
+      await expect(c.createDnsRecord("z", { ...rec, ...bad })).rejects.toThrow(/only creates proxied CNAMEs/);
+    }
+    await expect(c.deleteDnsRecord("z", { id: "dns-1", name: "sshother.example.com", comment: null })).rejects.toThrow(/not commented/);
+    expect(http.writes()).toEqual([]);
+    await expect(c.createDnsRecord("z", rec)).resolves.toBeDefined();
+  });
+
+  it("Hetzner: firewall writes only touch frosty's own firewall, with only window rules", async () => {
+    hz.firewalls.push(
+      { id: 60, name: "web", labels: {}, rules: [], applied_to: [] },
+      { id: 61, name: "stayfrosty-app1", labels: { stayfrosty: "1", "stayfrosty-box": "app1" }, rules: [], applied_to: [] },
+    );
+    hz.servers.push(
+      { id: 1, name: "app1", labels: { stayfrosty: "1", "stayfrosty-box": "app1" }, public_net: { ipv4: null, ipv6: null, firewalls: [] } },
+      { id: 2, name: "web1", labels: {}, public_net: { ipv4: null, ipv6: null, firewalls: [] } },
+    );
+    const h = hetzner();
+    const win = { direction: "in" as const, protocol: "tcp", port: "22", source_ips: ["198.51.100.7/32"], description: "stayfrosty window" };
+    await expect(h.setFirewallRules(60, [])).rejects.toThrow(/frosty did not create it/);
+    await expect(h.updateFirewallLabels(60, { stayfrosty: "1", "stayfrosty-box": "web" })).rejects.toThrow(/frosty did not create it/);
+    await expect(h.deleteFirewall(60)).rejects.toThrow(/frosty did not create it/);
+    await expect(h.applyFirewall(60, 1)).rejects.toThrow(/frosty did not create it/);
+    await expect(h.applyFirewall(61, 2)).rejects.toThrow(/that server is not box app1/);
+    for (const bad of [
+      [{ ...win, source_ips: ["0.0.0.0/0"] }],
+      [{ ...win, source_ips: ["198.51.100.0/24"] }],
+      [{ ...win, port: "80" }],
+      [{ ...win, port: "any" }],
+      [{ ...win, description: "mine" }],
+      [{ ...win, source_ips: ["198.51.100.7/32", "203.0.113.1/32"] }],
+      [win, win, win],
+    ]) {
+      await expect(h.setFirewallRules(61, bad)).rejects.toThrow(/only ever sets none, or TCP 22 from one address/);
+    }
+    await expect(h.updateFirewallLabels(61, { stayfrosty: "1", "stayfrosty-box": "web1" })).rejects.toThrow(/keeps frosty's labels/);
+    await expect(h.createFirewall("web", { stayfrosty: "1", "stayfrosty-box": "web1" }, [])).rejects.toThrow(/only creates stayfrosty-<box>/);
+    expect(http.writes()).toEqual([]);
+    await expect(h.setFirewallRules(61, [win])).resolves.toBeDefined();
+    await expect(h.applyFirewall(61, 1)).resolves.toBeDefined();
   });
 
   it("Hetzner: never deletes an adopted or protected server, never drops the adopted label", async () => {
@@ -84,6 +178,7 @@ describe("client guards", () => {
     expect(lines.map((l) => l["phase"])).toEqual(["intent", "done"]);
     expect(lines[0]?.["action"]).toBe("cloudflare POST");
     expect(lines[0]?.["request"]).toEqual({ name: "stayfrosty-t1", config_src: "cloudflare" });
+    expect(lines[0]?.["before"]).toBeNull();
     expect(Object.keys(lines[1]?.["result"] as object).sort()).toEqual(["ids", "status"]);
     expect(readFileSync(log, "utf8")).not.toContain("cf-token-0123456789");
   });

@@ -103,7 +103,7 @@ export async function runAdopt(deps: Deps, opts: AdoptOptions): Promise<number> 
   io.out("    - all inbound traffic stops once the window closes, web ports included: only the tunnel reaches it");
   io.out("    - UFW is reset to deny incoming except SSH (existing UFW rules are dropped)");
   io.out(`    - SSH accepts only ${config.adminUser} with a key; root and every other user can no longer log in over SSH`);
-  io.out("    - it may reboot once if the upgrade needs it");
+  io.out("    - upgraded services may be restarted without asking (needrestart), and it may reboot once if the upgrade needs it");
   if (others.length > 0) {
     io.out(`  It has ${others.length} other firewall(s) (id ${others.map((f) => f.id).join(", ")}). adopt attaches frosty's first, then stops so you can detach those.`);
   }

@@ -1,5 +1,5 @@
 import { ApiError, FrostyError } from "./errors.ts";
-import { summarize, type ChangeLog } from "./changelog.ts";
+import { logDone, summarize, type ChangeLog } from "./changelog.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
 import { redact, registerSecret } from "./redact.ts";
 
@@ -20,6 +20,41 @@ function ours(kind: string, name: string | undefined): void {
 
 function emailOnly(rules: CfAccessRule[] | undefined): boolean {
   return (rules ?? []).length > 0 && (rules ?? []).every((r) => Object.keys(r).length === 1 && typeof r.email?.email === "string");
+}
+
+// frosty's own kind of policy: its name, allow, only email includes, no require or exclude.
+export function isOurEmailPolicy(policy: { name?: string; decision?: string; include?: CfAccessRule[]; require?: CfAccessRule[]; exclude?: CfAccessRule[] }): boolean {
+  return (
+    policy.name !== undefined &&
+    policy.name.startsWith(NAME_PREFIX) &&
+    policy.name.length > NAME_PREFIX.length &&
+    policy.decision === "allow" &&
+    emailOnly(policy.include) &&
+    (policy.require ?? []).length === 0 &&
+    (policy.exclude ?? []).length === 0
+  );
+}
+
+const BOX = /^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$/;
+
+// The box a frosty name belongs to, or a refusal.
+function boxOf(kind: string, name: string | undefined): string {
+  ours(kind, name);
+  const box = (name as string).slice(NAME_PREFIX.length);
+  if (!BOX.test(box)) {
+    throw new FrostyError(`frosty refused to change the ${kind} "${name ?? "?"}": "${box}" is not a box name.`, "This is a bug in frosty. Please report it.");
+  }
+  return box;
+}
+
+// ssh-<box>.<some domain>, never a wildcard or the apex.
+function isSshHostname(hostname: string | undefined, box: string): boolean {
+  return hostname !== undefined && hostname.startsWith(`ssh-${box}.`) && /^ssh-[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(hostname);
+}
+
+// What a change log keeps of an object before it is changed.
+function pick(o: { id: string; name: string }): { id: string; name: string } {
+  return { id: o.id, name: o.name };
 }
 
 interface Envelope<T> {
@@ -118,10 +153,11 @@ export class Cloudflare {
     this.baseUrl = opts.baseUrl ?? CLOUDFLARE_BASE_URL;
   }
 
-  async envelope<T>(method: string, path: string, body?: unknown): Promise<Envelope<T>> {
+  // Private, so every write goes through a method below and its guard.
+  private async envelope<T>(method: string, path: string, body?: unknown, before?: unknown): Promise<Envelope<T>> {
     const write = method !== "GET";
     if (write) {
-      this.changeLog?.({ phase: "intent", action: `cloudflare ${method}`, target: path, request: body });
+      this.changeLog?.({ phase: "intent", action: `cloudflare ${method}`, target: path, before, request: body });
     }
     const response = await sendJson({
       api: "cloudflare",
@@ -134,7 +170,7 @@ export class Cloudflare {
     });
     const env = response.body as Envelope<T> | undefined;
     if (write) {
-      this.changeLog?.({ phase: "done", action: `cloudflare ${method}`, target: path, result: summarize(response.status, env?.result) });
+      logDone(this.changeLog, { phase: "done", action: `cloudflare ${method}`, target: path, before, result: summarize(response.status, env?.result) });
     }
     if (response.status >= 200 && response.status < 300 && env?.success === true) {
       return env;
@@ -158,13 +194,13 @@ export class Cloudflare {
     });
   }
 
-  async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const env = await this.envelope<T>(method, path, body);
+  private async request<T>(method: string, path: string, body?: unknown, before?: unknown): Promise<T> {
+    const env = await this.envelope<T>(method, path, body, before);
     return env.result;
   }
 
   // Page-number pagination, following result_info.total_pages; also handles cursor-paginated lists.
-  async listAll<T>(path: string, query: Record<string, string | number | boolean | undefined> = {}, perPage = 50): Promise<T[]> {
+  private async listAll<T>(path: string, query: Record<string, string | number | boolean | undefined> = {}, perPage = 50): Promise<T[]> {
     const items: T[] = [];
     let page = 1;
     let cursor: string | undefined;
@@ -235,8 +271,12 @@ export class Cloudflare {
     return this.listAll<CfAccessApp>(`/accounts/${encodeURIComponent(accountId)}/access/apps`);
   }
 
-  listNotificationPolicies(accountId: string): Promise<CfNotificationPolicy[]> {
-    return this.request<CfNotificationPolicy[]>("GET", `/accounts/${encodeURIComponent(accountId)}/alerting/v3/policies`);
+  async listNotificationPolicies(accountId: string): Promise<CfNotificationPolicy[]> {
+    const env = await this.envelope<CfNotificationPolicy[]>("GET", `/accounts/${encodeURIComponent(accountId)}/alerting/v3/policies`);
+    if ((env.result_info?.total_pages ?? 1) > 1) {
+      throw new FrostyError("The account has more notification policies than one page, and frosty reads only one.", "This is a bug in frosty. Please report it.");
+    }
+    return Array.isArray(env.result) ? env.result : [];
   }
 
   listDnsRecords(zoneId: string, query: Record<string, string | number | undefined> = {}): Promise<CfDnsRecord[]> {
@@ -261,9 +301,24 @@ export class Cloudflare {
     return token;
   }
 
+  // Only frosty's own shape: its box's SSH hostname to the box's sshd, everything else 404.
   async putTunnelIngress(accountId: string, tunnel: { id: string; name: string }, ingress: CfIngressRule[]): Promise<void> {
-    ours("tunnel", tunnel.name);
-    await this.request<unknown>("PUT", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnel.id)}/configurations`, { config: { ingress } });
+    const live = await this.getTunnel(accountId, tunnel.id);
+    const box = boxOf("tunnel", live.name);
+    const [first, last, ...rest] = ingress;
+    if (
+      rest.length > 0 ||
+      first === undefined ||
+      last === undefined ||
+      Object.keys(first).sort().join() !== "hostname,service" ||
+      first.service !== "ssh://localhost:22" ||
+      !isSshHostname(first.hostname, box) ||
+      Object.keys(last).join() !== "service" ||
+      last.service !== "http_status:404"
+    ) {
+      throw new FrostyError(`frosty refused to set ingress on tunnel ${live.name}: it only sets ssh-${box}.<domain> to ssh://localhost:22 and a 404 catch-all.`, "This is a bug in frosty. Please report it.");
+    }
+    await this.request<unknown>("PUT", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(live.id)}/configurations`, { config: { ingress } }, pick(live));
   }
 
   async getTunnelIngress(accountId: string, tunnelId: string): Promise<CfIngressRule[]> {
@@ -272,27 +327,36 @@ export class Cloudflare {
   }
 
   async deleteTunnel(accountId: string, tunnel: { id: string; name: string }): Promise<void> {
-    ours("tunnel", tunnel.name);
-    const tunnelId = tunnel.id;
+    const live = await this.getTunnel(accountId, tunnel.id);
+    ours("tunnel", live.name);
+    const tunnelId = live.id;
     // A tunnel with live connections cannot be deleted; drop them first.
-    await this.request<unknown>("DELETE", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/connections`);
-    await this.request<unknown>("DELETE", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}`);
+    await this.request<unknown>("DELETE", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/connections`, undefined, pick(live));
+    await this.request<unknown>("DELETE", `${acct(accountId)}/cfd_tunnel/${encodeURIComponent(tunnelId)}`, undefined, pick(live));
   }
 
   // DNS.
 
   async createDnsRecord(zoneId: string, record: { type: string; name: string; content: string; proxied: boolean; comment: string }): Promise<CfDnsRecord> {
-    if (!record.comment.startsWith(DNS_COMMENT_PREFIX) || record.type !== "CNAME" || !record.proxied) {
+    const box = record.comment.startsWith(DNS_COMMENT_PREFIX) ? record.comment.slice(DNS_COMMENT_PREFIX.length) : "";
+    if (
+      !BOX.test(box) ||
+      record.type !== "CNAME" ||
+      !record.proxied ||
+      !isSshHostname(record.name, box) ||
+      !/^[0-9a-f-]{36}\.cfargotunnel\.com$/.test(record.content)
+    ) {
       throw new FrostyError(`frosty refused to create DNS record ${record.name}: it only creates proxied CNAMEs commented "${DNS_COMMENT_PREFIX}...".`, "This is a bug in frosty. Please report it.");
     }
     return this.request<CfDnsRecord>("POST", `/zones/${encodeURIComponent(zoneId)}/dns_records`, { ...record, ttl: 1 });
   }
 
   async deleteDnsRecord(zoneId: string, record: { id: string; name: string; comment?: string | null }): Promise<void> {
-    if (record.comment?.startsWith(DNS_COMMENT_PREFIX) !== true) {
-      throw new FrostyError(`frosty refused to delete DNS record ${record.name}: it is not commented "${DNS_COMMENT_PREFIX}...".`, "This is a bug in frosty. Please report it.");
+    const live = await this.request<CfDnsRecord>("GET", `/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(record.id)}`);
+    if (live.comment?.startsWith(DNS_COMMENT_PREFIX) !== true) {
+      throw new FrostyError(`frosty refused to delete DNS record ${live.name}: it is not commented "${DNS_COMMENT_PREFIX}...".`, "This is a bug in frosty. Please report it.");
     }
-    await this.request<unknown>("DELETE", `/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(record.id)}`);
+    await this.request<unknown>("DELETE", `/zones/${encodeURIComponent(zoneId)}/dns_records/${encodeURIComponent(live.id)}`, undefined, live);
   }
 
   // Access.
@@ -302,43 +366,74 @@ export class Cloudflare {
   }
 
   async createAccessPolicy(accountId: string, policy: { name: string; decision: string; include: CfAccessRule[]; session_duration?: string }): Promise<CfAccessPolicy> {
-    ours("Access policy", policy.name);
     // Only "allow these emails": never bypass, everyone, groups, IdP orgs, IP ranges or service tokens.
-    if (policy.decision !== "allow" || !emailOnly(policy.include) || Object.keys(policy).some((k) => !["name", "decision", "include", "session_duration"].includes(k))) {
+    if (!isOurEmailPolicy(policy) || Object.keys(policy).some((k) => !["name", "decision", "include", "session_duration"].includes(k))) {
       throw new FrostyError(`frosty refused to create Access policy ${policy.name}: it only creates allow policies of plain email rules.`, "This is a bug in frosty. Please report it.");
     }
     return this.request<CfAccessPolicy>("POST", `${acct(accountId)}/access/policies`, policy);
   }
 
+  getAccessPolicy(accountId: string, policyId: string): Promise<CfAccessPolicy> {
+    return this.request<CfAccessPolicy>("GET", `${acct(accountId)}/access/policies/${encodeURIComponent(policyId)}`);
+  }
+
   async deleteAccessPolicy(accountId: string, policy: { id: string; name: string }): Promise<void> {
-    ours("Access policy", policy.name);
-    await this.request<unknown>("DELETE", `${acct(accountId)}/access/policies/${encodeURIComponent(policy.id)}`);
+    const live = await this.getAccessPolicy(accountId, policy.id);
+    ours("Access policy", live.name);
+    await this.request<unknown>("DELETE", `${acct(accountId)}/access/policies/${encodeURIComponent(live.id)}`, undefined, live);
   }
 
   getAccessApp(accountId: string, appId: string): Promise<CfAccessApp> {
     return this.request<CfAccessApp>("GET", `${acct(accountId)}/access/apps/${encodeURIComponent(appId)}`);
   }
 
-  async createAccessApp(accountId: string, app: Record<string, unknown>): Promise<CfAccessApp> {
-    ours("Access application", typeof app["name"] === "string" ? app["name"] : undefined);
+  // Only a self-hosted app for exactly its box's SSH hostname, with only frosty's own email
+  // policies, each re-read and checked. Nothing else in the body: no inline policies, no
+  // wildcard, no extra domains or destinations.
+  async createAccessApp(
+    accountId: string,
+    app: { name: string; type: string; domain: string; session_duration: string; app_launcher_visible: boolean; policies: { id: string; precedence: number }[] },
+  ): Promise<CfAccessApp> {
+    const box = boxOf("Access application", app.name);
+    const keysOk = Object.keys(app).sort().join() === "app_launcher_visible,domain,name,policies,session_duration,type";
+    const policiesOk = app.policies.length > 0 && app.policies.every((p) => Object.keys(p).sort().join() === "id,precedence" && typeof p.id === "string");
+    if (!keysOk || app.type !== "self_hosted" || !isSshHostname(app.domain, box) || !policiesOk || !/^\d+(m|h)$/.test(app.session_duration)) {
+      throw new FrostyError(`frosty refused to create Access application ${app.name}: it only creates a self-hosted app for ssh-${box}.<domain> with frosty's policies.`, "This is a bug in frosty. Please report it.");
+    }
+    for (const ref of app.policies) {
+      const live = await this.getAccessPolicy(accountId, ref.id);
+      if (!isOurEmailPolicy(live)) {
+        throw new FrostyError(`frosty refused to attach Access policy ${live.name} to ${app.name}: it is not one of frosty's allow-by-email policies.`, "Delete that policy in the Cloudflare dashboard if frosty did not make it, then run the command again.");
+      }
+    }
     return this.request<CfAccessApp>("POST", `${acct(accountId)}/access/apps`, app);
   }
 
   async deleteAccessApp(accountId: string, app: { id: string; name: string }): Promise<void> {
-    ours("Access application", app.name);
-    await this.request<unknown>("DELETE", `${acct(accountId)}/access/apps/${encodeURIComponent(app.id)}`);
+    const live = await this.getAccessApp(accountId, app.id);
+    ours("Access application", live.name);
+    await this.request<unknown>("DELETE", `${acct(accountId)}/access/apps/${encodeURIComponent(live.id)}`, undefined, live);
   }
 
   // Notifications.
 
-  async createNotificationPolicy(accountId: string, policy: Record<string, unknown>): Promise<{ id: string }> {
-    ours("notification", typeof policy["name"] === "string" ? policy["name"] : undefined);
+  // Email only, to one address: no webhooks or other destinations.
+  async createNotificationPolicy(
+    accountId: string,
+    policy: { name: string; description: string; alert_type: string; enabled: boolean; mechanisms: { email: { id: string }[] }; filters: Record<string, string[]> },
+  ): Promise<{ id: string }> {
+    ours("notification", policy.name);
+    const emails = policy.mechanisms.email;
+    if (Object.keys(policy.mechanisms).join() !== "email" || emails.length !== 1 || Object.keys(emails[0] ?? {}).join() !== "id" || !/^[^\s@]+@[^\s@]+$/.test(emails[0]?.id ?? "")) {
+      throw new FrostyError(`frosty refused to create notification ${policy.name}: it only sends email to one address.`, "This is a bug in frosty. Please report it.");
+    }
     return this.request<{ id: string }>("POST", `${acct(accountId)}/alerting/v3/policies`, policy);
   }
 
   async deleteNotificationPolicy(accountId: string, policy: { id: string; name: string }): Promise<void> {
-    ours("notification", policy.name);
-    await this.request<unknown>("DELETE", `${acct(accountId)}/alerting/v3/policies/${encodeURIComponent(policy.id)}`);
+    const live = await this.request<CfNotificationPolicy>("GET", `${acct(accountId)}/alerting/v3/policies/${encodeURIComponent(policy.id)}`);
+    ours("notification", live.name);
+    await this.request<unknown>("DELETE", `${acct(accountId)}/alerting/v3/policies/${encodeURIComponent(live.id)}`, undefined, live);
   }
 
   async countDnsRecords(zoneId: string): Promise<number> {

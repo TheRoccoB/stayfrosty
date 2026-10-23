@@ -8,7 +8,7 @@ import { fail, pass, type CheckResult } from "./types.ts";
 // Checks of what the APIs say about a box. Pure: the caller fetches, these judge.
 
 function rebuild(box: string): string {
-  return `Run: frosty new ${box} --resume (each step checks and repairs its part)`;
+  return `Run: frosty new ${box} --resume, or for an adopted box frosty adopt ${box} --ip <ip> --resume (each step checks and repairs its part)`;
 }
 
 export function checkWindowClosed(box: string, firewall: HzFirewall | undefined, now: number): CheckResult {
@@ -21,7 +21,7 @@ export function checkWindowClosed(box: string, firewall: HzFirewall | undefined,
     const opened = Number(firewall.labels[LABEL_WINDOW_OPENED]);
     const age = Number.isFinite(opened) && opened > 0 ? `, open for ${Math.max(0, Math.round((now / 1000 - opened) / 60))} minutes` : "";
     const sources = inbound.flatMap((r) => r.source_ips ?? []).join(", ");
-    return fail(name, `a window is open (TCP ${inbound.map((r) => r.port ?? "any").join(", ")} from ${sources}${age})`, `Close it with: frosty new ${box} --resume`);
+    return fail(name, `a window is open (TCP ${inbound.map((r) => r.port ?? "any").join(", ")} from ${sources}${age})`, rebuild(box));
   }
   return pass(name, "deny all inbound");
 }

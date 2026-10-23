@@ -174,8 +174,9 @@ export async function finishBox(ctx: Context, input: FinishInput): Promise<numbe
   const edge = await findEdge(ctx, box);
   const tunnel = await ensureTunnel(ctx, box, edge.tunnel);
   const token = await installConnector(ctx, target, tunnel.id);
-  await ensureDns(ctx, box, tunnel.id, edge);
+  // Access before DNS: the hostname must never resolve to the tunnel without Access in front.
   await ensureAccess(ctx, box, edge);
+  await ensureDns(ctx, box, tunnel.id, edge);
   await ensureAlert(ctx, box, tunnel.id, edge);
   io.out("Waiting for the tunnel to report healthy.");
   await waitForHealthyTunnel(ctx, tunnel.id);

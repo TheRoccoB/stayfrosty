@@ -1,4 +1,4 @@
-import { DNS_COMMENT_PREFIX, NAME_PREFIX, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel } from "./cloudflare.ts";
+import { DNS_COMMENT_PREFIX, NAME_PREFIX, isOurEmailPolicy, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel } from "./cloudflare.ts";
 import { runOrFail, type SshTarget } from "./box.ts";
 import { sshHostname, type Context } from "./context.ts";
 import { FrostyError } from "./errors.ts";
@@ -118,6 +118,13 @@ export async function ensureDns(ctx: Context, box: string, tunnelId: string, edg
 export async function ensureAccess(ctx: Context, box: string, edge: Edge): Promise<{ app: CfAccessApp; policy: CfAccessPolicy }> {
   const { cloudflare, config, io } = ctx;
   let policy = edge.policy;
+  // A policy with frosty's name is reused only if it is still frosty's kind: allow, emails only.
+  if (policy !== undefined && !isOurEmailPolicy(policy)) {
+    throw new FrostyError(
+      `Access policy ${policy.name} is no longer an allow-by-email policy, so frosty will not attach it.`,
+      "Delete it in the Cloudflare dashboard (Access, Policies), then run the command again with --resume. frosty creates a fresh one.",
+    );
+  }
   if (policy === undefined) {
     io.out(`Creating Access policy ${edgeName(box)}: allow ${config.accessEmails.join(", ")}.`);
     policy = await cloudflare.createAccessPolicy(config.accountId, {

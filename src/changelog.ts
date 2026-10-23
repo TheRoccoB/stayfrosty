@@ -2,7 +2,22 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { dirname } from "node:path";
 import { FrostyError } from "./errors.ts";
-import { redact } from "./redact.ts";
+import { redact, redactValue } from "./redact.ts";
+
+// Secret-named keys, then known secret values, are removed.
+function clean(value: unknown): unknown {
+  return JSON.parse(redact(JSON.stringify(redactValue(value)))) as unknown;
+}
+
+// The done line comes after the change is made, so failing to write it must not hide what the
+// API did: say so on stderr and let the real result through.
+export function logDone(log: ChangeLog | undefined, entry: ChangeEntry): void {
+  try {
+    log?.(entry);
+  } catch (error) {
+    process.stderr.write(`frosty: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}
 
 // An optional JSON-lines record of every write frosty sends to an API: an "intent" line before
 // the request (if it cannot be written, the request is not sent) and a "done" line after. Bodies
@@ -13,6 +28,8 @@ export interface ChangeEntry {
   phase: "intent" | "done";
   action: string;
   target: string;
+  // The object as it was before the change, when the client read it (deletes and updates).
+  before?: unknown;
   request?: unknown;
   result?: unknown;
 }
@@ -25,8 +42,8 @@ export function fileChangeLog(path: string): ChangeLog {
       phase: entry.phase,
       action: entry.action,
       target: entry.target,
-      before: null,
-      request: entry.request === undefined ? null : JSON.parse(redact(JSON.stringify(entry.request))),
+      before: entry.before === undefined ? null : clean(entry.before),
+      request: entry.request === undefined ? null : clean(entry.request),
       result: entry.result ?? null,
     });
     try {

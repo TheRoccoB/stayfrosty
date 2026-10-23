@@ -207,6 +207,15 @@ function writeFiles(block: string[], offset: number): WriteFile[] {
   return files;
 }
 
+// Both phases start with this: an OS and sshd layout the hardening is known to work on, checked
+// before anything changes. Without the Include, the sshd drop-in would be silently ignored.
+const PREFLIGHT = `. /etc/os-release
+if [ "\${ID:-}" != ubuntu ] || ! dpkg --compare-versions "\${VERSION_ID:-0}" ge 24.04; then
+  echo "stayfrosty-adopt: needs Ubuntu 24.04 or later, this is \${PRETTY_NAME:-unknown}" >&2
+  exit 1
+fi
+grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\\.d/\\*\\.conf' /etc/ssh/sshd_config || { echo "stayfrosty-adopt: /etc/ssh/sshd_config does not include sshd_config.d" >&2; exit 1; }`;
+
 // Phase 1, run as the box's existing login (usually root): the admin user with the laptop's key
 // and passwordless sudo, as cloud-init's `users` would make it. sshd is not touched yet, so if
 // this goes wrong the existing login still works.
@@ -218,12 +227,7 @@ export function userScript(adminUser: string, publicKey: string): string {
   const b64 = Buffer.from(publicKey.trim(), "utf8").toString("base64");
   return `main() {
 set -euo pipefail
-. /etc/os-release
-if [ "\${ID:-}" != ubuntu ] || ! dpkg --compare-versions "\${VERSION_ID:-0}" ge 24.04; then
-  echo "stayfrosty-adopt: needs Ubuntu 24.04 or later, this is \${PRETTY_NAME:-unknown}" >&2
-  exit 1
-fi
-grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\\.d/\\*\\.conf' /etc/ssh/sshd_config || { echo "stayfrosty-adopt: /etc/ssh/sshd_config does not include sshd_config.d" >&2; exit 1; }
+${PREFLIGHT}
 u=${adminUser}
 key=$(printf '%s' '${b64}' | base64 -d)
 case $key in *$'\n'*|'') echo "stayfrosty-adopt: bad key" >&2; exit 1 ;; esac
@@ -279,13 +283,15 @@ mv '${f.path}.stayfrosty-new' '${f.path}'`;
   return `main() {
 set -euo pipefail
 trap 'echo "stayfrosty-adopt: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+${PREFLIGHT}
 export DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 NEEDRESTART_MODE=a
 # A long-lived box may be mid unattended-upgrade, or left half-configured by an earlier run.
 apt_opts=(-y -q -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-dpkg --configure -a
+for i in $(seq 20); do dpkg --force-confdef --force-confold --configure -a && break; [ "$i" = 20 ] && exit 1; sleep 30; done
 for i in 1 2 3 4 5; do apt-get -q -o DPkg::Lock::Timeout=600 update && break; [ "$i" = 5 ] && exit 1; sleep 30; done
 # cloud-init's package_upgrade is a dist-upgrade, so new kernels come in too.
-apt-get "\${apt_opts[@]}" dist-upgrade
+# --no-remove: stop rather than remove a package to make an upgrade fit.
+apt-get "\${apt_opts[@]}" --no-remove dist-upgrade
 apt-get "\${apt_opts[@]}" install ${packages.join(" ")}
 ${files}
 ${runcmd.join("\n")}

@@ -48,7 +48,7 @@ describe("Hetzner client", () => {
 
   it("does not retry a write", async () => {
     const http = new FakeHttp().on("POST", HOST, "/v1/firewalls", { status: 503, body: { error: { code: "unavailable", message: "try later" } } });
-    await expect(client(http).request("POST", "/firewalls", { name: "x" })).rejects.toBeInstanceOf(ApiError);
+    await expect(client(http).createFirewall("stayfrosty-x", { stayfrosty: "1", "stayfrosty-box": "x" }, [])).rejects.toBeInstanceOf(ApiError);
     expect(http.calls).toHaveLength(1);
   });
 
@@ -61,7 +61,9 @@ describe("Hetzner client", () => {
 
   it("explains a read-only token on write", async () => {
     const http = new FakeHttp().on("POST", HOST, "/v1/servers", { status: 403, body: { error: { code: "token_readonly", message: "forbidden" } } });
-    const error = await client(http).request("POST", "/servers", {}).catch((e: unknown) => e);
+    const error = await client(http)
+      .createServer({ name: "x", serverType: "cx23", image: "ubuntu-24.04", location: "fsn1", sshKeyIds: [], userData: "", labels: {}, firewallIds: [] })
+      .catch((e: unknown) => e);
     expect((error as ApiError).hint).toContain("Read & Write");
   });
 

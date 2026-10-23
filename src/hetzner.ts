@@ -1,5 +1,5 @@
 import { ApiError, FrostyError } from "./errors.ts";
-import { summarize, type ChangeLog } from "./changelog.ts";
+import { logDone, summarize, type ChangeLog } from "./changelog.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
 import { redact } from "./redact.ts";
 
@@ -121,10 +121,11 @@ export class Hetzner {
     this.baseUrl = opts.baseUrl ?? HETZNER_BASE_URL;
   }
 
-  async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  // Private, so every write goes through a method below and its guard.
+  private async request<T>(method: string, path: string, body?: unknown, before?: unknown): Promise<T> {
     const write = method !== "GET";
     if (write) {
-      this.changeLog?.({ phase: "intent", action: `hetzner ${method}`, target: path, request: body });
+      this.changeLog?.({ phase: "intent", action: `hetzner ${method}`, target: path, before, request: body });
     }
     const response = await sendJson({
       api: "hetzner",
@@ -136,7 +137,7 @@ export class Hetzner {
       body,
     });
     if (write) {
-      this.changeLog?.({ phase: "done", action: `hetzner ${method}`, target: path, result: summarize(response.status, response.body) });
+      logDone(this.changeLog, { phase: "done", action: `hetzner ${method}`, target: path, before, result: summarize(response.status, response.body) });
     }
     if (response.status >= 200 && response.status < 300) {
       return response.body as T;
@@ -207,20 +208,53 @@ export class Hetzner {
   }
 
   async createFirewall(name: string, labels: Record<string, string>, rules: HzFirewallRule[]): Promise<{ firewall: HzFirewall; actions: HzAction[] }> {
+    const box = labels[LABEL_BOX] ?? "";
+    if (labels[LABEL_MANAGED] !== "1" || name !== `stayfrosty-${box}` || box === "") {
+      throw new FrostyError(`frosty refused to create firewall ${name}: it only creates stayfrosty-<box> firewalls labeled for that box.`, "This is a bug in frosty. Please report it.");
+    }
+    assertWindowRules(name, rules);
     return this.request<{ firewall: HzFirewall; actions: HzAction[] }>("POST", "/firewalls", { name, labels, rules });
   }
 
+  async getFirewall(id: number): Promise<HzFirewall> {
+    const body = await this.request<{ firewall: HzFirewall }>("GET", `/firewalls/${id}`);
+    return body.firewall;
+  }
+
+  // Every firewall write re-reads the firewall and acts only on frosty's own (by its labels and
+  // name), so a wrong id can never open or wipe someone else's firewall.
+  private async ourFirewall(id: number): Promise<HzFirewall & { box: string }> {
+    const live = await this.getFirewall(id);
+    const box = live.labels[LABEL_BOX] ?? "";
+    if (live.labels[LABEL_MANAGED] !== "1" || box === "" || live.name !== `stayfrosty-${box}`) {
+      throw new FrostyError(`frosty refused to change firewall ${live.name} (id ${id}): frosty did not create it.`, "This is a bug in frosty. Please report it.");
+    }
+    return { ...live, box };
+  }
+
   async updateFirewallLabels(id: number, labels: Record<string, string>): Promise<HzFirewall> {
-    const body = await this.request<{ firewall: HzFirewall }>("PUT", `/firewalls/${id}`, { labels });
+    const live = await this.ourFirewall(id);
+    if (labels[LABEL_MANAGED] !== "1" || labels[LABEL_BOX] !== live.box) {
+      throw new FrostyError(`frosty refused to relabel firewall ${live.name}: it keeps frosty's labels.`, "This is a bug in frosty. Please report it.");
+    }
+    const body = await this.request<{ firewall: HzFirewall }>("PUT", `/firewalls/${id}`, { labels }, { labels: live.labels });
     return body.firewall;
   }
 
   async setFirewallRules(id: number, rules: HzFirewallRule[]): Promise<HzAction[]> {
-    const body = await this.request<{ actions: HzAction[] }>("POST", `/firewalls/${id}/actions/set_rules`, { rules });
+    const live = await this.ourFirewall(id);
+    assertWindowRules(live.name, rules);
+    const body = await this.request<{ actions: HzAction[] }>("POST", `/firewalls/${id}/actions/set_rules`, { rules }, { rules: live.rules });
     return body.actions;
   }
 
+  // Only to the server labeled as the firewall's box.
   async applyFirewall(id: number, serverId: number): Promise<HzAction[]> {
+    const live = await this.ourFirewall(id);
+    const server = await this.getServer(serverId);
+    if (server.labels[LABEL_MANAGED] !== "1" || server.labels[LABEL_BOX] !== live.box) {
+      throw new FrostyError(`frosty refused to attach firewall ${live.name} to ${server.name}: that server is not box ${live.box}.`, "This is a bug in frosty. Please report it.");
+    }
     const body = await this.request<{ actions: HzAction[] }>("POST", `/firewalls/${id}/actions/apply_to_resources`, {
       apply_to: [{ type: "server", server: { id: serverId } }],
     });
@@ -228,7 +262,8 @@ export class Hetzner {
   }
 
   async deleteFirewall(id: number): Promise<void> {
-    await this.request<unknown>("DELETE", `/firewalls/${id}`);
+    const live = await this.ourFirewall(id);
+    await this.request<unknown>("DELETE", `/firewalls/${id}`, undefined, { name: live.name, rules: live.rules, applied_to: live.applied_to });
   }
 
   async createServer(input: CreateServerInput): Promise<{ server: HzServer; action: HzAction; next_actions: HzAction[] }> {
@@ -337,4 +372,24 @@ export function serverLocation(server: HzServer): string {
 // A server frosty must never delete or recreate: adopted, or protected by its owner.
 export function isUntouchable(server: HzServer): boolean {
   return server.labels[LABEL_ADOPTED] !== undefined || server.protection?.delete === true || server.protection?.rebuild === true;
+}
+
+// The only rules frosty ever sets: none (deny all inbound), or its window: TCP 22 inbound from
+// one address (a /32 or /128), at most one per address family.
+export function assertWindowRules(name: string, rules: HzFirewallRule[]): void {
+  const ok =
+    rules.length <= 2 &&
+    rules.every(
+      (r) =>
+        r.direction === "in" &&
+        r.protocol === "tcp" &&
+        r.port === "22" &&
+        r.description === WINDOW_DESCRIPTION &&
+        (r.destination_ips ?? []).length === 0 &&
+        (r.source_ips ?? []).length === 1 &&
+        /^(\d{1,3}(\.\d{1,3}){3}\/32|[0-9a-f:]+\/128)$/i.test(r.source_ips?.[0] ?? ""),
+    );
+  if (!ok) {
+    throw new FrostyError(`frosty refused to set rules on firewall ${name}: it only ever sets none, or TCP 22 from one address.`, "This is a bug in frosty. Please report it.");
+  }
 }

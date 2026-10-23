@@ -27,7 +27,7 @@ export class FakeCloudflare {
         return cfOk(this.tunnels.filter((t) => name === null || t["name"] === name), { total_pages: 1 });
       })
       .on("POST", CF, `${ACCT}/cfd_tunnel`, (call) => {
-        const tunnel = { id: `tun-${this.id()}`, name: body(call)["name"], status: "inactive", created_at: "", deleted_at: null };
+        const tunnel = { id: `00000000-0000-4000-8000-${String(this.id()).padStart(12, "0")}`, name: body(call)["name"], status: "inactive", created_at: "", deleted_at: null };
         this.tunnels.push(tunnel);
         return cfOk(tunnel);
       })
@@ -62,6 +62,7 @@ export class FakeCloudflare {
         this.dns.push(record);
         return cfOk(record);
       })
+      .on("GET", CF, `${ZONE}/dns_records/[^/]+`, (call) => cfOk(this.dns.find((r) => r["id"] === lastId(call))))
       .on("DELETE", CF, `${ZONE}/dns_records/[^/]+`, (call) => {
         this.dns = this.dns.filter((r) => r["id"] !== lastId(call));
         return cfOk({});
@@ -72,6 +73,7 @@ export class FakeCloudflare {
         this.policies.push(policy);
         return cfOk(policy);
       })
+      .on("GET", CF, `${ACCT}/access/policies/[^/]+`, (call) => cfOk(this.policies.find((p) => p["id"] === lastId(call))))
       .on("DELETE", CF, `${ACCT}/access/policies/[^/]+`, (call) => {
         if (this.apps.some((a) => (a["policies"] as { id: string }[]).some((p) => p.id === lastId(call)))) {
           return { status: 409, body: { success: false, errors: [{ code: 12130, message: "policy is in use" }], result: null } };
@@ -104,6 +106,7 @@ export class FakeCloudflare {
         this.alerts.push(alert);
         return cfOk({ id: alert.id });
       })
+      .on("GET", CF, `${ACCT}/alerting/v3/policies/[^/]+`, (call) => cfOk(this.alerts.find((p) => p["id"] === lastId(call))))
       .on("DELETE", CF, `${ACCT}/alerting/v3/policies/[^/]+`, (call) => {
         this.alerts = this.alerts.filter((a) => a["id"] !== lastId(call));
         return cfOk({});

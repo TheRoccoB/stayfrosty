@@ -25,7 +25,10 @@ export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<numb
 
   // Before anything is removed, Cloudflare side included: a protected or adopted server keeps
   // its whole setup.
-  const adopted = servers.filter((s) => isUntouchable(s));
+  // The servers its firewalls are attached to count too: labels can be removed by hand.
+  const attachedIds = firewalls.flatMap((f) => f.applied_to.flatMap((a) => (a.type === "server" && a.server !== undefined ? [a.server.id] : [])));
+  const attached = await Promise.all(attachedIds.filter((id) => !servers.some((s) => s.id === id)).map((id) => hetzner.getServer(id)));
+  const adopted = [...servers, ...attached].filter((s) => isUntouchable(s));
   if (adopted.length > 0) {
     throw new FrostyError(
       `${box} is an adopted or delete/rebuild protected server. frosty never deletes a server it did not create, or one you protected.`,

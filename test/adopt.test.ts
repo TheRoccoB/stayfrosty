@@ -299,6 +299,14 @@ describe("frosty adopt", () => {
     expect(http.writes()).toHaveLength(before);
   });
 
+  it("destroy refuses when its firewall is on a protected server whose frosty labels were removed", async () => {
+    await runAdopt(deps(new ScriptedIo()), opts());
+    server()["labels"] = { owner: "rocco" };
+    const before = http.writes().length;
+    await expect(runDestroy(deps(new ScriptedIo(["app1"])), { box: "app1", dryRun: false })).rejects.toThrow(/protected server/);
+    expect(http.writes()).toHaveLength(before);
+  });
+
   it("destroy and new both refuse an adopted server", async () => {
     await runAdopt(deps(new ScriptedIo()), opts());
     await expect(runDestroy(deps(new ScriptedIo(["app1"])), { box: "app1", dryRun: false })).rejects.toThrow(/never deletes a server it did not create/);

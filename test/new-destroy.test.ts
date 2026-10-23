@@ -123,6 +123,9 @@ describe("frosty new and destroy", () => {
     ]);
 
     expect(events).toEqual(["user ssh t1 true", "window closed"]);
+    // Access exists before the hostname resolves to the tunnel.
+    const cfWrites = http.writes().map((c) => `${c.method} ${c.url.pathname}`);
+    expect(cfWrites.findIndex((w) => w.endsWith("/access/apps"))).toBeLessThan(cfWrites.findIndex((w) => w.endsWith("/dns_records")));
     expect((hz.firewalls[0] as { labels: Record<string, string> }).labels["stayfrosty-window-opened"]).toBeUndefined();
     expect(io.text()).toContain("A browser window opens for the Cloudflare Access login");
     expect(io.text()).toContain("Box t1 is ready. Log in with: ssh t1");
