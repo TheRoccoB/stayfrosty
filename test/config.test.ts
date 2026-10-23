@@ -56,3 +56,14 @@ describe("config", () => {
     expect(validateConfig([])).toEqual(["the file is not a JSON object"]);
   });
 });
+
+describe("rebootTimes validation", () => {
+  it("accepts box names mapped to HH:MM and refuses anything else", async () => {
+    const { validateConfig } = await import("../src/config.ts");
+    const { sampleConfig } = await import("./fixtures.ts");
+    expect(validateConfig({ ...sampleConfig, rebootTimes: { app1: "10:00", svc1: "09:00" } })).toEqual([]);
+    for (const bad of [[], null, "10:00", { app1: '10:00";' }, { App1: "10:00" }, { app1: 10 }, { app1: "25:00" }, { "a b": "10:00" }]) {
+      expect(validateConfig({ ...sampleConfig, rebootTimes: bad }).join(), JSON.stringify(bad)).toMatch(/rebootTimes/);
+    }
+  });
+});

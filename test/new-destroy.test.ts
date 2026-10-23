@@ -85,7 +85,7 @@ describe("frosty new and destroy", () => {
 
   it("creates the firewall with only the window, then the server with it attached", async () => {
     const io = new ScriptedIo();
-    expect(await runNew(deps(io), { box: "t1", resume: false, dryRun: false })).toBe(0);
+    expect(await runNew(deps(io), { box: "t1", resume: false, dryRun: false }), io.text()).toBe(0);
 
     const firewall = hz.firewalls[0] as Record<string, unknown>;
     const fwId = firewall["id"] as number;
@@ -123,6 +123,9 @@ describe("frosty new and destroy", () => {
     ]);
 
     expect(events).toEqual(["user ssh t1 true", "window closed"]);
+    // Access exists before the hostname resolves to the tunnel.
+    const cfWrites = http.writes().map((c) => `${c.method} ${c.url.pathname}`);
+    expect(cfWrites.findIndex((w) => w.endsWith("/access/apps"))).toBeLessThan(cfWrites.findIndex((w) => w.endsWith("/dns_records")));
     expect((hz.firewalls[0] as { labels: Record<string, string> }).labels["stayfrosty-window-opened"]).toBeUndefined();
     expect(io.text()).toContain("A browser window opens for the Cloudflare Access login");
     expect(io.text()).toContain("Box t1 is ready. Log in with: ssh t1");
@@ -290,6 +293,9 @@ describe("frosty new and destroy", () => {
     expect(await runNew(deps(io), { box: "t1", resume: false, dryRun: false })).toBe(1);
     expect(io.text()).toMatch(/FAIL\s+root login is refused/);
     expect(io.text()).toContain("frosty destroy t1 && frosty new t1");
+    // A box that fails its checks keeps the window, for this laptop only, so it can be fixed.
+    expect(events).not.toContain("window closed");
+    expect(io.text()).toContain("so the window stays open for this laptop's IP only");
   });
 
   it("destroy needs the typed name, then deletes everything, the alert first", async () => {

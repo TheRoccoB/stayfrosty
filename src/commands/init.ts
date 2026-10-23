@@ -202,6 +202,16 @@ export async function runInit(deps: InitDeps): Promise<number> {
   if (passwordCommandAnswer.trim().length > 0) {
     config.passwordCommand = passwordCommandAnswer.trim();
   }
+  // Settings init does not ask about are kept as they were.
+  if (previous?.rebootTimes !== undefined) {
+    config.rebootTimes = previous.rebootTimes;
+  }
+  if (previous?.hetznerChangeLog !== undefined) {
+    config.hetznerChangeLog = previous.hetznerChangeLog;
+  }
+  if (previous?.cloudflareChangeLog !== undefined) {
+    config.cloudflareChangeLog = previous.cloudflareChangeLog;
+  }
 
   const keys = await hetzner.listSshKeys();
   const keyBody = publicKey.split(/\s+/).slice(0, 2).join(" ");

@@ -1,14 +1,14 @@
 import type { CfAccessApp, CfAccessPolicy, CfAccessRule, CfDnsRecord, CfIngressRule, CfNotificationPolicy, CfTunnel } from "../cloudflare.ts";
 import { expectedIngress, sameIngress } from "../edge.ts";
-import type { HzFirewall } from "../hetzner.ts";
-import { LABEL_WINDOW_OPENED } from "../hetzner.ts";
+import type { HzFirewall, HzServer } from "../hetzner.ts";
+import { LABEL_ADOPTED, LABEL_WINDOW_OPENED } from "../hetzner.ts";
 import type { Fetch } from "../http.ts";
 import { fail, pass, type CheckResult } from "./types.ts";
 
 // Checks of what the APIs say about a box. Pure: the caller fetches, these judge.
 
 function rebuild(box: string): string {
-  return `Run: frosty new ${box} --resume (each step checks and repairs its part)`;
+  return `Run: frosty new ${box} --resume, or for an adopted box frosty adopt ${box} --ip <ip> --resume (each step checks and repairs its part)`;
 }
 
 export function checkWindowClosed(box: string, firewall: HzFirewall | undefined, now: number): CheckResult {
@@ -21,9 +21,34 @@ export function checkWindowClosed(box: string, firewall: HzFirewall | undefined,
     const opened = Number(firewall.labels[LABEL_WINDOW_OPENED]);
     const age = Number.isFinite(opened) && opened > 0 ? `, open for ${Math.max(0, Math.round((now / 1000 - opened) / 60))} minutes` : "";
     const sources = inbound.flatMap((r) => r.source_ips ?? []).join(", ");
-    return fail(name, `a window is open (TCP ${inbound.map((r) => r.port ?? "any").join(", ")} from ${sources}${age})`, `Close it with: frosty new ${box} --resume`);
+    return fail(name, `a window is open (TCP ${inbound.map((r) => r.port ?? "any").join(", ")} from ${sources}${age})`, rebuild(box));
   }
   return pass(name, "deny all inbound");
+}
+
+// Hetzner firewalls add up, so a second firewall's allow rules would undo frosty's deny-all.
+export function checkOnlyOurFirewall(box: string, server: HzServer, firewall: HzFirewall | undefined): CheckResult {
+  const name = "Box firewall is the only one attached";
+  const attached = server.public_net.firewalls ?? [];
+  const ours = firewall !== undefined && attached.some((f) => f.id === firewall.id && f.status === "applied");
+  const others = attached.filter((f) => f.id !== firewall?.id);
+  if (!ours || others.length > 0) {
+    const problems = [...(ours ? [] : ["frosty's firewall is not attached"]), ...(others.length > 0 ? [`other firewall(s) attached: id ${others.map((f) => f.id).join(", ")}`] : [])];
+    return fail(name, problems.join("; "), `Detach the others in the Hetzner Cloud Console (Firewalls); attach frosty's with the same command that set up ${box} and --resume.`);
+  }
+  return pass(name, `only ${firewall.name}`);
+}
+
+// An adopted server cannot be recreated (that is why it was adopted), so it must stay protected.
+export function checkProtected(server: HzServer): CheckResult | undefined {
+  if (server.labels[LABEL_ADOPTED] === undefined) {
+    return undefined;
+  }
+  const name = "Adopted server: delete and rebuild protection on";
+  if (server.protection?.delete !== true || server.protection.rebuild !== true) {
+    return fail(name, `delete ${String(server.protection?.delete ?? false)}, rebuild ${String(server.protection?.rebuild ?? false)}`, `Run: frosty adopt ${server.name} --ip ${server.public_net.ipv4?.ip ?? "<ip>"} --resume`);
+  }
+  return pass(name, "delete and rebuild protected");
 }
 
 export function checkTunnel(box: string, tunnel: CfTunnel | undefined, ingress: CfIngressRule[], hostname: string): CheckResult {
@@ -77,6 +102,11 @@ export function checkAccess(box: string, app: CfAccessApp | undefined, policy: C
     }
   }
   problems.push(...ruleProblems(policy.include, emails));
+  const listed = new Set((policy.include ?? []).map((r) => r.email?.email.toLowerCase()).filter((e): e is string => e !== undefined));
+  const missing = emails.filter((e) => !listed.has(e.toLowerCase()));
+  if (missing.length > 0) {
+    problems.push(`the policy does not include ${missing.join(", ")}`);
+  }
   if ((policy.include ?? []).length === 0) {
     problems.push("the policy includes nobody");
   }

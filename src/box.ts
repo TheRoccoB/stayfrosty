@@ -16,6 +16,9 @@ export interface SshTarget {
   // The key learned through the window is the one the tunnel path must present.
   hostKeyAlias: string;
   proxyCommand?: string;
+  // The key is already pinned (adopt checks it against a fingerprint first), so an unknown or
+  // different key is refused instead of learned.
+  pinned?: boolean;
 }
 
 export function hostKeyAlias(box: string): string {
@@ -64,7 +67,7 @@ export function sshArgs(target: SshTarget, env: Env, extra: string[] = []): stri
     "-o",
     // First contact is through the window, from one IP, to a box minutes old. After that the
     // key is pinned and the tunnel path must match it.
-    `StrictHostKeyChecking=${target.proxyCommand === undefined ? "accept-new" : "yes"}`,
+    `StrictHostKeyChecking=${target.proxyCommand === undefined && target.pinned !== true ? "accept-new" : "yes"}`,
     "-o",
     `UserKnownHostsFile=${knownHostsPath(env)}`,
     "-o",
@@ -179,7 +182,7 @@ export async function waitForSsh(opts: {
     if (/REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed/i.test(result.stderr)) {
       throw new FrostyError(
         `The SSH host key of ${opts.target.host} does not match the one frosty pinned for this box (${opts.target.hostKeyAlias}).`,
-        "Stop here: something may be intercepting the connection. If you rebuilt the box outside frosty, destroy it with frosty destroy and create it again.",
+        `Stop here: something may be intercepting the connection. If the box was rebuilt outside frosty: a box frosty created, destroy and new it; an adopted box, check its fingerprint in the Hetzner web console, remove the line starting "${opts.target.hostKeyAlias} " from frosty's known_hosts, and run adopt again with --host-key.`,
       );
     }
     if (opts.now() >= deadline) {
@@ -201,7 +204,10 @@ export type UserSsh = (host: string, command: string, onStderr: (line: string) =
 // Access login; its messages are passed through so the user sees what to do.
 export const userSsh: UserSsh = (host, command, onStderr, timeoutMs) =>
   new Promise((resolve, reject) => {
-    const child = spawn("ssh", ["-o", "BatchMode=yes", "-o", "ConnectTimeout=30", host, command], { stdio: ["ignore", "pipe", "pipe"] });
+    // The connect timeout covers cloudflared waiting for the browser login, so it must be as long as
+    // the whole wait: a 30-second one gave up before the person could log in.
+    const connectTimeout = Math.max(30, Math.ceil(timeoutMs / 1000));
+    const child = spawn("ssh", ["-o", "BatchMode=yes", "-o", `ConnectTimeout=${connectTimeout}`, host, command], { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let partial = "";
@@ -231,3 +237,45 @@ export const userSsh: UserSsh = (host, command, onStderr, timeoutMs) =>
       resolve({ code: code ?? 255, stdout, stderr });
     });
   });
+
+export interface ScannedKey {
+  type: string;
+  key: string;
+  fingerprint: string;
+}
+
+export type KeyScanner = (host: string) => Promise<ScannedKey[]>;
+
+// The box's host keys as it presents them, with their SHA256 fingerprints.
+export const keyScan: KeyScanner = (host) =>
+  new Promise((resolve, reject) => {
+    const scan = spawn("ssh-keyscan", ["-T", "10", "-t", "ed25519,ecdsa,rsa", host], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    scan.stdout.on("data", (chunk: Buffer) => {
+      out += chunk.toString("utf8");
+    });
+    scan.on("error", (error) => reject(new FrostyError(`Could not run ssh-keyscan: ${error.message}`, "Install OpenSSH.")));
+    scan.on("close", async () => {
+      const keys: ScannedKey[] = [];
+      for (const line of out.split("\n")) {
+        const [, type, key] = line.trim().split(/\s+/);
+        if (type !== undefined && key !== undefined && !line.startsWith("#")) {
+          keys.push({ type, key, fingerprint: await fingerprintOf(`${type} ${key}`) });
+        }
+      }
+      resolve(keys);
+    });
+  });
+
+export function fingerprintOf(publicKey: string): Promise<string> {
+  return new Promise((resolve) => {
+    const child = spawn("ssh-keygen", ["-l", "-E", "sha256", "-f", "-"], { stdio: ["pipe", "pipe", "ignore"] });
+    let out = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      out += chunk.toString("utf8");
+    });
+    child.on("error", () => resolve(""));
+    child.on("close", () => resolve(out.trim().split(/\s+/)[1] ?? ""));
+    child.stdin.end(`${publicKey}\n`);
+  });
+}

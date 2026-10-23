@@ -31,6 +31,11 @@ export class FakeHetzner {
       .on("GET", HZ, "/v1/servers", (call) => hzPage("servers", byName(this.servers, call)))
       .on("GET", HZ, "/v1/firewalls", (call) => hzPage("firewalls", byName(this.firewalls, call)))
       .on("GET", HZ, "/v1/ssh_keys", () => hzPage("ssh_keys", this.sshKeys))
+      .on("GET", HZ, "/v1/firewalls/\\d+", (call) => {
+        const id = Number(call.url.pathname.split("/").pop());
+        const firewall = this.firewalls.find((f) => f["id"] === id);
+        return firewall === undefined ? { status: 404, body: { error: { code: "not_found", message: "no firewall" } } } : { body: { firewall } };
+      })
       .on("POST", HZ, "/v1/ssh_keys", (call) => {
         const key = { id: this.id(), fingerprint: "x", ...(call.body as Record<string, unknown>) };
         this.sshKeys.push(key);
@@ -82,6 +87,40 @@ export class FakeHetzner {
         const firewall = this.firewalls.find((f) => f["id"] === id) as Record<string, unknown>;
         firewall["rules"] = (call.body as { rules: unknown }).rules;
         return { status: 201, body: { actions: [done("set_firewall_rules")] } };
+      })
+      .on("PUT", HZ, "/v1/servers/\\d+", (call) => {
+        const id = Number(call.url.pathname.split("/")[3]);
+        const server = this.servers.find((x) => x["id"] === id) as Record<string, unknown>;
+        server["labels"] = (call.body as { labels: unknown }).labels;
+        return { body: { server } };
+      })
+      .on("POST", HZ, "/v1/servers/\\d+/actions/change_protection", (call) => {
+        const id = Number(call.url.pathname.split("/")[3]);
+        const server = this.servers.find((x) => x["id"] === id) as Record<string, unknown>;
+        server["protection"] = call.body;
+        return { status: 201, body: { action: done("change_protection") } };
+      })
+      .on("POST", HZ, "/v1/firewalls/\\d+/actions/apply_to_resources", (call) => {
+        const id = Number(call.url.pathname.split("/")[3]);
+        const body = call.body as { apply_to: { server: { id: number } }[] };
+        for (const target of body.apply_to) {
+          const server = this.servers.find((x) => x["id"] === target.server.id) as { public_net: { firewalls: unknown[] } };
+          server.public_net.firewalls.push({ id, status: "applied" });
+        }
+        const firewall = this.firewalls.find((f) => f["id"] === id) as { applied_to: unknown[] };
+        firewall.applied_to.push(...body.apply_to.map((t) => ({ type: "server", server: { id: t.server.id } })));
+        return { status: 201, body: { actions: [done("apply_firewall")] } };
+      })
+      .on("POST", HZ, "/v1/firewalls/\\d+/actions/remove_from_resources", (call) => {
+        const id = Number(call.url.pathname.split("/")[3]);
+        const body = call.body as { remove_from: { server: { id: number } }[] };
+        for (const target of body.remove_from) {
+          const server = this.servers.find((x) => x["id"] === target.server.id) as { public_net: { firewalls: { id: number }[] } };
+          server.public_net.firewalls = server.public_net.firewalls.filter((f) => f.id !== id);
+          const firewall = this.firewalls.find((f) => f["id"] === id) as { applied_to: { server?: { id: number } }[] };
+          firewall.applied_to = firewall.applied_to.filter((t) => t.server?.id !== target.server.id);
+        }
+        return { status: 201, body: { actions: [done("remove_firewall")] } };
       })
       .on("PUT", HZ, "/v1/firewalls/\\d+", (call) => {
         const id = Number(call.url.pathname.split("/")[3]);

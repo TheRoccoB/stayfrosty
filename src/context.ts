@@ -1,12 +1,13 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { closeSshMaster, hostKeyAlias, systemSsh, forgetHost, userSsh, type SshRunner, type SshTarget, type UserSsh } from "./box.ts";
+import { closeSshMaster, fingerprintOf, hostKeyAlias, keyScan, systemSsh, forgetHost, userSsh, type KeyScanner, type SshRunner, type SshTarget, type UserSsh } from "./box.ts";
 import { isPublicKey } from "./cloudinit.ts";
+import { fileChangeLog } from "./changelog.ts";
 import { Cloudflare } from "./cloudflare.ts";
 import { expandHome, loadConfig, type Config, type Env } from "./config.ts";
 import { authoritativeResolves, systemResolves } from "./dns.ts";
 import { FrostyError } from "./errors.ts";
-import { Hetzner, type HzServer } from "./hetzner.ts";
+import { Hetzner, LABEL_ADOPTED, type HzServer } from "./hetzner.ts";
 import { realSleep, type Fetch, type Sleep } from "./http.ts";
 import type { Io } from "./io.ts";
 import { findLaptopIp, type LaptopIp } from "./ip.ts";
@@ -25,6 +26,8 @@ export interface Deps {
   forgetHost?: (host: string) => Promise<void>;
   closeSsh?: (target: SshTarget) => Promise<void>;
   userSsh?: UserSsh;
+  keyScan?: KeyScanner;
+  fingerprintOf?: (publicKey: string) => Promise<string>;
   // Whether cloudflared on the laptop already holds an Access token for a hostname.
   hasAccessToken?: (hostname: string) => Promise<boolean>;
   authoritativeResolves?: (hostname: string, domain: string) => Promise<boolean>;
@@ -47,6 +50,8 @@ export interface Context {
   forgetHost: (host: string) => Promise<void>;
   closeSsh: (target: SshTarget) => Promise<void>;
   userSsh: UserSsh;
+  keyScan: KeyScanner;
+  fingerprintOf: (publicKey: string) => Promise<string>;
   hasAccessToken: (hostname: string) => Promise<boolean>;
   authoritativeResolves: (hostname: string, domain: string) => Promise<boolean>;
   systemResolves: (hostname: string) => Promise<boolean>;
@@ -79,14 +84,16 @@ export async function buildContext(deps: Deps): Promise<Context> {
     io: deps.io,
     env,
     config,
-    hetzner: new Hetzner({ token: tokens.hetzner, fetch: fetchImpl, sleep }),
-    cloudflare: new Cloudflare({ token: tokens.cloudflare, fetch: fetchImpl, sleep }),
+    hetzner: new Hetzner({ token: tokens.hetzner, fetch: fetchImpl, sleep, changeLog: config.hetznerChangeLog === undefined ? undefined : fileChangeLog(config.hetznerChangeLog) }),
+    cloudflare: new Cloudflare({ token: tokens.cloudflare, fetch: fetchImpl, sleep, changeLog: config.cloudflareChangeLog === undefined ? undefined : fileChangeLog(config.cloudflareChangeLog) }),
     sleep,
     now: deps.now ?? Date.now,
     ssh: deps.ssh ?? systemSsh(env),
     forgetHost: deps.forgetHost ?? ((host) => forgetHost(host, env)),
     closeSsh: deps.closeSsh ?? ((target) => closeSshMaster(target, env)),
     userSsh: deps.userSsh ?? userSsh,
+    keyScan: deps.keyScan ?? keyScan,
+    fingerprintOf: deps.fingerprintOf ?? fingerprintOf,
     hasAccessToken: deps.hasAccessToken ?? ((hostname) => cloudflaredHasToken(findCommand("cloudflared", env), hostname)),
     authoritativeResolves: deps.authoritativeResolves ?? authoritativeResolves,
     systemResolves: deps.systemResolves ?? systemResolves,
@@ -119,7 +126,8 @@ export function directTarget(ctx: Context, box: string, server: HzServer, family
   if (host === undefined) {
     throw new FrostyError(`Box ${server.name} has no public IPv${family} address.`, "This is a bug in frosty. Please report it.");
   }
-  return { host, user: ctx.config.adminUser, keyPath: ctx.keyPath, hostKeyAlias: hostKeyAlias(box) };
+  // An adopted box's key was checked against a fingerprint, so it is never learned again.
+  return { host, user: ctx.config.adminUser, keyPath: ctx.keyPath, hostKeyAlias: hostKeyAlias(box), pinned: server.labels[LABEL_ADOPTED] !== undefined };
 }
 
 export function sshHostname(ctx: Context, box: string): string {

@@ -4,6 +4,7 @@ import { parseOfferedMethods } from "../src/checks/login.ts";
 import { checkListeners, parseSs } from "../src/checks/listeners.ts";
 import { evaluateOnBox, parseSections } from "../src/checks/onbox.ts";
 import { checkSshd } from "../src/checks/sshd.ts";
+import { rebootTimeFor } from "../src/config.ts";
 import { checkUfw } from "../src/checks/ufw.ts";
 import { checkPendingReboot, checkUnattendedUpgrades } from "../src/checks/updates.ts";
 import { APT_CONFIG_GOOD, POLICY_GOOD, SS_GOOD, SSHD_T_GOOD, UFW_GOOD } from "./box-fixtures.ts";
@@ -13,6 +14,10 @@ const NOW = 1_790_000_000;
 describe("sshd check", () => {
   it("passes the hardened config", () => {
     expect(checkSshd(SSHD_T_GOOD, "t1", "ops").ok).toBe(true);
+    expect(checkSshd(SSHD_T_GOOD, "t1", "ops", "\n").ok).toBe(true);
+    const match = checkSshd(SSHD_T_GOOD, "t1", "ops", "Match Address 10.0.0.0/8\n");
+    expect(match.ok).toBe(false);
+    expect(match.detail).toContain("Match blocks (Match Address 10.0.0.0/8)");
   });
 
   it("names every wrong value", () => {
@@ -196,6 +201,9 @@ describe("edge checks", () => {
     const policy = { id: "p", name: "stayfrosty-t1", decision: "allow", include: [{ email: { email: "me@example.com" } }] };
     const app = { id: "a", name: "stayfrosty-t1", type: "self_hosted", domain: "ssh-t1.example.com", policies: [{ ...policy, precedence: 1 }] };
     expect(checkAccess("t1", app, policy, "ssh-t1.example.com", ["me@example.com"]).ok).toBe(true);
+    const short = checkAccess("t1", app, policy, "ssh-t1.example.com", ["me@example.com", "two@example.com"]);
+    expect(short.ok).toBe(false);
+    expect(short.detail).toContain("does not include two@example.com");
     const open = { ...policy, decision: "bypass", include: [{ everyone: {} }] };
     const result = checkAccess("t1", { ...app, policies: [{ ...open, precedence: 1 }] }, open, "ssh-t1.example.com", ["me@example.com"]);
     expect(result.ok).toBe(false);
@@ -209,5 +217,24 @@ describe("edge checks", () => {
     const result = checkWindowClosed("t1", firewall, 1_790_000_000_000 + 30 * 60_000);
     expect(result.detail).toContain("open for 30 minutes");
     expect(checkWindowClosed("t1", { ...firewall, rules: [] }, 0).ok).toBe(true);
+  });
+});
+
+describe("per-box reboot times", () => {
+  it("each box gets its own time, others the default, and the check wants the box's", () => {
+    const cfg = { rebootTime: "04:00", rebootTimes: { app1: "10:00" } };
+    expect(rebootTimeFor(cfg, "app1")).toBe("10:00");
+    expect(rebootTimeFor(cfg, "svc1")).toBe("04:00");
+    const input = { enabled: "enabled", aptConfig: APT_CONFIG_GOOD, stamp: "none", createdAt: 1, now: 2 };
+    expect(checkUnattendedUpgrades({ ...input, rebootTime: "04:00" }, "t1").ok).toBe(true);
+    const wrong = checkUnattendedUpgrades({ ...input, rebootTime: "10:00" }, "t1");
+    expect(wrong.ok).toBe(false);
+    expect(wrong.detail).toContain("reboot time is 04:00, want 10:00");
+    const pacific = checkUnattendedUpgrades({ ...input, rebootTime: "04:00", timezone: "America/Los_Angeles\n" }, "t1");
+    expect(pacific.ok).toBe(false);
+    expect(pacific.detail).toContain("timezone is America/Los_Angeles, not UTC");
+    expect(checkUnattendedUpgrades({ ...input, rebootTime: "04:00", timezone: "Etc/UTC\n" }, "t1").ok).toBe(true);
+    // A key that is only in the prototype chain is not a box.
+    expect(rebootTimeFor({ rebootTime: "04:00", rebootTimes: {} }, "constructor")).toBe("04:00");
   });
 });

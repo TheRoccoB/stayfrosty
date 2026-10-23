@@ -19,7 +19,9 @@ export function parseSshdT(text: string): Map<string, string[]> {
   return out;
 }
 
-export function checkSshd(sshdT: string, box: string, adminUser: string): CheckResult {
+// `matchLines` are the Match directives in the sshd config files. `sshd -T` ignores Match
+// blocks, so one could reopen root or passwords for some sources without this check seeing it.
+export function checkSshd(sshdT: string, box: string, adminUser: string, matchLines = ""): CheckResult {
   const name = "sshd: keys only, no root, only the admin user";
   const values = parseSshdT(sshdT);
   if (values.size === 0) {
@@ -41,6 +43,10 @@ export function checkSshd(sshdT: string, box: string, adminUser: string): CheckR
   const allow = values.get("allowusers") ?? [];
   if (allow.length !== 1 || allow[0] !== adminUser) {
     wrong.push(`allowusers is ${allow.length === 0 ? "unset" : allow.join(" ")}, want ${adminUser}`);
+  }
+  const matches = matchLines.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+  if (matches.length > 0) {
+    wrong.push(`the config has Match blocks (${matches.join("; ")}), which can override these`);
   }
   if (wrong.length > 0) {
     return fail(name, wrong.join("; "), reapplyFix(box));

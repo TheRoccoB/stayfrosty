@@ -3,10 +3,13 @@ import { FrostyError } from "./errors.ts";
 import { terminalIo, type Io } from "./io.ts";
 import { redact } from "./redact.ts";
 import { runInit } from "./commands/init.ts";
+import { runAdopt } from "./commands/adopt.ts";
 import { runConsolePassword } from "./commands/console-password.ts";
 import { runDestroy } from "./commands/destroy.ts";
+import { runDetachForeign } from "./commands/detach-foreign.ts";
 import { runLs } from "./commands/ls.ts";
 import { runNew } from "./commands/new.ts";
+import { runVerify } from "./commands/verify.ts";
 import { VERSION } from "./version.ts";
 
 const USAGE = `frosty ${VERSION}: a VPS with no front door
@@ -14,8 +17,9 @@ const USAGE = `frosty ${VERSION}: a VPS with no front door
 Usage:
   frosty init                         write config, check tokens (creates nothing)
   frosty new <box> [--type T] [--location L] [--resume]
-  frosty adopt <box> --ip <ip>
-  frosty verify [<box> | --all] [--full]
+  frosty adopt <box> --ip <ip> [--user U] (--host-key SHA256:... | --trust-first-use) [--resume]
+  frosty verify (<box> | --all)       check a box again, through the tunnel (changes nothing)
+  frosty detach-foreign <box>         detach other firewalls from an adopted box (keeps frosty's)
   frosty breakglass <box> [--minutes N | --close]
   frosty ls
   frosty ssh-config                   rewrite ~/.ssh/stayfrosty.conf from the APIs
@@ -31,8 +35,6 @@ Tokens come from HCLOUD_TOKEN and CLOUDFLARE_API_TOKEN. Run "frosty init" for de
 
 // Commands from later milestones, so nobody mistakes a missing command for a broken one.
 const PLANNED: Record<string, string> = {
-  adopt: "M4",
-  verify: "M3",
   breakglass: "M3",
   "ssh-config": "M3",
 };
@@ -50,6 +52,11 @@ export async function main(argv: string[], io: Io): Promise<number> {
       direct: { type: "boolean" },
       type: { type: "string" },
       location: { type: "string" },
+      ip: { type: "string" },
+      user: { type: "string" },
+      "host-key": { type: "string" },
+      "trust-first-use": { type: "boolean" },
+      all: { type: "boolean" },
     },
   });
   const command = positionals[0];
@@ -69,6 +76,23 @@ export async function main(argv: string[], io: Io): Promise<number> {
       return runLs({ io });
     case "new":
       return runNew({ io }, { box: positionals[1], resume: values["resume"] === true, dryRun, serverType: stringFlag(values["type"]), location: stringFlag(values["location"]) });
+    case "adopt":
+      return runAdopt(
+        { io },
+        {
+          box: positionals[1],
+          ip: stringFlag(values["ip"]),
+          user: stringFlag(values["user"]) ?? "root",
+          hostKey: stringFlag(values["host-key"]),
+          trustFirstUse: values["trust-first-use"] === true,
+          resume: values["resume"] === true,
+          dryRun,
+        },
+      );
+    case "verify":
+      return runVerify({ io }, { box: positionals[1], all: values["all"] === true });
+    case "detach-foreign":
+      return runDetachForeign({ io }, { box: positionals[1], dryRun });
     case "destroy":
       return runDestroy({ io }, { box: positionals[1], dryRun });
     case "console-password":

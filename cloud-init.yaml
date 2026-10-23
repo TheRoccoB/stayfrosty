@@ -119,14 +119,17 @@ write_files:
         chmod 0644 /usr/share/keyrings/cloudflare-main.gpg
       fi
       echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" > /etc/apt/sources.list.d/cloudflared.list
-      apt-get update -q
-      apt-get install -y -q cloudflared
+      apt-get -o DPkg::Lock::Timeout=600 update -q
+      apt-get -o DPkg::Lock::Timeout=600 install -y -q cloudflared
 
       # No fail2ban: tunnel traffic arrives from localhost, and the direct path is only ever
       # open to one IP during a window. Remove it if an older setup installed it.
       if dpkg -s fail2ban >/dev/null 2>&1; then
-        apt-get purge -y -q fail2ban
+        apt-get -o DPkg::Lock::Timeout=600 purge -y -q fail2ban
       fi
+
+      # Reboot times are box local time; keep every box on UTC so rebootTimes mean the same everywhere.
+      timedatectl set-timezone Etc/UTC
 
       # UFW is the second layer behind the Hetzner firewall. Port 22 stays allowed here or
       # break-glass cannot work; the Hetzner firewall is what keeps it closed.

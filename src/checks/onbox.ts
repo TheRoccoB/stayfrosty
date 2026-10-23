@@ -10,6 +10,7 @@ import { checkPendingReboot, checkUnattendedUpgrades } from "./updates.ts";
 export const GATHER_SCRIPT = `set -u
 section() { echo "### $1"; }
 section sshd; sshd -T 2>&1 || true
+section sshd-match; grep -hiE '^[[:space:]]*Match[[:space:]]' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
 section ufw; ufw status verbose 2>&1 || true
 section ss; ss -tulnpH 2>&1 || true
 section uu-enabled; systemctl is-enabled unattended-upgrades.service 2>&1 || true
@@ -18,6 +19,7 @@ section uu-stamp; stat -c %Y /var/lib/apt/periodic/unattended-upgrades-stamp 2>/
 section reboot-required; stat -c %Y /var/run/reboot-required 2>/dev/null || echo none
 section cloudflared; apt-cache policy cloudflared 2>&1 || true
 section connector; systemctl is-active cloudflared.service 2>&1; systemctl is-enabled cloudflared.service 2>&1; stat -c '%a %U' /etc/cloudflared/token 2>&1 || true
+section timezone; timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true
 section now; date +%s
 section end
 `;
@@ -58,11 +60,11 @@ export function evaluateOnBox(sections: Map<string, string>, want: OnBoxExpectat
   const get = (key: string): string => sections.get(key) ?? "";
   const now = Number(get("now").trim()) || Math.floor(Date.now() / 1000);
   return [
-    checkSshd(get("sshd"), box, adminUser),
+    checkSshd(get("sshd"), box, adminUser, get("sshd-match")),
     checkUfw(get("ufw"), box),
     checkListeners(get("ss")),
     checkUnattendedUpgrades(
-      { enabled: get("uu-enabled"), aptConfig: get("apt-config"), stamp: get("uu-stamp"), createdAt, now },
+      { enabled: get("uu-enabled"), aptConfig: get("apt-config"), stamp: get("uu-stamp"), createdAt, now, rebootTime, timezone: get("timezone") },
       box,
     ),
     checkCloudflared(get("cloudflared"), box),

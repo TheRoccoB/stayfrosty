@@ -2,7 +2,7 @@ import { hostKeyAlias } from "../box.ts";
 import { assertBoxName, buildContext, type Deps } from "../context.ts";
 import { describeEdge, edgeIsEmpty, findEdge, removeEdge, removeTunnel } from "../edge.ts";
 import { ApiError, FrostyError } from "../errors.ts";
-import { boxSelector } from "../hetzner.ts";
+import { boxSelector, isUntouchable } from "../hetzner.ts";
 import { tildify, writeSshConfig } from "../sshconfig.ts";
 import { sshConfigEntries } from "./new.ts";
 
@@ -21,6 +21,19 @@ export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<numb
   if (servers.length === 0 && firewalls.length === 0 && edgeIsEmpty(edge)) {
     io.out(`frosty has nothing named ${box}. Nothing to destroy. See what exists with: frosty ls`);
     return 0;
+  }
+
+  // Before anything is removed, Cloudflare side included: a protected or adopted server keeps
+  // its whole setup.
+  // The servers its firewalls are attached to count too: labels can be removed by hand.
+  const attachedIds = firewalls.flatMap((f) => f.applied_to.flatMap((a) => (a.type === "server" && a.server !== undefined ? [a.server.id] : [])));
+  const attached = await Promise.all(attachedIds.filter((id) => !servers.some((s) => s.id === id)).map((id) => hetzner.getServer(id)));
+  const adopted = [...servers, ...attached].filter((s) => isUntouchable(s));
+  if (adopted.length > 0) {
+    throw new FrostyError(
+      `${box} is an adopted or delete/rebuild protected server. frosty never deletes a server it did not create, or one you protected.`,
+      "Delete it yourself in the Hetzner Cloud Console if you really mean to (turn off its protection first).",
+    );
   }
 
   io.out(`${opts.dryRun ? "Would delete" : "This deletes"}, permanently:`);

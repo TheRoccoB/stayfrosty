@@ -25,6 +25,10 @@ export interface UpdatesInput {
   // it was built, so a stamp older than the box means it has not run on this box yet.
   createdAt: number | undefined;
   now: number;
+  // The reboot time this box should have (config rebootTimes or rebootTime).
+  rebootTime?: string;
+  // The box's timezone: reboot times are local, and frosty keeps every box on UTC.
+  timezone?: string;
 }
 
 export function checkUnattendedUpgrades(input: UpdatesInput, box: string): CheckResult {
@@ -45,7 +49,16 @@ export function checkUnattendedUpgrades(input: UpdatesInput, box: string): Check
   if (!/^Unattended-Upgrade::Automatic-Reboot "true";/m.test(input.aptConfig)) {
     problems.push("automatic reboot is off");
   }
-  const born = input.createdAt;
+  const tz = input.timezone?.trim();
+  if (tz !== undefined && tz !== "" && tz !== "Etc/UTC" && tz !== "UTC") {
+    problems.push(`the timezone is ${tz}, not UTC, so the reboot time is not what the config means`);
+  }
+  const time = /^Unattended-Upgrade::Automatic-Reboot-Time "([^"]*)";/m.exec(input.aptConfig)?.[1];
+  if (input.rebootTime !== undefined && time !== input.rebootTime) {
+    problems.push(`reboot time is ${time ?? "unset"}, want ${input.rebootTime}`);
+  }
+  // A birth time in the future (a bad label) must not make "never ran" pass forever.
+  const born = input.createdAt === undefined ? undefined : Math.min(input.createdAt, input.now);
   const rawStamp = parseEpoch(input.stamp);
   const stamp = rawStamp !== undefined && born !== undefined && rawStamp < born ? undefined : rawStamp;
   if (stamp === undefined) {
