@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { BYPASS_POLICY_NAME, Cloudflare } from "../src/cloudflare.ts";
 import { validateConfig } from "../src/config.ts";
 import type { Context } from "../src/context.ts";
-import { syncRoutes } from "../src/edge.ts";
+import { appCovers, syncRoutes } from "../src/edge.ts";
 import { checkRouteAccess, checkRouteOutside, checkRoutePorts, classify } from "../src/checks/routes.ts";
 import { assertBoxName } from "../src/context.ts";
 import type { RawGet } from "../src/rawget.ts";
@@ -330,5 +330,19 @@ describe("route review fixes", () => {
     expect(validateRoutes("svc1", [{ ...listmonk, public: ["/a/../b"] }], opts)).not.toEqual([]);
     expect(validateRoutes("svc1", [{ ...listmonk, public: ["/."] }], opts)).not.toEqual([]);
     expect(validateRoutes("svc1", [{ ...listmonk, public: ["/public/static.v2/"] }], opts)).toEqual([expect.stringMatching(/probe/)]);
+  });
+});
+
+describe("external app coverage", () => {
+  it("accepts exact paths, path prefixes and path wildcards, from destinations or self_hosted_domains", () => {
+    const app = (uris: string[], field: "destinations" | "self_hosted_domains" = "destinations") =>
+      ({ id: "a", name: "x", type: "self_hosted", ...(field === "destinations" ? { destinations: uris.map((uri) => ({ uri })) } : { self_hosted_domains: uris }) }) as never;
+    expect(appCovers(app(["news.example.net/api"]), "news.example.net/api")).toBe(true);
+    expect(appCovers(app(["news.example.net/api*"], "self_hosted_domains"), "news.example.net/api")).toBe(true);
+    expect(appCovers(app(["news.example.net/admin*", "news.example.net/api*"], "self_hosted_domains"), "news.example.net/admin")).toBe(true);
+    expect(appCovers(app(["news.example.net"]), "news.example.net/api")).toBe(true);
+    expect(appCovers(app(["news.example.net/apis"]), "news.example.net/api")).toBe(false);
+    expect(appCovers(app(["*.example.net"]), "news.example.net/api")).toBe(false);
+    expect(appCovers(app(["news.example.net/admin*"], "self_hosted_domains"), "news.example.net/api")).toBe(false);
   });
 });

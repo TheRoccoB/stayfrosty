@@ -206,7 +206,14 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
 
 function appUris(app: CfAccessApp): string[] {
   const uris = (app.destinations ?? []).map((d) => d.uri).filter((u): u is string => u !== undefined);
-  return uris.length > 0 ? uris : app.domain === undefined ? [] : [app.domain];
+  if (uris.length > 0) {
+    return uris;
+  }
+  // Apps made in the dashboard may list their paths here instead.
+  if ((app.self_hosted_domains ?? []).length > 0) {
+    return app.self_hosted_domains as string[];
+  }
+  return app.domain === undefined ? [] : [app.domain];
 }
 
 // What's wrong with an external app's policies for guarding a protected path: frosty doesn't own
@@ -243,9 +250,18 @@ export function describeIncludes(app: CfAccessApp): string {
   return [...counts].map(([k, n]) => `${k}: ${n}`).join(", ") || "nobody";
 }
 
-// An app covers a URI if one of its destinations is that URI or a path prefix of it.
+// An app covers a URI if one of its destinations is that URI or a path prefix of it, or ends in a
+// path wildcard ("host/api*") that the URI starts with. Host wildcards ("*.example.net") never count.
 export function appCovers(app: CfAccessApp, uri: string): boolean {
-  return appUris(app).some((u) => uri === u || uri.startsWith(`${u}/`));
+  return appUris(app).some((u) => {
+    if (u.startsWith("*")) {
+      return false;
+    }
+    if (u.endsWith("*") && u.includes("/")) {
+      return uri.startsWith(u.slice(0, -1));
+    }
+    return uri === u || uri.startsWith(`${u}/`);
+  });
 }
 
 export function appMatches(app: CfAccessApp, uris: string[], policyIds: string[]): boolean {
