@@ -142,3 +142,31 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
 - [M4] adopt pins the host key as soon as it is checked, before the foreign-firewall stop. Why: on staging1 the first run stopped before pinning, so the resume needed `--host-key` again. Alt: pin at the first login.
 - [M4] `rebootTimes` in the config maps box names to their own reboot time; other boxes use `rebootTime`. Times are the box's local time, which is UTC on Hetzner's images. The unattended-upgrades check now also fails when the box's `Automatic-Reboot-Time` differs from its configured time. Why: boxes that depend on each other (app1 and the services it calls) must not reboot together, and production reboots at the quietest hour. Alt: one time for all.
 - [M4] The hardening sets the timezone to Etc/UTC, and the unattended-upgrades check fails on any other timezone. Why: reboot times are box local time, and an adopted box may have had its timezone changed. `verify --all` warns about `rebootTimes` keys that name no box (a typo leaves that box on the default). `init` keeps `rebootTimes` and the change-log paths, which it does not ask about. `detach-foreign` exits non-zero if another firewall is still on the box afterwards (for example applied by a label selector too), and frosty's own firewall must be applied to the server directly.
+
+## App routes (`frosty route`)
+
+- `routes.<box>` in config lists web apps served through the box's tunnel: a hostname, a service (`http://127.0.0.1:<port>` only, not `localhost`, which can resolve to `::1`), and every path as `protected` (behind Access) or `public`. Hostnames must be in `appZones`, never in `domain` or an `ssh-*` name, and each belongs to one route of one box. Why: one place says what is open, and frosty generates everything from it. Alt: hand-written ingress.
+- The tunnel ingress is the allowlist. For each app host it has, in order:
+  - a 404 for any path containing `..`, `//`, a backslash, `;` or `%`;
+  - one rule per public prefix;
+  - one rule per protected prefix;
+  - a 404 for the rest of the host.
+
+  A prefix ending in `/` matches what's under it. One without matches itself and what's under `/`, never `/archivex`. The regex is generated with every character escaped. Why: unlisted paths never reach the app, and encoded tricks can't hide in the path. Alt: route the whole host and rely on Access.
+- Protected rules carry exactly one origin option, `access: {required: true, teamName, audTag}`. With it, cloudflared checks the Access token itself, so a mistake at the edge (a bypass too wide, a path trick) still can't reach the app. Public rules under a protected prefix (`/api/public/`) come before it. Why: the-bouncer's must-fix G. Alt: trust the edge alone.
+- Access apps for a route:
+  - `stayfrosty-<box>:<route>` covers the protected prefixes, with the box's own email policy.
+  - `stayfrosty-<box>:<route>:public` covers the public paths under a protected prefix, with `stayfrosty-bypass` (decision bypass, include everyone, nothing else). It's the only bypass frosty ever makes. The client refuses it on every other app, including the SSH app, and verify checks it's on no other app.
+
+  The colon can't be in a box name, so a route app is never taken for another box's app. Why: the-bouncer's must-fix H. Alt: protect the whole host and bypass each public path, which Rocco turned down.
+- `externalAccess` maps a protected prefix to an Access app frosty doesn't own (on svc1, `/admin` stays on an Access app Rocco already had). frosty only reads it: the app must exist and cover the prefix, and its audience goes into the `/admin` rule's token check. Why: Rocco's choice B, 2026-10-23. Alt: frosty takes over `/admin`.
+- `frosty route sync` writes the Access apps before the ingress that routes their paths. A route whose apps are missing stays out of the ingress, so its paths 404. A route removed from config leaves the ingress first, and its apps are deleted after. `new` and `adopt --resume` keep the routes whose apps exist. Why: a protected path is never reachable without Access in front, even for a moment.
+- DNS for route hostnames isn't frosty's to write. Its token stays limited to the frosty domain, and `route plan` prints the CNAME to add elsewhere.
+- verify, per route, from outside with no credentials, sending each path exactly as written:
+  - protected prefixes, `/api/settings` and a random path under each get the Access login of this team;
+  - nine path tricks (`/api/public/../settings`, `..%2f`, `//api/settings`, `/API/settings`, `/api;/settings`, ...) get the login or the tunnel's 404, and anything from the app fails;
+  - unlisted paths get the tunnel's 404;
+  - public paths never ask for a login;
+  - `probe` answers 200 from the app.
+
+  The tunnel's 404 is told apart from the app's by its empty body. From inside, verify checks that each route's port listens on 127.0.0.1 only and that nothing listens on 5432.

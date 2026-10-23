@@ -65,6 +65,31 @@ frosty detach-foreign <box> [--dry-run]
 
 When adopt stops because the server has a firewall frosty did not make, this detaches that firewall from this one box, and only while frosty's own firewall is attached and applied, so the box is never left without one. The other firewall is not deleted and stays on any other servers. Then run adopt again with `--resume`.
 
+## `frosty route`
+
+A web app on a box, served through the box's tunnel at its own hostname. Paths are either behind Access or public, and every other path is a 404 at the tunnel. In the config:
+
+```json
+"appZones": ["example.net"],
+"accessTeam": "yourteam",
+"routes": {
+  "box1": [{
+    "name": "newsletter",
+    "hostname": "news.example.net",
+    "service": "http://127.0.0.1:9000",
+    "protected": ["/admin", "/api"],
+    "public": ["/subscription/", "/link/", "/api/public/"],
+    "probe": "/public/static/logo.svg"
+  }]
+}
+```
+
+- `frosty route plan box1` shows what the routes need, including the DNS record to add for each hostname. frosty doesn't write DNS outside its own domain.
+- `frosty route sync box1` creates or updates the Access apps first, then the tunnel's ingress, and removes routes no longer in config.
+- `frosty verify box1` then checks every path from outside.
+
+See DECISIONS.md, "App routes".
+
 ## Reboot times
 
 `rebootTime` is the default. `rebootTimes` (an object of box name to `HH:MM`, box local time, UTC on Hetzner) gives boxes their own, so boxes that depend on each other never reboot at once. adopt and new write the box's time, and `verify` checks it.
