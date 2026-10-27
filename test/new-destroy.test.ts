@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runDestroy } from "../src/commands/destroy.ts";
 import { runNew } from "../src/commands/new.ts";
+import { runSshConfig } from "../src/commands/ssh-config.ts";
 import { saveConfig } from "../src/config.ts";
 import type { Deps } from "../src/context.ts";
 import { clearSecretsForTests } from "../src/redact.ts";
@@ -152,6 +153,25 @@ describe("frosty new and destroy", () => {
     expect(main.startsWith("# Added by stayfrosty")).toBe(true);
     expect(main).toContain("Include stayfrosty.conf\n\nHost old");
     expect(readFileSync(join(home, ".ssh", "config.stayfrosty-backup-1790000000"), "utf8")).toBe("Host old\n  HostName old.example.com\n");
+  });
+
+  it("ssh-config rewrites the file from the API with the current cloudflared, and dry run writes nothing", async () => {
+    await runNew(deps(new ScriptedIo()), { box: "t1", resume: false, dryRun: false });
+    const path = join(home, ".ssh", "stayfrosty.conf");
+    writeFileSync(path, "stale\n");
+    const before = http.writes().length;
+
+    const dry = new ScriptedIo();
+    expect(await runSshConfig(deps(dry, { cloudflaredPath: "/home/me/.local/share/mise/installs/cloudflared/latest/cloudflared" }), { dryRun: true })).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe("stale\n");
+    expect(dry.text()).toContain("ProxyCommand /home/me/.local/share/mise/installs/cloudflared/latest/cloudflared access ssh");
+
+    const io = new ScriptedIo();
+    expect(await runSshConfig(deps(io, { cloudflaredPath: "/home/me/.local/share/mise/installs/cloudflared/latest/cloudflared" }), { dryRun: false })).toBe(0);
+    expect(readFileSync(path, "utf8")).toContain("Host t1\n");
+    expect(readFileSync(path, "utf8")).toContain("ProxyCommand /home/me/.local/share/mise/installs/cloudflared/latest/cloudflared access ssh --hostname %h");
+    expect(io.text()).toContain("Wrote ~/.ssh/stayfrosty.conf (1 box).");
+    expect(http.writes().length).toBe(before);
   });
 
   it("keeps the window open when ssh through Access fails", async () => {
