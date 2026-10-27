@@ -18,3 +18,21 @@ export function findCommand(name: string, env: Env): string | undefined {
   }
   return undefined;
 }
+
+// Like findCommand, but a path that survives upgrades, for writing into files such as ssh_config.
+// Version managers (mise, asdf) put one versioned directory per install on PATH; written into a
+// file, that path keeps running the old version after an upgrade. Their shim picks the current one.
+export function findStableCommand(name: string, env: Env): string | undefined {
+  const found = findCommand(name, env);
+  const install = found === undefined ? null : /^(.*)[\\/]installs[\\/][^\\/]+[\\/][^\\/]+[\\/]/.exec(found);
+  if (install === null) {
+    return found;
+  }
+  const shim = join(install[1]!, "shims", name);
+  try {
+    accessSync(shim, constants.X_OK);
+    return shim;
+  } catch {
+    return found;
+  }
+}

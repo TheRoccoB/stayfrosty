@@ -8,14 +8,14 @@ It replaces [cloudflared-vps-lockdown](https://github.com/TheRoccoB/cloudflared-
 
 ## Status: under construction
 
-`init`, `ls`, `new`, `destroy`, `console-password`, `adopt` and `verify` exist. `breakglass` and `ssh-config` do not yet. Do not point this at anything you care about yet.
+`init`, `ls`, `new`, `destroy`, `console-password`, `adopt`, `verify` and `ssh-config` exist. `breakglass` does not yet. Do not point this at anything you care about yet.
 
 | Milestone | What | State |
 |---|---|---|
 | M0 | Skeleton, CI, secret scanning, `init`, `ls` | done |
 | M1 | A box that only your laptop can reach, `destroy` | done |
 | M2 | Through the tunnel: Access, DNS, SSH config | done |
-| M3 | `verify`, `breakglass`, `ssh-config` | `verify` done |
+| M3 | `verify`, `breakglass`, `ssh-config` | `verify`, `ssh-config` done |
 | M4 | `adopt`, full docs, first release | `adopt` done |
 | Extra | `route`: serve a web app through the tunnel (beyond the original scope, optional) | done |
 
@@ -107,6 +107,16 @@ See DECISIONS.md, "App routes".
 ## Change logs and guards
 
 Set `hetznerChangeLog` and `cloudflareChangeLog` in the config to absolute paths, and frosty appends a JSON line before and after every API write (status and ids only, bodies redacted). frosty only creates, changes or deletes Cloudflare tunnels, Access apps, policies and notifications named `stayfrosty-*`, and DNS records commented `stayfrosty box *`, so a broad token cannot reach anything else through it. It never deletes a server that is adopted or protected.
+
+## `frosty ssh-config`
+
+```
+frosty ssh-config [--dry-run]
+```
+
+Rewrites `~/.ssh/stayfrosty.conf` from the Hetzner API, one `Host` block per box. Run it after making a box from another laptop, or when the file points at a cloudflared that is gone. `new`, `adopt` and `destroy` already do this.
+
+The `ProxyCommand` uses the first cloudflared on your `PATH`. A version manager's versioned path (mise or asdf, `.../installs/cloudflared/<version>/`) is swapped for its shim, so upgrading cloudflared doesn't leave SSH on the old version.
 
 ## `frosty verify`
 
