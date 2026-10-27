@@ -162,14 +162,14 @@ describe("frosty new and destroy", () => {
     const before = http.writes().length;
 
     const dry = new ScriptedIo();
-    expect(await runSshConfig(deps(dry, { cloudflaredPath: "/home/me/.local/share/mise/shims/cloudflared" }), { dryRun: true })).toBe(0);
+    expect(await runSshConfig(deps(dry, { cloudflaredPath: "/home/me/.local/share/mise/installs/cloudflared/latest/cloudflared" }), { dryRun: true })).toBe(0);
     expect(readFileSync(path, "utf8")).toBe("stale\n");
-    expect(dry.text()).toContain("ProxyCommand /home/me/.local/share/mise/shims/cloudflared access ssh");
+    expect(dry.text()).toContain("ProxyCommand /home/me/.local/share/mise/installs/cloudflared/latest/cloudflared access ssh");
 
     const io = new ScriptedIo();
-    expect(await runSshConfig(deps(io, { cloudflaredPath: "/home/me/.local/share/mise/shims/cloudflared" }), { dryRun: false })).toBe(0);
+    expect(await runSshConfig(deps(io, { cloudflaredPath: "/home/me/.local/share/mise/installs/cloudflared/latest/cloudflared" }), { dryRun: false })).toBe(0);
     expect(readFileSync(path, "utf8")).toContain("Host t1\n");
-    expect(readFileSync(path, "utf8")).toContain("ProxyCommand /home/me/.local/share/mise/shims/cloudflared access ssh --hostname %h");
+    expect(readFileSync(path, "utf8")).toContain("ProxyCommand /home/me/.local/share/mise/installs/cloudflared/latest/cloudflared access ssh --hostname %h");
     expect(io.text()).toContain("Wrote ~/.ssh/stayfrosty.conf (1 box).");
     expect(http.writes().length).toBe(before);
   });

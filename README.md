@@ -114,9 +114,9 @@ Set `hetznerChangeLog` and `cloudflareChangeLog` in the config to absolute paths
 frosty ssh-config [--dry-run]
 ```
 
-Rewrites `~/.ssh/stayfrosty.conf` from the Hetzner API, one `Host` block per box. Run it after making a box from another laptop, or when the file points at a cloudflared that is gone. `new`, `adopt` and `destroy` already do this.
+Rewrites `~/.ssh/stayfrosty.conf` from the Hetzner API, one `Host` block per box, and adds `Include stayfrosty.conf` to the top of `~/.ssh/config` if it isn't there yet (keeping a backup). It needs both tokens, like every command, but only reads the Hetzner API. Run it after making a box from another laptop, or when the file points at a cloudflared that is gone. `new`, `adopt` and `destroy` already do this.
 
-The `ProxyCommand` uses the first cloudflared on your `PATH`. A version manager's versioned path (mise or asdf, `.../installs/cloudflared/<version>/`) is swapped for its shim, so upgrading cloudflared doesn't leave SSH on the old version.
+The `ProxyCommand` uses the first cloudflared on your `PATH`. A mise install path (`.../installs/cloudflared/<version>/...`) is written as mise's `latest` symlink to the newest installed version, so upgrading cloudflared doesn't leave SSH on the old one. Never the shim: a shim picks the version from the directory you run ssh in, so a cloned repo could choose what runs. Without a `latest` symlink (asdf), the versioned path is kept; run `frosty ssh-config` again after an upgrade.
 
 ## `frosty verify`
 
