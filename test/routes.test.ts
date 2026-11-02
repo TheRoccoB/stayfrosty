@@ -22,6 +22,9 @@ const listmonk: Route = {
 };
 const opts = { domain: "example.com", appZones: ["example.net"], accessTeam: "team" };
 const AUD = "a".repeat(64);
+// cloudflared's rules are Go regexps; protected ones start with Go's inline (?i), which JS spells as a flag.
+const goRe = (pattern: string): RegExp => (pattern.startsWith("(?i)") ? new RegExp(pattern.slice(4), "i") : new RegExp(pattern));
+const protRe = (prefix: string): string => prefixRegex(prefix, { caseInsensitive: true });
 
 describe("route paths", () => {
   const matches = (prefix: string, path: string): boolean => new RegExp(prefixRegex(prefix)).test(path);
@@ -44,7 +47,10 @@ describe("route paths", () => {
     for (const p of ["/api/public/../settings", "//api/settings", "/api\\settings", "/api;/settings", "/admin%2f..", "/api/public/%2e%2e/settings"]) {
       expect(suspicious.test(p), p).toBe(true);
     }
-    for (const p of ["/api/public/subscription", "/link/abc-123/def", "/public/static/logo.svg"]) {
+    for (const p of ["/x/./y", "/.", "/./"]) {
+      expect(suspicious.test(p), p).toBe(true);
+    }
+    for (const p of ["/api/public/subscription", "/link/abc-123/def", "/public/static/logo.svg", "/.well-known/x", "/a.b/c"]) {
       expect(suspicious.test(p), p).toBe(false);
     }
   });
@@ -59,14 +65,14 @@ describe("route paths", () => {
     expect(rules.at(-1)).toEqual({ hostname: "news.example.net", service: "http_status:404" });
     const firstProtected = rules.findIndex((r) => r.originRequest !== undefined);
     expect(rules.findIndex((r) => r.path === prefixRegex("/api/public/"))).toBeLessThan(firstProtected);
-    for (const r of rules.filter((x) => x.path === prefixRegex("/admin") || x.path === prefixRegex("/api"))) {
+    for (const r of rules.filter((x) => x.path === protRe("/admin") || x.path === protRe("/api"))) {
       expect(r.originRequest).toEqual({ access: { required: true, teamName: "team", audTag: [AUD] } });
     }
     expect(rules.filter((r) => r.originRequest !== undefined)).toHaveLength(2);
     // First match wins in cloudflared: simulate it over real paths.
     const route = (path: string): string => {
       const all = boxIngress("ssh-svc1.example.com", [{ route: listmonk, audFor: () => [AUD] }], "team");
-      const hit = all.find((r) => (r.hostname === undefined || r.hostname === "news.example.net") && (r.path === undefined || new RegExp(r.path).test(path)));
+      const hit = all.find((r) => (r.hostname === undefined || r.hostname === "news.example.net") && (r.path === undefined || goRe(r.path).test(path)));
       return hit === undefined ? "none" : hit.originRequest !== undefined ? "access" : hit.service === "http_status:404" ? "404" : "app";
     };
     expect(route("/api/public/subscription")).toBe("app");
@@ -74,7 +80,9 @@ describe("route paths", () => {
     expect(route("/admin")).toBe("access");
     expect(route("/install")).toBe("404");
     expect(route("/api2")).toBe("404");
-    expect(route("/API/settings")).toBe("404");
+    // Protected prefixes match whatever the case, so a case change still meets the Access check.
+    expect(route("/API/settings")).toBe("access");
+    expect(route("/Admin")).toBe("access");
     for (const trick of ["/api/public/../settings", "//api/settings", "/api;/settings", "/admin%2f..", "/api/public/..%2fsettings"]) {
       expect(route(trick), trick).toBe("404");
     }
@@ -211,7 +219,7 @@ describe("route guards and sync", () => {
     expect(s.fcf.apps.find((a) => a["name"] === "stayfrosty-svc1:listmonk")).toBeUndefined();
     expect(s.fcf.apps.find((a) => a["name"] === "stayfrosty-svc1:listmonk:public")).toBeDefined();
     const tags = (s.fcf.ingress.get(tunnel.id) as { path?: string; originRequest?: { access: { audTag: string[] } } }[]).filter((r) => r.originRequest !== undefined).map((r) => [r.path, r.originRequest?.access.audTag[0]]);
-    expect(tags).toEqual([[prefixRegex("/admin"), "b".repeat(64)], [prefixRegex("/api"), "b".repeat(64)]]);
+    expect(tags).toEqual([[protRe("/admin"), "b".repeat(64)], [protRe("/api"), "b".repeat(64)]]);
     expect(s.http.writes().some((w) => w.url.pathname.includes("app-other-app"))).toBe(false);
   });
 
@@ -255,7 +263,7 @@ describe("route verify checks", () => {
   // A correctly set-up route, simulated from the generated ingress (first match wins).
   const good: RawGet = async (_host, path) => {
     const rules = boxIngress("ssh-svc1.example.com", [{ route: listmonk, audFor: () => [AUD] }], team);
-    const hit = rules.find((r) => (r.hostname === undefined || r.hostname === "news.example.net") && (r.path === undefined || new RegExp(r.path).test(path)));
+    const hit = rules.find((r) => (r.hostname === undefined || r.hostname === "news.example.net") && (r.path === undefined || goRe(r.path).test(path)));
     if (hit?.originRequest !== undefined) {
       // Access at the edge: protected paths, minus the bypass.
       return login;
@@ -366,7 +374,7 @@ describe("whole-site routes (\"/\")", () => {
   const login = { status: 302, location: `https://${team}.cloudflareaccess.com/cdn-cgi/access/login/x?y=1`, body: "" };
   // First match wins in cloudflared; a rule with an Access check answers with the login.
   const hit = (route: Route, path: string) =>
-    boxIngress("ssh-app1.example.com", [{ route, audFor: () => [AUD] }], team).find((r) => (r.hostname === undefined || r.hostname === route.hostname) && (r.path === undefined || new RegExp(r.path).test(path)));
+    boxIngress("ssh-app1.example.com", [{ route, audFor: () => [AUD] }], team).find((r) => (r.hostname === undefined || r.hostname === route.hostname) && (r.path === undefined || goRe(r.path).test(path)));
   const answer = (route: Route, path: string): string => {
     const h = hit(route, path);
     return h === undefined ? "none" : h.originRequest !== undefined ? "access" : h.service === "http_status:404" ? "404" : "app";
@@ -392,9 +400,11 @@ describe("whole-site routes (\"/\")", () => {
 
   it("orders rules by specificity: the trick 404 first, longer prefixes before shorter, \"/\" last", () => {
     const paths = (route: Route) => routeIngress(route, team, () => [AUD]).map((r) => [r.path ?? "(host 404)", r.originRequest !== undefined]);
-    expect(paths(site)).toEqual([[SUSPICIOUS_PATH, false], [prefixRegex("/api/health"), false], [prefixRegex("/"), true], ["(host 404)", false]]);
-    expect(paths(shop)).toEqual([[SUSPICIOUS_PATH, false], [prefixRegex("/api/admin/"), true], [prefixRegex("/admin"), true], [prefixRegex("/"), false], ["(host 404)", false]]);
-    expect(routeIngress(site, team, () => [AUD]).find((r) => r.path === prefixRegex("/"))?.originRequest).toEqual({ access: { required: true, teamName: team, audTag: [AUD] } });
+    expect(paths(site)).toEqual([[SUSPICIOUS_PATH, false], [prefixRegex("/api/health"), false], [protRe("/"), true], ["(host 404)", false]]);
+    expect(paths(shop)).toEqual([[SUSPICIOUS_PATH, false], [protRe("/api/admin/"), true], [protRe("/admin"), true], [prefixRegex("/"), false], ["(host 404)", false]]);
+    // Protected rules are case-insensitive (Go's (?i)); public ones aren't.
+    expect(protRe("/admin")).toBe(`(?i)${prefixRegex("/admin")}`);
+    expect(routeIngress(site, team, () => [AUD]).find((r) => r.path === protRe("/"))?.originRequest).toEqual({ access: { required: true, teamName: team, audTag: [AUD] } });
   });
 
   it("routes real paths the way each shape means", () => {
@@ -404,14 +414,16 @@ describe("whole-site routes (\"/\")", () => {
     // Public entries are prefixes: /api/health/<anything> is public too (the app 404s it).
     expect(answer(site, "/api/health")).toBe("app");
     expect(answer(site, "/api/health/x")).toBe("app");
-    for (const path of ["/admin", "/admin/users", "/api/admin/x"]) {
+    for (const path of ["/admin", "/admin/users", "/api/admin/x", "/ADMIN", "/Admin/x", "/API/Admin/x"]) {
       expect(answer(shop, path), path).toBe("access");
     }
+    // Public prefixes stay case-sensitive: /API/HEALTH isn't the open health path.
+    expect(answer(site, "/API/HEALTH")).toBe("access");
     for (const path of ["/", "/x", "/games/abc", "/adminx", "/api/adminx"]) {
       expect(answer(shop, path), path).toBe("app");
     }
     for (const route of [site, shop]) {
-      for (const trick of ["/admin/../x", "//admin", "/admin;/x", "/a%2f..", "/x\\y"]) {
+      for (const trick of ["/admin/../x", "//admin", "/admin;/x", "/a%2f..", "/x\\y", "/./admin", "/x/.", "/admin/./x"]) {
         expect(answer(route, trick), trick).toBe("404");
       }
     }
@@ -438,7 +450,7 @@ describe("whole-site routes (\"/\")", () => {
     ]);
     const prot = apps.find((a) => a["name"] === "stayfrosty-svc1:site") as Record<string, unknown>;
     const ingress = fcf.ingress.get(tunnel.id) as { path?: string; originRequest?: { access: { audTag: string[] } } }[];
-    expect(ingress.filter((r) => r.originRequest !== undefined).map((r) => [r.path, r.originRequest?.access.audTag])).toEqual([[prefixRegex("/"), [prot["aud"]]]]);
+    expect(ingress.filter((r) => r.originRequest !== undefined).map((r) => [r.path, r.originRequest?.access.audTag])).toEqual([[protRe("/"), [prot["aud"]]]]);
   });
 
   it("verify from outside: protected \"/\" means every other path asks for the login; public \"/\" means none does", async () => {
@@ -455,10 +467,14 @@ describe("whole-site routes (\"/\")", () => {
     // The open path on a protected "/" must not ask for the login.
     const noBypass: RawGet = async (host, path) => (path === "/api/health" ? login : simulate(site)(host, path));
     expect((await checkRouteOutside(noBypass, site, team)).detail).toContain("/api/health asks for the Access login");
-    // On a public "/" site, a trick that lands inside a protected prefix (/API/settings under /api, if the
-    // app folds case) must not reach the app: cloudflared's regexes are case-sensitive, so verify says so.
+    // On a public "/" site, a case-changed trick into a protected prefix meets the Access check (the
+    // protected rule is case-insensitive), so verify passes; an app answering it there fails.
     const apiShop: Route = { ...shop, protected: ["/api"] };
-    expect((await checkRouteOutside(simulate(apiShop), apiShop, team)).detail).toContain("/API/settings got origin");
+    expect(answer(apiShop, "/API/settings")).toBe("access");
+    const okApi = await checkRouteOutside(simulate(apiShop), apiShop, team);
+    expect(okApi.ok, okApi.detail).toBe(true);
+    const caseLeak: RawGet = async (host, path) => (path === "/API/settings" ? { status: 200, location: null, body: "{}" } : simulate(apiShop)(host, path));
+    expect((await checkRouteOutside(caseLeak, apiShop, team)).detail).toContain("/API/settings got origin");
   });
 });
 

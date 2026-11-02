@@ -31,8 +31,9 @@ const TEAM = /^[a-z0-9-]{1,63}$/;
 
 // The first rule for every app hostname: 404 anything a path trick could hide in. cloudflared
 // matches the decoded path, so `%` here only catches double encoding (%25..); encoded dots and
-// slashes decode to `..` and `//`, which are caught as such.
-export const SUSPICIOUS_PATH = String.raw`(\.\.|//|\\|;|%)`;
+// slashes decode to `..` and `//`, which are caught as such. A `.` segment (/./) is caught too, rather
+// than trusting the zone's URL normalization to collapse it.
+export const SUSPICIOUS_PATH = String.raw`(\.\.|//|\\|;|%|/\.(/|$))`;
 
 export function servicePort(service: string): number | undefined {
   const m = SERVICE.exec(service);
@@ -49,9 +50,13 @@ export function isUnder(child: string, parent: string): boolean {
 }
 
 // "/archive" matches /archive and /archive/..., never /archivex. "/link/" matches /link/... only.
-export function prefixRegex(prefix: string): string {
+// Protected prefixes match case-insensitively (Go regexp's (?i), which cloudflared uses): /ADMIN gets
+// the Access check too, instead of falling through to a public "/" (or the 404), whatever the app
+// does with case. Public prefixes stay case-sensitive, so they never open more than listed.
+export function prefixRegex(prefix: string, opts: { caseInsensitive?: boolean } = {}): string {
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\/-]/g, "\\$&");
-  return prefix.endsWith("/") ? `^${escaped}` : `^${escaped}(/|$)`;
+  const re = prefix.endsWith("/") ? `^${escaped}` : `^${escaped}(/|$)`;
+  return opts.caseInsensitive === true ? `(?i)${re}` : re;
 }
 
 // Public paths inside a protected prefix: each needs an Access bypass, or Access would ask for a login.
@@ -227,7 +232,7 @@ export function routeIngress(route: Route, teamName: string, audFor: (prefix: st
   return [
     { hostname, path: SUSPICIOUS_PATH, service: "http_status:404" },
     ...ordered.map(({ p, protect }): IngressRule => (protect
-      ? { hostname, path: prefixRegex(p), service, originRequest: { access: { required: true as const, teamName, audTag: audFor(p) } } }
+      ? { hostname, path: prefixRegex(p, { caseInsensitive: true }), service, originRequest: { access: { required: true as const, teamName, audTag: audFor(p) } } }
       : { hostname, path: prefixRegex(p), service })),
     { hostname, service: "http_status:404" },
   ];
