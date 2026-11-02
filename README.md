@@ -94,7 +94,7 @@ Two options cover common setups:
 - **`externalAccess`.** Map protected prefixes to an Access app you already manage outside frosty, for example `"externalAccess": {"/admin": "my-app", "/api": "my-app"}`. frosty only reads that app. It must cover those paths and may only let identified people in: no everyone, IP-range or service-token rules. Map **every** protected prefix of a hostname to the same app (frosty enforces this). Two Access apps on one hostname fight over the same login cookie, and a single-page app that calls its API from the browser breaks.
 
 Commands:
-- `frosty route plan box1` shows what the routes need, including the DNS record to add for each hostname. frosty doesn't write DNS outside its own domain.
+- `frosty route plan box1` shows what the routes need, including the DNS record to add for each hostname. frosty doesn't write DNS outside its own domain. It also makes the same checks of `externalAccess` apps as sync (they exist, cover the path, and only let identified people in), and exits 1 if sync would refuse.
 - `frosty route sync box1` creates or updates the Access apps first, then the tunnel's ingress, and removes routes no longer in config.
 - `frosty verify box1` then checks every path from outside: it tries the protected paths, a set of path tricks (`..`, `%2f`, `//`, case changes) and unlisted paths, all without credentials. On the box, it checks that the app listens on 127.0.0.1 only.
 

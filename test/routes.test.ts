@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { BYPASS_POLICY_NAME, Cloudflare } from "../src/cloudflare.ts";
 import { validateConfig } from "../src/config.ts";
 import type { Context } from "../src/context.ts";
-import { appCovers, syncRoutes } from "../src/edge.ts";
+import { appCovers, checkExternalAccess, routeApps, syncRoutes } from "../src/edge.ts";
 import { checkRouteAccess, checkRouteOutside, checkRoutePorts, classify } from "../src/checks/routes.ts";
 import { assertBoxName } from "../src/context.ts";
 import type { RawGet } from "../src/rawget.ts";
@@ -213,6 +213,31 @@ describe("route guards and sync", () => {
     const tags = (s.fcf.ingress.get(tunnel.id) as { path?: string; originRequest?: { access: { audTag: string[] } } }[]).filter((r) => r.originRequest !== undefined).map((r) => [r.path, r.originRequest?.access.audTag[0]]);
     expect(tags).toEqual([[prefixRegex("/admin"), "b".repeat(64)], [prefixRegex("/api"), "b".repeat(64)]]);
     expect(s.http.writes().some((w) => w.url.pathname.includes("app-other-app"))).toBe(false);
+  });
+
+  it("route plan makes the same external-app checks as sync, so they can't disagree", async () => {
+    const route = { ...listmonk, externalAccess: { "/admin": "other-app", "/api": "other-app" } };
+    const s = setup([route]);
+    const check = async () => (await checkExternalAccess(s.ctx, route, routeApps(await s.cloudflare.listAccessApps("acc123"), "svc1", route))).map((c) => c.problem ?? "ok");
+    // Missing, then present but not covering /api, then letting everyone in, then right.
+    expect(await check()).toEqual([expect.stringMatching(/must exist and cover news.example.net\/admin/), expect.stringMatching(/must exist and cover news.example.net\/api/)]);
+    s.fcf.policies.push({ id: "pol-other-app", name: "gh-policy", decision: "allow", include: [{ everyone: {} }] });
+    s.fcf.apps.push({ id: "app-other-app", name: "other-app", aud: "b".repeat(64), type: "self_hosted", domain: "other.example.net", self_hosted_domains: ["other.example.net", "news.example.net/admin*"], policies: [{ id: "pol-other-app", precedence: 1 }] });
+    expect(await check()).toEqual([expect.stringMatching(/includes a everyone rule/), expect.stringMatching(/must exist and cover news.example.net\/api/)]);
+    const app = s.fcf.apps.find((a) => a["id"] === "app-other-app") as Record<string, unknown>;
+    app["self_hosted_domains"] = ["other.example.net", "news.example.net/admin*", "news.example.net/api*"];
+    (s.fcf.policies.find((p) => p["id"] === "pol-other-app") as Record<string, unknown>)["include"] = [{ email: { email: "a@b.co" } }];
+    expect(await check()).toEqual(["ok", "ok"]);
+  });
+
+  it("sync accepts an external app that covers its paths with wildcards in self_hosted_domains", async () => {
+    const route = { ...listmonk, externalAccess: { "/admin": "other-app", "/api": "other-app" } };
+    const s = setup([route]);
+    const { tunnel } = await seedBox(s);
+    s.fcf.policies.push({ id: "pol-other-app", name: "gh-policy", decision: "allow", include: [{ email: { email: "a@b.co" } }] });
+    s.fcf.apps.push({ id: "app-other-app", name: "other-app", aud: "b".repeat(64), type: "self_hosted", domain: "other.example.net", self_hosted_domains: ["other.example.net", "news.example.net/admin*", "news.example.net/api*"], policies: [{ id: "pol-other-app", precedence: 1 }] });
+    await syncRoutes(s.ctx, "svc1", tunnel);
+    expect(s.io.text()).toContain("Access app other-app (not frosty's) covers news.example.net/api and lets in email: 1.");
   });
 
   it("refuses a look-alike bypass policy", async () => {

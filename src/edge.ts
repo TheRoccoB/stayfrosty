@@ -165,17 +165,11 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
   const base = { box, appZones: config.appZones ?? [], domain: config.domain, sessionDuration: config.accessSessionDuration };
   for (const route of routes) {
     const have = routeApps(apps, box, route);
-    for (const [prefix, name] of Object.entries(route.externalAccess ?? {})) {
-      const listedExt = have.external[prefix];
-      const ext = listedExt === undefined ? undefined : await cloudflare.getAccessApp(config.accountId, listedExt.id);
-      if (ext === undefined || !appCovers(ext, accessUri(route.hostname, prefix))) {
-        throw new FrostyError(`Access app ${name} must exist and cover ${accessUri(route.hostname, prefix)} (externalAccess for ${route.name}).`, "frosty doesn't change that app. Fix it in the Cloudflare dashboard, or take the path out of externalAccess.");
+    for (const c of await checkExternalAccess(ctx, route, have)) {
+      if (c.problem !== undefined) {
+        throw new FrostyError(c.problem, c.fix);
       }
-      const bad = externalPolicyProblems(ext);
-      if (bad.length > 0) {
-        throw new FrostyError(`Access app ${name} doesn't only let identified people in: ${bad.join("; ")}.`, "frosty doesn't change that app. Fix its policies in the Cloudflare dashboard, or take the path out of externalAccess.");
-      }
-      io.out(`Access app ${name} (not frosty's) covers ${accessUri(route.hostname, prefix)} and lets in ${describeIncludes(ext)}.`);
+      io.out(`Access app ${c.name} (not frosty's) covers ${c.uri} and lets in ${describeIncludes(c.app!)}.`);
     }
     if (frostyProtected(route).length > 0) {
       const want = frostyProtected(route).map((p) => accessUri(route.hostname, p));
@@ -218,6 +212,37 @@ function appUris(app: CfAccessApp): string[] {
 
 // What's wrong with an external app's policies for guarding a protected path: frosty doesn't own
 // it, but it must still only let identified people in (allow, no everyone, IP ranges or tokens).
+export interface ExternalAccessCheck {
+  prefix: string;
+  name: string;
+  uri: string;
+  app: CfAccessApp | undefined;
+  problem?: string;
+  fix?: string;
+}
+
+// The Access apps a route borrows (externalAccess), each fetched in full and checked: it must exist,
+// cover the path, and only let identified people in. Shared by route plan and sync, so they agree.
+export async function checkExternalAccess(ctx: Context, route: Route, have: RouteApps): Promise<ExternalAccessCheck[]> {
+  const out: ExternalAccessCheck[] = [];
+  for (const [prefix, name] of Object.entries(route.externalAccess ?? {})) {
+    const uri = accessUri(route.hostname, prefix);
+    const listed = have.external[prefix];
+    const app = listed === undefined ? undefined : await ctx.cloudflare.getAccessApp(ctx.config.accountId, listed.id);
+    if (app === undefined || !appCovers(app, uri)) {
+      out.push({ prefix, name, uri, app, problem: `Access app ${name} must exist and cover ${uri} (externalAccess for ${route.name}).`, fix: "frosty doesn't change that app. Fix it in the Cloudflare dashboard, or take the path out of externalAccess." });
+      continue;
+    }
+    const bad = externalPolicyProblems(app);
+    if (bad.length > 0) {
+      out.push({ prefix, name, uri, app, problem: `Access app ${name} doesn't only let identified people in: ${bad.join("; ")}.`, fix: "frosty doesn't change that app. Fix its policies in the Cloudflare dashboard, or take the path out of externalAccess." });
+      continue;
+    }
+    out.push({ prefix, name, uri, app });
+  }
+  return out;
+}
+
 export function externalPolicyProblems(app: CfAccessApp): string[] {
   const problems: string[] = [];
   const policies = app.policies ?? [];
