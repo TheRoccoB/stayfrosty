@@ -1,6 +1,7 @@
 // App routes: a web app on a box, served through the box's tunnel (see DECISIONS.md, "App routes").
 //
-// Every path the app serves is listed in config as protected (behind Access) or public. The tunnel's
+// Every path the app serves is listed in config as protected (behind Access) or public; "/" alone
+// covers the whole site (a whole-site app behind Access, or a public site with protected parts). The tunnel's
 // ingress is generated from that list and is itself an allowlist: unlisted paths, and any path with
 // `..`, `//`, a backslash, `;` or `%`, get the tunnel's 404 and never reach the app. Protected rules
 // also make cloudflared check the Access token itself, so a mistake at the edge can't open them.
@@ -21,15 +22,18 @@ export interface Route {
 const ROUTE_NAME = /^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$/;
 const HOSTNAME = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 // One or more /segments, each starting with a letter, digit, _ or - (so never . or ..), and an
-// optional trailing slash. Linear: each segment starts at its own /.
+// optional trailing slash. Linear: each segment starts at its own /. "/" alone is checked separately.
 const PREFIX = /^(\/[a-z0-9_-][a-z0-9_.-]*)+\/?$/;
+export const ROOT = "/";
+const isPrefix = (p: unknown): p is string => typeof p === "string" && (p === ROOT || PREFIX.test(p));
 const SERVICE = /^http:\/\/127\.0\.0\.1:(\d{4,5})$/;
 const TEAM = /^[a-z0-9-]{1,63}$/;
 
 // The first rule for every app hostname: 404 anything a path trick could hide in. cloudflared
 // matches the decoded path, so `%` here only catches double encoding (%25..); encoded dots and
-// slashes decode to `..` and `//`, which are caught as such.
-export const SUSPICIOUS_PATH = String.raw`(\.\.|//|\\|;|%)`;
+// slashes decode to `..` and `//`, which are caught as such. A `.` segment (/./) is caught too, rather
+// than trusting the zone's URL normalization to collapse it.
+export const SUSPICIOUS_PATH = String.raw`(\.\.|//|\\|;|%|/\.(/|$))`;
 
 export function servicePort(service: string): number | undefined {
   const m = SERVICE.exec(service);
@@ -46,9 +50,13 @@ export function isUnder(child: string, parent: string): boolean {
 }
 
 // "/archive" matches /archive and /archive/..., never /archivex. "/link/" matches /link/... only.
-export function prefixRegex(prefix: string): string {
+// Protected prefixes match case-insensitively (Go regexp's (?i), which cloudflared uses): /ADMIN gets
+// the Access check too, instead of falling through to a public "/" (or the 404), whatever the app
+// does with case. Public prefixes stay case-sensitive, so they never open more than listed.
+export function prefixRegex(prefix: string, opts: { caseInsensitive?: boolean } = {}): string {
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\/-]/g, "\\$&");
-  return prefix.endsWith("/") ? `^${escaped}` : `^${escaped}(/|$)`;
+  const re = prefix.endsWith("/") ? `^${escaped}` : `^${escaped}(/|$)`;
+  return opts.caseInsensitive === true ? `(?i)${re}` : re;
 }
 
 // Public paths inside a protected prefix: each needs an Access bypass, or Access would ask for a login.
@@ -126,8 +134,8 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
     const lists: Record<string, string[]> = {};
     for (const key of ["protected", "public"]) {
       const list = r[key];
-      if (!Array.isArray(list) || list.some((p) => typeof p !== "string" || !PREFIX.test(p) || p === "/" || /\/\//.test(p))) {
-        problems.push(`${where}.${key} must be a list of paths like /admin or /link/ (lowercase letters, digits, _ . -)`);
+      if (!Array.isArray(list) || list.some((p) => !isPrefix(p) || /\/\//.test(p))) {
+        problems.push(`${where}.${key} must be a list of paths like /, /admin or /link/ (lowercase letters, digits, _ . -)`);
         lists[key] = [];
       } else {
         lists[key] = list as string[];
@@ -143,9 +151,12 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
         problems.push(`${where} lists ${p} twice`);
       }
     }
+    // A protected path under a public one would be public, except under a public "/": the ingress puts
+    // every longer prefix before "/", so cloudflared still checks Access on it (a public site with
+    // protected parts, like /admin).
     for (const q of prot) {
       for (const p of pub) {
-        if (q !== p && isUnder(q, p)) {
+        if (q !== p && p !== ROOT && isUnder(q, p)) {
           problems.push(`${where}: protected ${q} is under public ${p}, which would make it public`);
         }
       }
@@ -158,6 +169,8 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
         for (const [p, app] of Object.entries(external as Record<string, unknown>)) {
           if (!prot.includes(p) || typeof app !== "string" || app.length === 0 || app.startsWith("stayfrosty-")) {
             problems.push(`${where}.externalAccess.${p} must be a protected path mapped to the name of an Access app frosty doesn't own`);
+          } else if (p === ROOT) {
+            problems.push(`${where}.externalAccess can't cover "/": a whole-site app gets frosty's own Access app`);
           }
         }
       }
@@ -170,7 +183,7 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
       }
     }
     const probe = r["probe"];
-    if (probe !== undefined && (typeof probe !== "string" || !PREFIX.test(probe) || !pub.some((p) => isUnder(probe, p) && !prot.some((q) => isUnder(probe, q))))) {
+    if (probe !== undefined && (typeof probe !== "string" || !isPrefix(probe) || !pub.some((p) => isUnder(probe, p) && !prot.some((q) => isUnder(probe, q))))) {
       problems.push(`${where}.probe must be a path under a public prefix that isn't protected`);
     }
   }
@@ -200,14 +213,27 @@ export interface IngressRule {
   originRequest?: { access: { required: true; teamName: string; audTag: string[] } };
 }
 
-// One route's rules: the trick-path 404, public prefixes (so /api/public/ wins over /api), protected
-// prefixes with cloudflared's own Access check, then a 404 for everything else on the host.
+// The order cloudflared should try prefixes in (first match wins): the most specific first, so
+// /api/public/ comes before /api, and every prefix before "/". Prefixes that don't nest can't both match
+// a path, so length alone orders the ones that do; ties keep config order, public before protected.
+function bySpecificity(a: string, b: string): number {
+  if (a === ROOT || b === ROOT) {
+    return a === b ? 0 : a === ROOT ? 1 : -1;
+  }
+  return b.length - a.length;
+}
+
+// One route's rules: the trick-path 404, then every listed prefix by specificity (protected ones with
+// cloudflared's own Access check), then a 404 for everything else on the host.
 export function routeIngress(route: Route, teamName: string, audFor: (prefix: string) => string[]): IngressRule[] {
   const { hostname, service } = route;
+  const listed = [...route.public.map((p) => ({ p, protect: false })), ...route.protected.map((p) => ({ p, protect: true }))];
+  const ordered = listed.map((x, i) => ({ ...x, i })).sort((a, b) => bySpecificity(a.p, b.p) || a.i - b.i);
   return [
     { hostname, path: SUSPICIOUS_PATH, service: "http_status:404" },
-    ...route.public.map((p) => ({ hostname, path: prefixRegex(p), service })),
-    ...route.protected.map((p) => ({ hostname, path: prefixRegex(p), service, originRequest: { access: { required: true as const, teamName, audTag: audFor(p) } } })),
+    ...ordered.map(({ p, protect }): IngressRule => (protect
+      ? { hostname, path: prefixRegex(p, { caseInsensitive: true }), service, originRequest: { access: { required: true as const, teamName, audTag: audFor(p) } } }
+      : { hostname, path: prefixRegex(p), service })),
     { hostname, service: "http_status:404" },
   ];
 }

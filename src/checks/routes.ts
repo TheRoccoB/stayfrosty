@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { BYPASS_POLICY_NAME, isOurBypassPolicy, isOurEmailPolicy, type CfAccessApp, type CfAccessPolicy } from "../cloudflare.ts";
 import { appCovers, appMatches, describeIncludes, externalPolicyProblems, routeApps } from "../edge.ts";
-import { accessUri, bypassPaths, frostyProtected, publicAppName, routeAppName, servicePort, type Route } from "../routes.ts";
+import { ROOT, accessUri, isUnder, bypassPaths, frostyProtected, publicAppName, routeAppName, servicePort, type Route } from "../routes.ts";
 import type { RawGet, RawResponse } from "../rawget.ts";
 import { parseSs, type Listener } from "./listeners.ts";
 import { fail, pass, type CheckResult } from "./types.ts";
@@ -76,11 +76,22 @@ export async function checkRouteOutside(get: RawGet, route: Route, team: string)
   if (route.protected.includes("/api")) {
     await expect("/api/settings", ["access"], "protected");
   }
+  // A trick path must never reach the app inside a protected prefix. On a public "/" site, a trick that
+  // only lands on public paths (read as an app might: case folded, /./ collapsed) may reach it.
+  const lands = (path: string): string => path.toLowerCase().replace(/\/\.(?=\/|$)/g, "");
   for (const t of TRICKS) {
-    await expect(t, ["access", "tunnel-404", "tunnel-403"], "path trick");
+    const harmless = route.public.includes(ROOT) && !route.protected.some((q) => isUnder(lands(t), q));
+    await expect(t, harmless ? ["access", "tunnel-404", "tunnel-403", "origin"] : ["access", "tunnel-404", "tunnel-403"], "path trick");
   }
-  for (const p of [`/${rand}`, "/install", `${(route.protected[0] ?? route.public[0] ?? "/x").replace(/\/$/, "")}${rand}`]) {
-    await expect(p, ["tunnel-404"], "not listed");
+  // Paths no prefix lists get the tunnel's 404, unless "/" is listed: then there are no unlisted paths,
+  // and they must get the Access login (protected "/") or reach the app (public "/").
+  const notListed: [Answer[], string] = route.protected.includes(ROOT)
+    ? [["access"], "protected by /"]
+    : route.public.includes(ROOT)
+      ? [["origin"], "public by /"]
+      : [["tunnel-404"], "not listed"];
+  for (const p of [`/${rand}`, "/install", `${(route.protected[0] ?? route.public[0] ?? "/x").replace(/\/$/, "") || "/x"}${rand}`]) {
+    await expect(p, ...notListed);
   }
   for (const p of route.public) {
     const path = p.endsWith("/") ? `${p}${rand}` : p;
@@ -102,7 +113,7 @@ export async function checkRouteOutside(get: RawGet, route: Route, team: string)
   if (problems.length > 0) {
     return fail(name, problems.join("; "), `A protected or unlisted path is reachable, or the app isn't answering. Run: frosty route sync <box>, then check the app on the box.`);
   }
-  return pass(name, `protected paths get the Access login, ${TRICKS.length} path tricks are stopped, unlisted paths 404${route.probe === undefined ? "" : ", the app answers"}`);
+  return pass(name, `protected paths get the Access login, ${TRICKS.length} path tricks are stopped, ${route.protected.includes(ROOT) ? "every other path asks for the login" : route.public.includes(ROOT) ? "every other path reaches the app" : "unlisted paths 404"}${route.probe === undefined ? "" : ", the app answers"}`);
 }
 
 // The route's Access apps are exactly frosty's shape, and the bypass policy is on no other app.

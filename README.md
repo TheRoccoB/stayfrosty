@@ -88,6 +88,8 @@ Serve a web app on a no-front-door box. Some paths are public, and the rest sit 
 - `appZones` lists the zones where route hostnames may live. It never includes frosty's own `domain`.
 - `accessTeam` is your Access team name, as in `<team>.cloudflareaccess.com`.
 - `probe` (optional) is a public path that answers 200 from the app. It lets `verify` tell the app apart from the tunnel's 404.
+- Every entry is a **prefix**: `/hooks/incoming` also matches `/hooks/incoming/anything`. There's no exact-path form, so the app must 404 what it doesn't serve under a public prefix.
+- **`/` covers the whole site.** `"protected": ["/"], "public": ["/health"]` puts a whole app behind Access with one open path. `"public": ["/"], "protected": ["/admin"]` is a public site with a protected part. Rules go longest prefix first and `/` last, so the more specific one always wins, and protected prefixes keep cloudflared's own Access check under a public `/`. With `/` listed there are no unlisted paths: `verify` expects the login (protected `/`) or the app (public `/`) where it would otherwise expect the tunnel's 404. `/` can't be in both lists or in `externalAccess`. Protected prefixes match case-insensitively (`/ADMIN` meets the Access check like `/admin`); public prefixes match exactly as written.
 
 Two options cover common setups:
 - **A public subpath inside a protected prefix.** Here that's `/api/public/` inside `/api`. frosty gives those paths their own Access app with a bypass policy, and that is the only place it ever uses a bypass.
