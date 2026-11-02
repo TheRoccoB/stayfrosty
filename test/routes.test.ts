@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { BYPASS_POLICY_NAME, Cloudflare } from "../src/cloudflare.ts";
 import { validateConfig } from "../src/config.ts";
 import type { Context } from "../src/context.ts";
-import { syncRoutes } from "../src/edge.ts";
+import { appCovers, checkExternalAccess, routeApps, syncRoutes } from "../src/edge.ts";
 import { checkRouteAccess, checkRouteOutside, checkRoutePorts, classify } from "../src/checks/routes.ts";
 import { assertBoxName } from "../src/context.ts";
 import type { RawGet } from "../src/rawget.ts";
@@ -215,6 +215,31 @@ describe("route guards and sync", () => {
     expect(s.http.writes().some((w) => w.url.pathname.includes("app-other-app"))).toBe(false);
   });
 
+  it("route plan makes the same external-app checks as sync, so they can't disagree", async () => {
+    const route = { ...listmonk, externalAccess: { "/admin": "other-app", "/api": "other-app" } };
+    const s = setup([route]);
+    const check = async () => (await checkExternalAccess(s.ctx, route, routeApps(await s.cloudflare.listAccessApps("acc123"), "svc1", route))).map((c) => c.problem ?? "ok");
+    // Missing, then present but not covering /api, then letting everyone in, then right.
+    expect(await check()).toEqual([expect.stringMatching(/must exist and cover news.example.net\/admin/), expect.stringMatching(/must exist and cover news.example.net\/api/)]);
+    s.fcf.policies.push({ id: "pol-other-app", name: "gh-policy", decision: "allow", include: [{ everyone: {} }] });
+    s.fcf.apps.push({ id: "app-other-app", name: "other-app", aud: "b".repeat(64), type: "self_hosted", domain: "other.example.net", self_hosted_domains: ["other.example.net", "news.example.net/admin*"], policies: [{ id: "pol-other-app", precedence: 1 }] });
+    expect(await check()).toEqual([expect.stringMatching(/includes a everyone rule/), expect.stringMatching(/must exist and cover news.example.net\/api/)]);
+    const app = s.fcf.apps.find((a) => a["id"] === "app-other-app") as Record<string, unknown>;
+    app["self_hosted_domains"] = ["other.example.net", "news.example.net/admin*", "news.example.net/api*"];
+    (s.fcf.policies.find((p) => p["id"] === "pol-other-app") as Record<string, unknown>)["include"] = [{ email: { email: "a@b.co" } }];
+    expect(await check()).toEqual(["ok", "ok"]);
+  });
+
+  it("sync accepts an external app that covers its paths with wildcards in self_hosted_domains", async () => {
+    const route = { ...listmonk, externalAccess: { "/admin": "other-app", "/api": "other-app" } };
+    const s = setup([route]);
+    const { tunnel } = await seedBox(s);
+    s.fcf.policies.push({ id: "pol-other-app", name: "gh-policy", decision: "allow", include: [{ email: { email: "a@b.co" } }] });
+    s.fcf.apps.push({ id: "app-other-app", name: "other-app", aud: "b".repeat(64), type: "self_hosted", domain: "other.example.net", self_hosted_domains: ["other.example.net", "news.example.net/admin*", "news.example.net/api*"], policies: [{ id: "pol-other-app", precedence: 1 }] });
+    await syncRoutes(s.ctx, "svc1", tunnel);
+    expect(s.io.text()).toContain("Access app other-app (not frosty's) covers news.example.net/api and lets in email: 1.");
+  });
+
   it("refuses a look-alike bypass policy", async () => {
     const s = setup();
     const { tunnel } = await seedBox(s);
@@ -330,5 +355,19 @@ describe("route review fixes", () => {
     expect(validateRoutes("svc1", [{ ...listmonk, public: ["/a/../b"] }], opts)).not.toEqual([]);
     expect(validateRoutes("svc1", [{ ...listmonk, public: ["/."] }], opts)).not.toEqual([]);
     expect(validateRoutes("svc1", [{ ...listmonk, public: ["/public/static.v2/"] }], opts)).toEqual([expect.stringMatching(/probe/)]);
+  });
+});
+
+describe("external app coverage", () => {
+  it("accepts exact paths, path prefixes and path wildcards, from destinations or self_hosted_domains", () => {
+    const app = (uris: string[], field: "destinations" | "self_hosted_domains" = "destinations") =>
+      ({ id: "a", name: "x", type: "self_hosted", ...(field === "destinations" ? { destinations: uris.map((uri) => ({ uri })) } : { self_hosted_domains: uris }) }) as never;
+    expect(appCovers(app(["news.example.net/api"]), "news.example.net/api")).toBe(true);
+    expect(appCovers(app(["news.example.net/api*"], "self_hosted_domains"), "news.example.net/api")).toBe(true);
+    expect(appCovers(app(["news.example.net/admin*", "news.example.net/api*"], "self_hosted_domains"), "news.example.net/admin")).toBe(true);
+    expect(appCovers(app(["news.example.net"]), "news.example.net/api")).toBe(true);
+    expect(appCovers(app(["news.example.net/apis"]), "news.example.net/api")).toBe(false);
+    expect(appCovers(app(["*.example.net"]), "news.example.net/api")).toBe(false);
+    expect(appCovers(app(["news.example.net/admin*"], "self_hosted_domains"), "news.example.net/api")).toBe(false);
   });
 });

@@ -1,6 +1,6 @@
 import { assertBoxName, buildContext, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
-import { boxRoutes, findEdge, routeApps, routeAuds, syncRoutes } from "../edge.ts";
+import { boxRoutes, checkExternalAccess, describeIncludes, findEdge, routeApps, routeAuds, syncRoutes } from "../edge.ts";
 import { accessUri, bypassPaths, frostyProtected, publicAppName, routeAppName } from "../routes.ts";
 
 export interface RouteOptions {
@@ -32,6 +32,7 @@ export async function runRoute(deps: Deps, opts: RouteOptions): Promise<number> 
     io.out(`${box} has no routes in config.${opts.action === "sync" ? " Its tunnel carries SSH only." : ""}`);
     return 0;
   }
+  let problems = 0;
   for (const route of routes) {
     const have = routeApps(apps, box, route);
     io.out(`${route.name}: ${route.hostname} -> ${route.service}`);
@@ -43,13 +44,23 @@ export async function runRoute(deps: Deps, opts: RouteOptions): Promise<number> 
     if (bypassPaths(route).length > 0) {
       io.out(`  Access ${publicAppName(box, route)} (bypass): ${bypassPaths(route).map((p) => accessUri(route.hostname, p)).join(", ")}${have.publicApp === undefined ? "  [missing]" : ""}`);
     }
-    for (const [prefix, name] of Object.entries(route.externalAccess ?? {})) {
-      io.out(`  Access ${name} (not frosty's, read only): ${accessUri(route.hostname, prefix)}${have.external[prefix] === undefined ? "  [missing]" : ""}`);
+    // The same checks sync makes, so a plan that looks fine never ends in a refused sync.
+    for (const c of await checkExternalAccess(ctx, route, have)) {
+      if (c.problem !== undefined) {
+        problems++;
+        io.out(`  Access ${c.name} (not frosty's, read only): ${c.uri}  [problem: ${c.problem}]`);
+      } else {
+        io.out(`  Access ${c.name} (not frosty's, read only): ${c.uri}, lets in ${describeIncludes(c.app!)}`);
+      }
     }
     io.out(`  In the tunnel's ingress: ${routeAuds(have) === undefined ? "no (an Access app is missing; run frosty route sync)" : "yes"}`);
     io.out(`  DNS (add it outside frosty): ${route.hostname} CNAME ${edge.tunnel.id}.cfargotunnel.com, proxied, comment "stayfrosty route ${box} ${route.name}"`);
   }
   io.out("");
+  if (problems > 0) {
+    io.out(`${problems} externalAccess problem(s) above: sync would refuse. frosty doesn't change those apps; fix them in the Cloudflare dashboard, or take the paths out of externalAccess.`);
+    return 1;
+  }
   io.out(`Then check it: frosty verify ${box}`);
   return 0;
 }

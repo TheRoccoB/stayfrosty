@@ -165,17 +165,11 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
   const base = { box, appZones: config.appZones ?? [], domain: config.domain, sessionDuration: config.accessSessionDuration };
   for (const route of routes) {
     const have = routeApps(apps, box, route);
-    for (const [prefix, name] of Object.entries(route.externalAccess ?? {})) {
-      const listedExt = have.external[prefix];
-      const ext = listedExt === undefined ? undefined : await cloudflare.getAccessApp(config.accountId, listedExt.id);
-      if (ext === undefined || !appCovers(ext, accessUri(route.hostname, prefix))) {
-        throw new FrostyError(`Access app ${name} must exist and cover ${accessUri(route.hostname, prefix)} (externalAccess for ${route.name}).`, "frosty doesn't change that app. Fix it in the Cloudflare dashboard, or take the path out of externalAccess.");
+    for (const c of await checkExternalAccess(ctx, route, have)) {
+      if (c.problem !== undefined) {
+        throw new FrostyError(c.problem, c.fix);
       }
-      const bad = externalPolicyProblems(ext);
-      if (bad.length > 0) {
-        throw new FrostyError(`Access app ${name} doesn't only let identified people in: ${bad.join("; ")}.`, "frosty doesn't change that app. Fix its policies in the Cloudflare dashboard, or take the path out of externalAccess.");
-      }
-      io.out(`Access app ${name} (not frosty's) covers ${accessUri(route.hostname, prefix)} and lets in ${describeIncludes(ext)}.`);
+      io.out(`Access app ${c.name} (not frosty's) covers ${c.uri} and lets in ${describeIncludes(c.app!)}.`);
     }
     if (frostyProtected(route).length > 0) {
       const want = frostyProtected(route).map((p) => accessUri(route.hostname, p));
@@ -206,7 +200,45 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
 
 function appUris(app: CfAccessApp): string[] {
   const uris = (app.destinations ?? []).map((d) => d.uri).filter((u): u is string => u !== undefined);
-  return uris.length > 0 ? uris : app.domain === undefined ? [] : [app.domain];
+  if (uris.length > 0) {
+    return uris;
+  }
+  // Apps made in the dashboard may list their paths here instead.
+  if ((app.self_hosted_domains ?? []).length > 0) {
+    return app.self_hosted_domains as string[];
+  }
+  return app.domain === undefined ? [] : [app.domain];
+}
+
+export interface ExternalAccessCheck {
+  prefix: string;
+  name: string;
+  uri: string;
+  app: CfAccessApp | undefined;
+  problem?: string;
+  fix?: string;
+}
+
+// The Access apps a route borrows (externalAccess), each fetched in full and checked: it must exist,
+// cover the path, and only let identified people in. Shared by route plan and sync, so they agree.
+export async function checkExternalAccess(ctx: Context, route: Route, have: RouteApps): Promise<ExternalAccessCheck[]> {
+  const out: ExternalAccessCheck[] = [];
+  for (const [prefix, name] of Object.entries(route.externalAccess ?? {})) {
+    const uri = accessUri(route.hostname, prefix);
+    const listed = have.external[prefix];
+    const app = listed === undefined ? undefined : await ctx.cloudflare.getAccessApp(ctx.config.accountId, listed.id);
+    if (app === undefined || !appCovers(app, uri)) {
+      out.push({ prefix, name, uri, app, problem: `Access app ${name} must exist and cover ${uri} (externalAccess for ${route.name}).`, fix: "frosty doesn't change that app. Fix it in the Cloudflare dashboard, or take the path out of externalAccess." });
+      continue;
+    }
+    const bad = externalPolicyProblems(app);
+    if (bad.length > 0) {
+      out.push({ prefix, name, uri, app, problem: `Access app ${name} doesn't only let identified people in: ${bad.join("; ")}.`, fix: "frosty doesn't change that app. Fix its policies in the Cloudflare dashboard, or take the path out of externalAccess." });
+      continue;
+    }
+    out.push({ prefix, name, uri, app });
+  }
+  return out;
 }
 
 // What's wrong with an external app's policies for guarding a protected path: frosty doesn't own
@@ -243,9 +275,18 @@ export function describeIncludes(app: CfAccessApp): string {
   return [...counts].map(([k, n]) => `${k}: ${n}`).join(", ") || "nobody";
 }
 
-// An app covers a URI if one of its destinations is that URI or a path prefix of it.
+// An app covers a URI if one of its destinations is that URI or a path prefix of it, or ends in a
+// path wildcard ("host/api*") that the URI starts with. Host wildcards ("*.example.net") never count.
 export function appCovers(app: CfAccessApp, uri: string): boolean {
-  return appUris(app).some((u) => uri === u || uri.startsWith(`${u}/`));
+  return appUris(app).some((u) => {
+    if (u.startsWith("*")) {
+      return false;
+    }
+    if (u.endsWith("*") && u.includes("/")) {
+      return uri.startsWith(u.slice(0, -1));
+    }
+    return uri === u || uri.startsWith(`${u}/`);
+  });
 }
 
 export function appMatches(app: CfAccessApp, uris: string[], policyIds: string[]): boolean {

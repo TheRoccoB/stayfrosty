@@ -136,6 +136,7 @@ export interface CfAccessApp {
   aud?: string;
   domain?: string;
   destinations?: { type?: string; uri?: string }[];
+  self_hosted_domains?: string[];
   type: string;
   session_duration?: string;
   policies?: { id: string; name?: string; decision?: string; precedence?: number; include?: CfAccessRule[] }[];
