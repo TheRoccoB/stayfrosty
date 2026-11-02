@@ -210,8 +210,6 @@ function appUris(app: CfAccessApp): string[] {
   return app.domain === undefined ? [] : [app.domain];
 }
 
-// What's wrong with an external app's policies for guarding a protected path: frosty doesn't own
-// it, but it must still only let identified people in (allow, no everyone, IP ranges or tokens).
 export interface ExternalAccessCheck {
   prefix: string;
   name: string;
@@ -243,6 +241,8 @@ export async function checkExternalAccess(ctx: Context, route: Route, have: Rout
   return out;
 }
 
+// What's wrong with an external app's policies for guarding a protected path: frosty doesn't own
+// it, but it must still only let identified people in (allow, no everyone, IP ranges or tokens).
 export function externalPolicyProblems(app: CfAccessApp): string[] {
   const problems: string[] = [];
   const policies = app.policies ?? [];
