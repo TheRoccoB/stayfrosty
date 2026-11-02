@@ -14,7 +14,7 @@ import { findLaptopIp, type LaptopIp } from "./ip.ts";
 import { shellPasswordCommand, type PasswordCommandRunner } from "./password.ts";
 import { loadTokens } from "./tokens.ts";
 import { rawGet, type RawGet } from "./rawget.ts";
-import { findCommand } from "./which.ts";
+import { findCommand, findStableCommand } from "./which.ts";
 
 // Everything a command touches in the outside world, injectable for tests.
 export interface Deps {
@@ -108,7 +108,7 @@ export async function buildContext(deps: Deps): Promise<Context> {
     runPasswordCommand: deps.runPasswordCommand ?? shellPasswordCommand,
     keyPath,
     publicKey,
-    cloudflaredPath: "cloudflaredPath" in deps ? deps.cloudflaredPath : findCommand("cloudflared", env),
+    cloudflaredPath: "cloudflaredPath" in deps ? deps.cloudflaredPath : findStableCommand("cloudflared", env),
   };
 }
 

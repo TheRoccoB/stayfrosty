@@ -6,6 +6,7 @@ import { runInit } from "./commands/init.ts";
 import { runAdopt } from "./commands/adopt.ts";
 import { runConsolePassword } from "./commands/console-password.ts";
 import { runDestroy } from "./commands/destroy.ts";
+import { runSshConfig } from "./commands/ssh-config.ts";
 import { runDetachForeign } from "./commands/detach-foreign.ts";
 import { runLs } from "./commands/ls.ts";
 import { runNew } from "./commands/new.ts";
@@ -38,7 +39,6 @@ Tokens come from HCLOUD_TOKEN and CLOUDFLARE_API_TOKEN. Run "frosty init" for de
 // Commands from later milestones, so nobody mistakes a missing command for a broken one.
 const PLANNED: Record<string, string> = {
   breakglass: "M3",
-  "ssh-config": "M3",
 };
 
 export async function main(argv: string[], io: Io): Promise<number> {
@@ -97,6 +97,8 @@ export async function main(argv: string[], io: Io): Promise<number> {
       return runRoute({ io }, { action: positionals[1], box: positionals[2] });
     case "detach-foreign":
       return runDetachForeign({ io }, { box: positionals[1], dryRun });
+    case "ssh-config":
+      return runSshConfig({ io }, { dryRun });
     case "destroy":
       return runDestroy({ io }, { box: positionals[1], dryRun });
     case "console-password":
