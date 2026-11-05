@@ -102,13 +102,50 @@ Commands:
 
 See DECISIONS.md, "App routes".
 
+## `frosty ssh-users` (optional)
+
+```
+frosty ssh-users plan <box>     print exactly what sync would change (changes nothing)
+frosty ssh-users sync <box>     apply it, then check the users
+```
+
+Some boxes need a second SSH login that can only run one program, for example a home server that pulls nightly database backups. Putting that key on the admin user would make any bug in the backup program a root bug, since the admin user has passwordless sudo. A restricted user can only run its forced command. Configure them per box:
+
+```json
+"restrictedUsers": {
+  "box1": [
+    {
+      "name": "backupuser",
+      "command": "/usr/local/sbin/backup-gate",
+      "groups": ["backupread"],
+      "keys": ["ssh-ed25519 AAAA... backup-puller-box1"]
+    }
+  ]
+}
+```
+
+- `name`: a lowercase Linux user name. Not root, not the admin user, not a privileged group name.
+- `command`: an absolute path, letters, digits, dots, dashes and underscores only. The program itself is installed by the app that owns it. Its arguments come from the client in `SSH_ORIGINAL_COMMAND`, so it must parse them strictly.
+- `groups`: the exact supplementary groups (may be empty). Never `sudo`, `admin`, `wheel`, `docker`, `adm`, `lxd`, `root`, `shadow`, `disk`, `systemd-journal`, the admin user's group or the user's own. Missing groups are created as empty system groups.
+- `keys`: `ssh-ed25519` or `ecdsa-sha2-nistp*` public key lines, without options. frosty adds them.
+
+What `sync` does on the box, as root, through the tunnel:
+
+- a system user with shell `/bin/sh` (sshd runs a forced command through the shell, so not `nologin`), a locked password, an empty root-owned home in `/var/lib/stayfrosty/users/<name>`, and exactly the configured groups;
+- `/etc/ssh/authorized_keys/<name>` (root:root 0644, in a root:root 0755 directory) with each key as `restrict,from="127.0.0.1,::1",command="<command>" <key>`;
+- the sshd drop-in gets `AllowUsers <admin> <names...>` and, at the end, one `Match User <name>` block with `AuthorizedKeysFile /etc/ssh/authorized_keys/%u`, `ForceCommand <command>`, publickey only, and no TTY, forwarding of any kind, tunnels or `~/.ssh/rc`. The admin user's settings and its `~/.ssh/authorized_keys` don't change.
+
+The drop-in is checked with `sshd -t` and the admin user's effective settings before sshd reloads, and the old file goes back if either fails. Then frosty opens a fresh admin login; if that fails it restores the old drop-in over the connection that is still open. Users taken out of config are removed (their key file, then the user) once sshd no longer lets them in. Set `boxChangeLog` to an absolute path to get a JSON line before and after each sync. `new` and `adopt` run the same sync before their final checks when the box has restricted users. With none, the drop-in is byte for byte the one in `cloud-init.yaml`.
+
+`verify` then allows exactly the admin user plus the configured users in `AllowUsers`, and only `Match User <configured user>` blocks. For each user it reads `sshd -T -C user=<name>,...` and checks the forced command, `AuthorizedKeysFile`, and every restriction above. It also checks the user's shell, home, groups and locked password, that the key directory, key file and forced command can only be changed by root, and that every key line starts with `restrict,from="127.0.0.1,::1",command="<command>"` and matches the config. A box without `restrictedUsers` is checked exactly as before.
+
 ## Reboot times
 
 `rebootTime` is the default. `rebootTimes` (an object of box name to `HH:MM`, box local time, UTC on Hetzner) gives boxes their own, so boxes that depend on each other never reboot at once. adopt and new write the box's time, and `verify` checks it.
 
 ## Change logs and guards
 
-Set `hetznerChangeLog` and `cloudflareChangeLog` in the config to absolute paths, and frosty appends a JSON line before and after every API write (status and ids only, bodies redacted). frosty only creates, changes or deletes Cloudflare tunnels, Access apps, policies and notifications named `stayfrosty-*`, and DNS records commented `stayfrosty box *`, so a broad token cannot reach anything else through it. It never deletes a server that is adopted or protected.
+Set `hetznerChangeLog` and `cloudflareChangeLog` in the config to absolute paths, and frosty appends a JSON line before and after every API write (and `boxChangeLog` for `ssh-users sync`) (status and ids only, bodies redacted). frosty only creates, changes or deletes Cloudflare tunnels, Access apps, policies and notifications named `stayfrosty-*`, and DNS records commented `stayfrosty box *`, so a broad token cannot reach anything else through it. It never deletes a server that is adopted or protected.
 
 ## `frosty ssh-config`
 

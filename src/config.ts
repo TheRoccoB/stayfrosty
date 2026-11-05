@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { FrostyError } from "./errors.ts";
 import { validateRouteHostnames, validateRoutes, type Route } from "./routes.ts";
+import { validateRestrictedUsers, type RestrictedUser } from "./sshusers.ts";
 
 export interface Config {
   domain: string;
@@ -24,11 +25,15 @@ export interface Config {
   // Optional JSON-lines logs of every API write (see changelog.ts). Absolute paths.
   hetznerChangeLog?: string;
   cloudflareChangeLog?: string;
+  // JSON-lines log of every on-box change frosty makes outside new and adopt (ssh-users sync).
+  boxChangeLog?: string;
   // Web apps served through a box's tunnel (routes.ts), by box. Their hostnames must be in appZones.
   routes?: Record<string, Route[]>;
   appZones?: string[];
   // The Access team name (<team>.cloudflareaccess.com), for cloudflared's own token check.
   accessTeam?: string;
+  // Extra forced-command-only SSH users (sshusers.ts), by box. Applied with frosty ssh-users sync.
+  restrictedUsers?: Record<string, RestrictedUser[]>;
 }
 
 export const DEFAULTS = {
@@ -170,7 +175,21 @@ export function validateConfig(value: unknown): string[] {
       }
     }
   }
-  for (const key of ["hetznerChangeLog", "cloudflareChangeLog"]) {
+  const restricted = c["restrictedUsers"];
+  if (restricted !== undefined) {
+    if (restricted === null || typeof restricted !== "object" || Array.isArray(restricted)) {
+      problems.push("restrictedUsers must be an object of box name to a list of users");
+    } else {
+      for (const [box, list] of Object.entries(restricted as Record<string, unknown>)) {
+        if (!/^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$/.test(box)) {
+          problems.push(`restrictedUsers.${box}: not a box name`);
+          continue;
+        }
+        problems.push(...validateRestrictedUsers(box, list, adminUser ?? ""));
+      }
+    }
+  }
+  for (const key of ["hetznerChangeLog", "cloudflareChangeLog", "boxChangeLog"]) {
     const v = c[key];
     if (v !== undefined && (typeof v !== "string" || !v.startsWith("/"))) {
       problems.push(`${key} must be an absolute path`);
@@ -222,6 +241,10 @@ export async function saveConfig(config: Config, env: Env = process.env): Promis
   await chmod(tmp, 0o600);
   await rename(tmp, path);
   return path;
+}
+
+export function restrictedUsersFor(config: Pick<Config, "restrictedUsers">, box: string): RestrictedUser[] {
+  return config.restrictedUsers !== undefined && Object.hasOwn(config.restrictedUsers, box) ? (config.restrictedUsers[box] as RestrictedUser[]) : [];
 }
 
 export function rebootTimeFor(config: Pick<Config, "rebootTime" | "rebootTimes">, box: string): string {

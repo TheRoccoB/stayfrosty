@@ -4,7 +4,7 @@ import { checkOnlyPublickey, checkRootRefused } from "../checks/login.ts";
 import { runOnBoxChecks } from "../checks/onbox.ts";
 import type { CheckResult } from "../checks/types.ts";
 import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
-import { rebootTimeFor } from "../config.ts";
+import { rebootTimeFor, restrictedUsersFor } from "../config.ts";
 import { assertBoxName, buildContext, directTarget, requireCloudflared, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
 import { checkAccess, checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
 import { checkTokenNotExposed } from "../checks/token.ts";
@@ -29,6 +29,7 @@ import {
 import { green, red, table } from "../io.ts";
 import { windowSource } from "../ip.ts";
 import { hasPassword, setConsolePassword } from "../password.ts";
+import { syncSshUsers } from "./ssh-users.ts";
 
 export interface NewOptions {
   box: string | undefined;
@@ -210,6 +211,11 @@ export async function finishBox(ctx: Context, input: FinishInput): Promise<numbe
   }
   io.out(`ssh ${box} works through Cloudflare Access.`);
 
+  // 14b. Restricted SSH users from config, if the box has any (the same as frosty ssh-users sync).
+  if (restrictedUsersFor(config, box).length > 0) {
+    await syncSshUsers(ctx, box, tunnelTarget(ctx, box));
+  }
+
   // 15. Every check except the window's, through the tunnel. The window closes only if they pass,
   // so a box that is not right yet stays reachable (from this laptop's IP only) to fix.
   const before = await checkBox(ctx, box, tunnelTarget(ctx, box), server, { tunnel: true, token, window: false });
@@ -368,7 +374,14 @@ export async function checkBox(
   const adopted = Number(server.labels[LABEL_ADOPTED]);
   const born = Math.max(Number.isFinite(created) ? Math.floor(created / 1000) : 0, Number.isFinite(adopted) ? adopted : 0);
   const createdAt = born > 0 ? born : undefined;
-  const onBox = await runOnBoxChecks(ctx.ssh, target, { box, adminUser: ctx.config.adminUser, rebootTime: rebootTimeFor(ctx.config, box), createdAt, tunnel: opts.tunnel });
+  const onBox = await runOnBoxChecks(ctx.ssh, target, {
+    box,
+    adminUser: ctx.config.adminUser,
+    rebootTime: rebootTimeFor(ctx.config, box),
+    createdAt,
+    tunnel: opts.tunnel,
+    restrictedUsers: restrictedUsersFor(ctx.config, box),
+  });
   if (!opts.tunnel) {
     return [...login, ...onBox];
   }

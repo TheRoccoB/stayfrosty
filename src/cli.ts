@@ -12,6 +12,7 @@ import { runLs } from "./commands/ls.ts";
 import { runNew } from "./commands/new.ts";
 import { runVerify } from "./commands/verify.ts";
 import { runRoute } from "./commands/route.ts";
+import { runSshUsers } from "./commands/ssh-users.ts";
 import { VERSION } from "./version.ts";
 
 const USAGE = `frosty ${VERSION}: a VPS with no front door
@@ -23,6 +24,7 @@ Usage:
   frosty verify (<box> | --all)       check a box again, through the tunnel (changes nothing)
   frosty detach-foreign <box>         detach other firewalls from an adopted box (keeps frosty's)
   frosty route (plan | sync) <box>    web apps through the box's tunnel (config: routes)
+  frosty ssh-users (plan | sync) <box>  forced-command-only SSH users (config: restrictedUsers)
   frosty breakglass <box> [--minutes N | --close]
   frosty ls
   frosty ssh-config                   rewrite ~/.ssh/stayfrosty.conf from the APIs
@@ -95,6 +97,8 @@ export async function main(argv: string[], io: Io): Promise<number> {
       return runVerify({ io }, { box: positionals[1], all: values["all"] === true });
     case "route":
       return runRoute({ io }, { action: positionals[1], box: positionals[2] });
+    case "ssh-users":
+      return runSshUsers({ io }, { action: positionals[1], box: positionals[2] });
     case "detach-foreign":
       return runDetachForeign({ io }, { box: positionals[1], dryRun });
     case "ssh-config":
