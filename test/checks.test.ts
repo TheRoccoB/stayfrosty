@@ -7,7 +7,9 @@ import { checkSshd } from "../src/checks/sshd.ts";
 import { rebootTimeFor } from "../src/config.ts";
 import { checkUfw } from "../src/checks/ufw.ts";
 import { checkPendingReboot, checkUnattendedUpgrades } from "../src/checks/updates.ts";
-import { APT_CONFIG_GOOD, POLICY_GOOD, SS_GOOD, SSHD_T_GOOD, UFW_GOOD } from "./box-fixtures.ts";
+import { checkRestrictedUser, type RestrictedState } from "../src/checks/restricted.ts";
+import { APT_CONFIG_GOOD, POLICY_GOOD, RESTRICTED_KEY, RESTRICTED_KEY_2, SS_GOOD, SSHD_T_GOOD, SSHD_T_RESTRICTED, UFW_GOOD } from "./box-fixtures.ts";
+import { gatherOutput } from "./fake-ssh.ts";
 
 const NOW = 1_790_000_000;
 
@@ -236,5 +238,166 @@ describe("per-box reboot times", () => {
     expect(checkUnattendedUpgrades({ ...input, rebootTime: "04:00", timezone: "Etc/UTC\n" }, "t1").ok).toBe(true);
     // A key that is only in the prototype chain is not a box.
     expect(rebootTimeFor({ rebootTime: "04:00", rebootTimes: {} }, "constructor")).toBe("04:00");
+  });
+});
+
+describe("restricted users", () => {
+  const user = { name: "dbbackup", command: "/usr/local/sbin/dbbackup-gate", groups: ["simmer-dbbackup"], keys: [RESTRICTED_KEY] };
+  const sshdT = SSHD_T_GOOD.replace("allowusers ops\n", "allowusers ops\nallowusers dbbackup\n");
+  const good = (): RestrictedState => ({
+    sshdT: SSHD_T_RESTRICTED,
+    passwd: "dbbackup:x:999:994::/var/lib/stayfrosty/users/dbbackup:/bin/sh\n",
+    groups: "dbbackup\ndbbackup simmer-dbbackup\n",
+    status: "dbbackup L 2026-11-05 -1 -1 -1 -1\n",
+    keyDirStat: "root root 755 directory\n",
+    keyFileStat: "root root 644 regular file\n",
+    keyFile: `restrict,command="/usr/local/sbin/dbbackup-gate" ${RESTRICTED_KEY}\n`,
+    commandStat: "root root 755 regular file\n",
+  });
+  const fails = (change: Partial<RestrictedState>, detail: string | RegExp): void => {
+    const result = checkRestrictedUser({ ...good(), ...change }, "t1", user);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(detail);
+    expect(result.fix).toContain("frosty ssh-users sync t1");
+  };
+  const sshdSetting = (key: string, value: string): Partial<RestrictedState> => ({ sshdT: SSHD_T_RESTRICTED.replace(new RegExp(`^${key} .*$`, "m"), `${key} ${value}`) });
+
+  it("passes AllowUsers of the admin plus the configured users, and their Match User lines", () => {
+    expect(checkSshd(sshdT, "t1", "ops", "Match User dbbackup\n", ["dbbackup"]).ok).toBe(true);
+    expect(checkSshd(sshdT, "t1", "ops", "  match user dbbackup\n", ["dbbackup"]).ok).toBe(true);
+    expect(checkSshd(SSHD_T_GOOD.replace("allowusers ops", "allowusers ops dbbackup"), "t1", "ops", "", ["dbbackup"]).ok).toBe(true);
+  });
+
+  it("without restricted users in config, the same box is red as before", () => {
+    const result = checkSshd(sshdT, "t1", "ops", "Match User dbbackup\n");
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("allowusers is ops dbbackup, want ops");
+    expect(result.detail).toContain("Match blocks (Match User dbbackup)");
+  });
+
+  it("fails AllowUsers with an extra user, or without a configured one", () => {
+    expect(checkSshd(sshdT.replace("allowusers dbbackup", "allowusers dbbackup\nallowusers eve"), "t1", "ops", "", ["dbbackup"]).detail).toContain("allowusers is ops dbbackup eve, want ops dbbackup");
+    expect(checkSshd(SSHD_T_GOOD, "t1", "ops", "", ["dbbackup"]).detail).toContain("allowusers is ops, want ops dbbackup");
+    expect(checkSshd(SSHD_T_GOOD, "t1", "ops", "", ["dbbackup"]).fix).toContain("frosty ssh-users sync t1");
+  });
+
+  it("fails any other Match block", () => {
+    for (const line of ["Match User eve", "Match User dbbackup,ops", "Match User db*", "Match Address 10.0.0.0/8", "Match User dbbackup Address 10.0.0.1", "Match Group simmer-dbbackup", "Match all"]) {
+      const result = checkSshd(sshdT, "t1", "ops", `Match User dbbackup\n${line}\n`, ["dbbackup"]);
+      expect(result.ok, line).toBe(false);
+      expect(result.detail).toContain(`Match blocks (${line})`);
+    }
+  });
+
+  it("passes the user frosty sets up (state captured from a test container)", () => {
+    expect(checkRestrictedUser(good(), "t1", user)).toMatchObject({ ok: true, detail: expect.stringContaining("runs only /usr/local/sbin/dbbackup-gate") });
+  });
+
+  it("passes while the forced command is not installed yet, and says so", () => {
+    const result = checkRestrictedUser({ ...good(), commandStat: "stat: cannot statx '/usr/local/sbin/dbbackup-gate': No such file or directory\n" }, "t1", user);
+    expect(result).toMatchObject({ ok: true, detail: expect.stringContaining("(not installed yet)") });
+  });
+
+  it("fails each effective sshd setting that is not locked down", () => {
+    fails(sshdSetting("forcecommand", "none"), "forcecommand is none, want /usr/local/sbin/dbbackup-gate");
+    fails(sshdSetting("forcecommand", "/bin/sh"), "forcecommand is /bin/sh");
+    fails(sshdSetting("permittty", "yes"), "permittty is yes, want no");
+    fails(sshdSetting("allowtcpforwarding", "yes"), "allowtcpforwarding is yes, want no");
+    fails(sshdSetting("allowtcpforwarding", "local"), "allowtcpforwarding is local, want no");
+    fails(sshdSetting("allowstreamlocalforwarding", "yes"), "allowstreamlocalforwarding is yes, want no");
+    fails(sshdSetting("x11forwarding", "yes"), "x11forwarding is yes, want no");
+    fails(sshdSetting("allowagentforwarding", "yes"), "allowagentforwarding is yes, want no");
+    fails(sshdSetting("permittunnel", "yes"), "permittunnel is yes, want no");
+    fails(sshdSetting("permituserrc", "yes"), "permituserrc is yes, want no");
+    fails(sshdSetting("authenticationmethods", "any"), "authenticationmethods is any, want publickey");
+    fails(sshdSetting("passwordauthentication", "yes"), "passwordauthentication is yes, want no");
+    fails(sshdSetting("kbdinteractiveauthentication", "yes"), "kbdinteractiveauthentication is yes, want no");
+    fails(sshdSetting("authorizedkeysfile", ".ssh/authorized_keys /etc/ssh/authorized_keys/%u"), "authorizedkeysfile is .ssh/authorized_keys");
+    fails({ sshdT: "" }, "printed nothing");
+  });
+
+  it("fails a missing user, a wrong shell or home, or uid 0", () => {
+    fails({ passwd: "missing\n" }, "the user does not exist");
+    fails({ passwd: "dbbackup:x:999:994::/var/lib/stayfrosty/users/dbbackup:/usr/sbin/nologin\n" }, "shell is /usr/sbin/nologin, want /bin/sh");
+    fails({ passwd: "dbbackup:x:999:994::/var/lib/stayfrosty/users/dbbackup:/bin/bash\n" }, "shell is /bin/bash");
+    fails({ passwd: "dbbackup:x:999:994::/home/dbbackup:/bin/sh\n" }, "home is /home/dbbackup");
+    fails({ passwd: "dbbackup:x:0:994::/var/lib/stayfrosty/users/dbbackup:/bin/sh\n" }, "uid is 0");
+  });
+
+  it("fails groups that are not exactly the configured ones, and privileged ones", () => {
+    fails({ groups: "dbbackup\ndbbackup\n" }, "groups are [], want [simmer-dbbackup]");
+    fails({ groups: "dbbackup\ndbbackup simmer-dbbackup other\n" }, "groups are [simmer-dbbackup other]");
+    fails({ groups: "dbbackup\ndbbackup simmer-dbbackup sudo\n" }, "privileged group(s) sudo");
+    fails({ groups: "dbbackup\ndbbackup simmer-dbbackup docker\n" }, "privileged group(s) docker");
+    fails({ groups: "dbbackup\ndbbackup simmer-dbbackup adm\n" }, "privileged group(s) adm");
+    fails({ groups: "sudo\nsudo simmer-dbbackup\n" }, /primary group is sudo.*privileged group\(s\) sudo/);
+  });
+
+  it("fails a password that is not locked", () => {
+    fails({ status: "dbbackup P 2026-11-05 0 99999 7 -1\n" }, "password is not locked");
+    fails({ status: "dbbackup NP 2026-11-05 0 99999 7 -1\n" }, "password is not locked");
+    fails({ status: "" }, "password is not locked");
+  });
+
+  it("fails a key directory that is not root-only", () => {
+    fails({ keyDirStat: "dbbackup root 755 directory\n" }, "/etc/ssh/authorized_keys owned by dbbackup:root");
+    fails({ keyDirStat: "root root 775 directory\n" }, "/etc/ssh/authorized_keys mode 775 is group or world writable");
+    fails({ keyDirStat: "stat: cannot statx: No such file or directory\n" }, "/etc/ssh/authorized_keys missing");
+  });
+
+  it("fails a key file that is not root-only", () => {
+    fails({ keyFileStat: "dbbackup dbbackup 644 regular file\n" }, "/etc/ssh/authorized_keys/dbbackup owned by dbbackup:dbbackup");
+    fails({ keyFileStat: "root dbbackup 644 regular file\n" }, "owned by root:dbbackup");
+    fails({ keyFileStat: "root root 646 regular file\n" }, "mode 646 is group or world writable");
+    fails({ keyFileStat: "root root 664 regular file\n" }, "mode 664 is group or world writable");
+    fails({ keyFileStat: "root root 777 symbolic link\n" }, /writable|symbolic link/);
+    fails({ keyFileStat: "root root 644 symbolic link\n" }, "is a symbolic link, want a regular");
+    fails({ keyFileStat: "" }, "/etc/ssh/authorized_keys/dbbackup missing");
+  });
+
+  it("fails key lines without restrict and the command, and keys that are not the configured ones", () => {
+    fails({ keyFile: `${RESTRICTED_KEY}\n` }, '1 key line(s) in /etc/ssh/authorized_keys/dbbackup do not start with restrict,command="/usr/local/sbin/dbbackup-gate"');
+    fails({ keyFile: `restrict,command="/usr/local/sbin/dbbackup-gate" ${RESTRICTED_KEY}\ncommand="/usr/local/sbin/dbbackup-gate" ${RESTRICTED_KEY_2}\n` }, "1 key line(s)");
+    fails({ keyFile: `restrict,command="/bin/sh" ${RESTRICTED_KEY}\n` }, "do not start with");
+    fails({ keyFile: `restrict,command="/usr/local/sbin/dbbackup-gate",port-forwarding ${RESTRICTED_KEY}\n` }, "do not start with");
+    fails({ keyFile: `restrict,command="/usr/local/sbin/dbbackup-gate" ${RESTRICTED_KEY}\nrestrict,command="/usr/local/sbin/dbbackup-gate" ${RESTRICTED_KEY_2}\n` }, "not the configured ones (2 on the box, 1 in config)");
+    fails({ keyFile: "" }, "not the configured ones (0 on the box");
+  });
+
+  it("fails a forced command anyone but root can change", () => {
+    fails({ commandStat: "dbbackup root 755 regular file\n" }, "forced command /usr/local/sbin/dbbackup-gate owned by dbbackup:root");
+    fails({ commandStat: "root simmer-dbbackup 775 regular file\n" }, "forced command /usr/local/sbin/dbbackup-gate owned by root:simmer-dbbackup");
+    fails({ commandStat: "root root 757 regular file\n" }, "mode 757 is group or world writable");
+    fails({ commandStat: "root root 755 directory\n" }, "is a directory");
+  });
+
+  it("evaluates restricted users only when the box has them in config", () => {
+    const base = parseSections(gatherOutput());
+    const want = { box: "t1", adminUser: "ops", rebootTime: "04:00", createdAt: NOW - 3600, tunnel: false };
+    const plain = evaluateOnBox(base, want);
+    expect(plain.map((r) => r.name)).not.toContain("restricted user dbbackup: forced command only");
+    expect(plain[0]?.ok).toBe(true);
+    const sections = new Map(base);
+    sections.set("sshd", sshdT);
+    sections.set("sshd-match", "Match User dbbackup\n");
+    for (const [k, v] of Object.entries({
+      "ru-keydir": good().keyDirStat,
+      "ru-sshd-dbbackup": good().sshdT,
+      "ru-passwd-dbbackup": good().passwd,
+      "ru-groups-dbbackup": good().groups,
+      "ru-status-dbbackup": good().status,
+      "ru-keyfile-stat-dbbackup": good().keyFileStat,
+      "ru-keyfile-dbbackup": good().keyFile,
+      "ru-command-dbbackup": good().commandStat,
+    })) {
+      sections.set(k, v);
+    }
+    const results = evaluateOnBox(sections, { ...want, restrictedUsers: [user] });
+    expect(results.slice(0, 2).map((r) => [r.name, r.ok])).toEqual([
+      ["sshd: keys only, no root, only the admin user", true],
+      ["restricted user dbbackup: forced command only", true],
+    ]);
+    // The same box checked with no restricted users in config is red.
+    expect(evaluateOnBox(sections, want)[0]?.ok).toBe(false);
   });
 });

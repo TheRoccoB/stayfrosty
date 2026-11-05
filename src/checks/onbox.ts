@@ -1,6 +1,8 @@
 import { runOrFail, type SshRunner, type SshTarget } from "../box.ts";
 import { checkCloudflared, checkConnector } from "./cloudflared.ts";
 import { checkListeners } from "./listeners.ts";
+import { restrictedGatherScript, type RestrictedUser } from "../sshusers.ts";
+import { checkRestrictedUser, restrictedState } from "./restricted.ts";
 import { checkSshd } from "./sshd.ts";
 import type { CheckResult } from "./types.ts";
 import { checkUfw } from "./ufw.ts";
@@ -53,14 +55,18 @@ export interface OnBoxExpectations {
   createdAt: number | undefined;
   // False until the tunnel is set up (a box mid-way through `new`).
   tunnel: boolean;
+  // The box's configured restricted users (sshusers.ts). Empty or absent: none allowed.
+  restrictedUsers?: RestrictedUser[];
 }
 
 export function evaluateOnBox(sections: Map<string, string>, want: OnBoxExpectations): CheckResult[] {
   const { box, adminUser, rebootTime, createdAt } = want;
   const get = (key: string): string => sections.get(key) ?? "";
   const now = Number(get("now").trim()) || Math.floor(Date.now() / 1000);
+  const restricted = want.restrictedUsers ?? [];
   return [
-    checkSshd(get("sshd"), box, adminUser, get("sshd-match")),
+    checkSshd(get("sshd"), box, adminUser, get("sshd-match"), restricted.map((u) => u.name)),
+    ...restricted.map((u) => checkRestrictedUser(restrictedState(sections, u.name), box, u)),
     checkUfw(get("ufw"), box),
     checkListeners(get("ss")),
     checkUnattendedUpgrades(
@@ -75,5 +81,14 @@ export function evaluateOnBox(sections: Map<string, string>, want: OnBoxExpectat
 
 export async function runOnBoxChecks(ssh: SshRunner, target: SshTarget, want: OnBoxExpectations): Promise<CheckResult[]> {
   const output = await runOrFail(ssh, target, "sudo bash -s", "Collecting on-box state", { stdin: GATHER_SCRIPT, timeoutMs: 60_000 });
-  return evaluateOnBox(parseSections(output), want);
+  const sections = parseSections(output);
+  // A second round trip only for boxes with restricted users, so other boxes are checked as before.
+  const restricted = want.restrictedUsers ?? [];
+  if (restricted.length > 0) {
+    const extra = await runOrFail(ssh, target, "sudo bash -s", "Collecting restricted users", { stdin: restrictedGatherScript(restricted), timeoutMs: 60_000 });
+    for (const [key, value] of parseSections(extra)) {
+      sections.set(key, value);
+    }
+  }
+  return evaluateOnBox(sections, want);
 }

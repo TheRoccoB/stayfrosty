@@ -14,7 +14,9 @@ import { clearSecretsForTests } from "../src/redact.ts";
 import { FakeCloudflare } from "./fake-cloudflare.ts";
 import { FakeHetzner } from "./fake-hetzner.ts";
 import { FakeHttp, noSleep } from "./fake-http.ts";
-import { FakeBox } from "./fake-ssh.ts";
+import { FakeBox, gatherOutput } from "./fake-ssh.ts";
+import { GATHER_SCRIPT } from "../src/checks/onbox.ts";
+import { RESTRICTED_KEY, SSHD_T_RESTRICTED } from "./box-fixtures.ts";
 import { ScriptedIo, sampleConfig } from "./fixtures.ts";
 
 const PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeFakeFakeFakeFakeFakeFakeFakeFakeFake me@laptop";
@@ -160,6 +162,48 @@ describe("frosty adopt", () => {
     expect(readFileSync(knownHostsPath(env), "utf8")).toBe("stayfrosty-app1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostHostHostHostHostHostHostHostHostHost\n");
     expect(io.text()).toContain(`Pinned app1's host key ssh-ed25519 ${HOST_FP}, matching --host-key.`);
     expect(io.text()).toContain("Box app1 is ready.");
+  });
+
+  it("sets up the box's restricted users before the final checks, and they are checked", async () => {
+    const user = { name: "dbbackup", command: "/usr/local/sbin/dbbackup-gate", groups: ["simmer-dbbackup"], keys: [RESTRICTED_KEY] };
+    await saveConfig({ ...sampleConfig, restrictedUsers: { app1: [user] } }, env);
+    let synced = false;
+    box.on((call) => {
+      const stdin = call.opts.stdin ?? "";
+      if (call.command === "sudo bash -s" && stdin.includes("stayfrosty-ssh-users-ok")) {
+        synced = true;
+        return { code: 0, stdout: "changing: create system user dbbackup\nstayfrosty-ssh-users-changes 3\nstayfrosty-ssh-users-ok\n", stderr: "" };
+      }
+      if (call.command === "sudo bash -s" && stdin === GATHER_SCRIPT && synced) {
+        const out = gatherOutput(NOW).replace("allowusers ops\n", "allowusers ops\nallowusers dbbackup\n").replace("### ufw", "### sshd-match\nMatch User dbbackup\n### ufw");
+        return { code: 0, stdout: out, stderr: "" };
+      }
+      if (call.command === "sudo bash -s" && stdin.includes("section ru-keydir")) {
+        return {
+          code: 0,
+          stdout: [
+            "### ru-keydir", "root root 755 directory",
+            "### ru-sshd-dbbackup", SSHD_T_RESTRICTED,
+            "### ru-passwd-dbbackup", "dbbackup:x:999:994::/var/lib/stayfrosty/users/dbbackup:/bin/sh",
+            "### ru-groups-dbbackup", "dbbackup\ndbbackup simmer-dbbackup",
+            "### ru-status-dbbackup", "dbbackup L 2026-11-05 -1 -1 -1 -1",
+            "### ru-keyfile-stat-dbbackup", "root root 644 regular file",
+            "### ru-keyfile-dbbackup", `restrict,command="/usr/local/sbin/dbbackup-gate" ${RESTRICTED_KEY}`,
+            "### ru-command-dbbackup", "stat: cannot statx '/usr/local/sbin/dbbackup-gate': No such file or directory",
+            "### end",
+          ].join("\n"),
+          stderr: "",
+        };
+      }
+      return undefined;
+    });
+    const io = new ScriptedIo();
+    expect(await runAdopt(deps(io), opts()), io.text()).toBe(0);
+    expect(synced).toBe(true);
+    expect(io.text()).toMatch(/pass\s+restricted user dbbackup: forced command only\s+runs only \/usr\/local\/sbin\/dbbackup-gate \(not installed yet\)/);
+    // The cloud-init drop-in adopt writes is still the plain one; the sync owns the restricted part.
+    const harden = box.calls.find((c) => c.opts.stdin?.includes("stayfrosty-harden-ok") === true)?.opts.stdin ?? "";
+    expect(decodeFiles(harden)).toContain("AllowUsers ops\n");
   });
 
   it("never creates, deletes, rebuilds or resizes a server", async () => {
