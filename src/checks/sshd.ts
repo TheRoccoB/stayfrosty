@@ -21,7 +21,10 @@ export function parseSshdT(text: string): Map<string, string[]> {
 
 // `matchLines` are the Match directives in the sshd config files. `sshd -T` ignores Match
 // blocks, so one could reopen root or passwords for some sources without this check seeing it.
-export function checkSshd(sshdT: string, box: string, adminUser: string, matchLines = ""): CheckResult {
+// `restricted` are the box's configured restricted users: AllowUsers is the admin user plus
+// exactly them, and the only Match lines allowed are `Match User <one of them>`, whose effective
+// settings checkRestrictedUser reads with `sshd -T -C`.
+export function checkSshd(sshdT: string, box: string, adminUser: string, matchLines = "", restricted: string[] = []): CheckResult {
   const name = "sshd: keys only, no root, only the admin user";
   const values = parseSshdT(sshdT);
   if (values.size === 0) {
@@ -41,15 +44,21 @@ export function checkSshd(sshdT: string, box: string, adminUser: string, matchLi
     }
   }
   const allow = values.get("allowusers") ?? [];
-  if (allow.length !== 1 || allow[0] !== adminUser) {
-    wrong.push(`allowusers is ${allow.length === 0 ? "unset" : allow.join(" ")}, want ${adminUser}`);
+  const want = [adminUser, ...restricted];
+  const sorted = (list: string[]): string => [...list].sort().join(" ");
+  if (allow.length !== want.length || sorted(allow) !== sorted(want)) {
+    wrong.push(`allowusers is ${allow.length === 0 ? "unset" : allow.join(" ")}, want ${want.join(" ")}`);
   }
   const matches = matchLines.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-  if (matches.length > 0) {
-    wrong.push(`the config has Match blocks (${matches.join("; ")}), which can override these`);
+  const unexpected = matches.filter((l) => {
+    const m = /^Match\s+User\s+(\S+)$/i.exec(l);
+    return m === null || !restricted.includes(m[1] as string);
+  });
+  if (unexpected.length > 0) {
+    wrong.push(`the config has Match blocks (${unexpected.join("; ")}), which can override these`);
   }
   if (wrong.length > 0) {
-    return fail(name, wrong.join("; "), reapplyFix(box));
+    return fail(name, wrong.join("; "), restricted.length > 0 ? `${reapplyFix(box)}; for restricted users: frosty ssh-users sync ${box}` : reapplyFix(box));
   }
-  return pass(name, `root login off, password and keyboard-interactive off, AllowUsers ${adminUser}`);
+  return pass(name, `root login off, password and keyboard-interactive off, AllowUsers ${want.join(" ")}`);
 }

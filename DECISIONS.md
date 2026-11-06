@@ -188,3 +188,18 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
 - verify also sends `/api%2fsettings`, `/api/public` and `/api/publicx`. Each must get the login, the tunnel's 404, or cloudflared's own 403. The tunnel's 403 is told from the app's because it's neither JSON nor HTML. cloudflared stays current through the on-box check (Cloudflare's apt repo, installed within a day), so `originRequest.access` is supported.
 - DNS order: `route sync`, then the CNAME, then `verify`. Adding the CNAME before verify passes is safe, because both Access and cloudflared's own check are already in front. Without the CNAME, verify says the record is missing.
 - The box name `bypass` is reserved. `ls` attributes `stayfrosty-<box>:<route>` apps to their box and never lists the shared bypass policy as a leftover. Path segments can't be `.` or `..`, and the path pattern is linear.
+
+## Restricted SSH users (`frosty ssh-users`)
+
+Design from a security review (2026-11). The first user is a backup host pulling encrypted nightly dumps from an app box.
+
+- A forced-command user per job instead of a key on the admin user. Why: the admin user has passwordless sudo, so a bug in the gate would be root. Alt: `command=` on an admin key.
+- `AuthorizedKeysFile /etc/ssh/authorized_keys/%u` is set inside the user's `Match` block, not globally. Why: the admin user keeps sshd's default (`.ssh/authorized_keys .ssh/authorized_keys2`) untouched, and the restricted user has no other key source, so a key it writes into a home directory is never read. Checked against OpenSSH 9.6 (Ubuntu 24.04): a Match block in an included drop-in does not leak into the rest of `sshd_config`. Alt: the global `AuthorizedKeysFile /etc/ssh/authorized_keys/%u .ssh/authorized_keys` from the review, which would also read the restricted user's own `~/.ssh/authorized_keys`.
+- Two layers: `ForceCommand` plus `restrict,from="127.0.0.1,::1",command="..."` on each key line. Alt: either alone.
+- Shell `/bin/sh`, not `nologin`: sshd runs a forced command with `<shell> -c`. The home is an empty root-owned directory, so the user can't write anything there. `PermitUserRC no` blocks `~/.ssh/rc`.
+- Missing groups are created as empty system groups, not required. Why: `new` and `adopt` can then finish before the app that owns the group is deployed, and the user is in no group it isn't configured for. A typo makes a useless group, which fails safe. Alt: require the group (deploy order matters).
+- A user that already exists with another home is refused, never taken over. Removing a user from config removes only users whose home is under `/var/lib/stayfrosty/users/`.
+- `verify` passes while the forced command is not installed yet (it says so), and fails if it is writable by anyone but root. Why: a missing program can't run; a writable one would let its owner choose what the user runs.
+- A separate `ssh-users sync` command rather than re-running adopt, because nothing else rewrites sshd on an existing box. It changes only the restricted users, their key files and the drop-in. A changed drop-in is checked with `sshd -t` and the admin's effective `AllowUsers`/`ForceCommand`/`PermitRootLogin` before reload, then proven with a fresh admin login, with the old file restored over the open connection if that fails.
+- verify's extra on-box round trip runs only for boxes with restricted users, so boxes without them make the same calls and get the same checks as before.
+- The on-box change log is the new optional `boxChangeLog`, in the same JSON-lines format as the API change logs. The box also logs each change to syslog (`logger -t stayfrosty`).
