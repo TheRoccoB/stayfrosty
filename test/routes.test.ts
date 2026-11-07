@@ -6,7 +6,7 @@ import { appCovers, checkExternalAccess, routeApps, syncRoutes } from "../src/ed
 import { checkRouteAccess, checkRouteOutside, checkRoutePorts, classify } from "../src/checks/routes.ts";
 import { assertBoxName } from "../src/context.ts";
 import type { RawGet } from "../src/rawget.ts";
-import { SUSPICIOUS_PATH, boxIngress, bypassPaths, prefixRegex, routeIngress, validateRoutes, type Route } from "../src/routes.ts";
+import { SUSPICIOUS_PATH, boxIngress, bypassPaths, bypassUris, exactRegex, prefixRegex, protectedUris, routeIngress, validateRoutes, type Route } from "../src/routes.ts";
 import { FakeCloudflare } from "./fake-cloudflare.ts";
 import { FakeHttp, noSleep } from "./fake-http.ts";
 import { ScriptedIo, sampleConfig } from "./fixtures.ts";
@@ -489,5 +489,100 @@ describe("external app coverage", () => {
     expect(appCovers(app(["news.example.net/apis"]), "news.example.net/api")).toBe(false);
     expect(appCovers(app(["*.example.net"]), "news.example.net/api")).toBe(false);
     expect(appCovers(app(["news.example.net/admin*"], "self_hosted_domains"), "news.example.net/api")).toBe(false);
+  });
+});
+
+describe("exact public paths (publicExact)", () => {
+  // A whole site behind Access with one feed open to anyone, and nothing under or next to it.
+  const site: Route = { name: "site", hostname: "stage.example.net", service: "http://127.0.0.1:8080", protected: ["/"], public: ["/api/health"], publicExact: ["/api/feed"] };
+  const team = "team";
+  const login = { status: 302, location: `https://${team}.cloudflareaccess.com/cdn-cgi/access/login/x?y=1`, body: "" };
+  const hit = (route: Route, path: string) =>
+    boxIngress("ssh-app1.example.com", [{ route, audFor: () => [AUD] }], team).find((r) => (r.hostname === undefined || r.hostname === route.hostname) && (r.path === undefined || goRe(r.path).test(path)));
+  const answer = (route: Route, path: string): string => {
+    const h = hit(route, path);
+    return h === undefined ? "none" : h.originRequest !== undefined ? "access" : h.service === "http_status:404" ? "404" : "app";
+  };
+  const simulate = (route: Route): RawGet => async (_host, path) => {
+    const a = answer(route, path);
+    return a === "access" ? login : a === "404" ? { status: 404, location: null, body: "" } : { status: 404, location: null, body: "<html>app</html>" };
+  };
+
+  it("accepts an exact path inside a protected prefix of frosty's own app, and refuses every other shape", () => {
+    expect(validateRoutes("app1", [site], opts)).toEqual([]);
+    for (const bad of [["/"], ["/api/feed/"], ["/api//feed"], ["/api/feed", "/api/feed"], ["/api/health"], ["/*"], "/api/feed"]) {
+      expect(validateRoutes("app1", [{ ...site, publicExact: bad as string[] }], opts), JSON.stringify(bad)).not.toEqual([]);
+    }
+    // Under a public prefix it would be open with its subpaths already.
+    expect(validateRoutes("app1", [{ ...site, publicExact: ["/api/health/x"] }], opts)).toEqual([expect.stringMatching(/under public \/api\/health/)]);
+    // Not under any protected prefix, or only under an external app's: nothing could take its subpaths back.
+    const shop: Route = { name: "shop", hostname: "www.example.net", service: "http://127.0.0.1:8080", protected: ["/admin"], public: ["/"] };
+    expect(validateRoutes("app1", [{ ...shop, publicExact: ["/feed"] }], opts)).toEqual([expect.stringMatching(/must be under a protected path of frosty's own/)]);
+    expect(validateRoutes("app1", [{ ...shop, publicExact: ["/admin/feed"], externalAccess: { "/admin": "other-app" } }], opts)).toEqual([expect.stringMatching(/must be under a protected path of frosty's own/)]);
+    expect(validateRoutes("app1", [{ ...shop, publicExact: ["/admin/feed"] }], opts)).toEqual([]);
+    // It can be the probe.
+    expect(validateRoutes("app1", [{ ...site, probe: "/api/feed" }], opts)).toEqual([]);
+    expect(validateRoutes("app1", [{ ...site, probe: "/api/feed/x" }], opts)).toEqual([expect.stringMatching(/probe/)]);
+  });
+
+  it("opens exactly the one path at the tunnel: not its subpaths, its trailing slash, a longer name or another case", () => {
+    expect(exactRegex("/api/feed")).toBe("^\\/api\\/feed$");
+    const paths = routeIngress(site, team, () => [AUD]).map((r) => [r.path ?? "(host 404)", r.originRequest !== undefined]);
+    expect(paths).toEqual([[SUSPICIOUS_PATH, false], [exactRegex("/api/feed"), false], [prefixRegex("/api/health"), false], [protRe("/"), true], ["(host 404)", false]]);
+    expect(answer(site, "/api/feed")).toBe("app");
+    for (const path of ["/api/feed/", "/api/feed/x", "/api/feedx", "/API/FEED", "/api/feed.json", "/api/fee", "/api"]) {
+      expect(answer(site, path), path).toBe("access");
+    }
+    for (const trick of ["/api/feed/..", "/api/feed;x", "/api/feed%2f", "//api/feed", "/api/./feed"]) {
+      expect(answer(site, trick), trick).toBe("404");
+    }
+  });
+
+  it("gives Access the bypass on the path and \"<path>/*\" on frosty's own app", () => {
+    expect(protectedUris(site)).toEqual(["stage.example.net", "stage.example.net/api/feed/*"]);
+    expect(bypassUris(site)).toEqual(["stage.example.net/api/health", "stage.example.net/api/feed"]);
+    // Only an exact path: the bypass app exists for it alone.
+    const only: Route = { ...site, public: [] };
+    expect(bypassPaths(only)).toEqual([]);
+    expect(bypassUris(only)).toEqual(["stage.example.net/api/feed"]);
+  });
+
+  it("sync writes those destinations, and verify checks them", async () => {
+    const http = new FakeHttp();
+    const fcf = new FakeCloudflare(http);
+    const cloudflare = new Cloudflare({ token: "cf-token-0123456789", fetch: http.fetch, sleep: noSleep });
+    const config = { ...sampleConfig, appZones: ["example.net"], accessTeam: team, routes: { svc1: [site] } };
+    const ctx = { cloudflare, config, io: new ScriptedIo() } as unknown as Context;
+    const tunnel = await cloudflare.createTunnel("acc123", "stayfrosty-svc1");
+    const policy = await cloudflare.createAccessPolicy("acc123", { name: "stayfrosty-svc1", decision: "allow", include: [{ email: { email: "me@example.com" } }] });
+    await syncRoutes(ctx, "svc1", tunnel);
+    const apps = fcf.apps.filter((a) => String(a["name"]).startsWith("stayfrosty-svc1:"));
+    expect(apps.map((a) => [a["name"], a["domain"], (a["destinations"] as { uri: string }[]).map((d) => d.uri)])).toEqual([
+      ["stayfrosty-svc1:site", "stage.example.net", ["stage.example.net", "stage.example.net/api/feed/*"]],
+      ["stayfrosty-svc1:site:public", "stage.example.net/api/health", ["stage.example.net/api/health", "stage.example.net/api/feed"]],
+    ]);
+    const ingress = fcf.ingress.get(tunnel.id) as { path?: string; originRequest?: unknown }[];
+    expect(ingress.some((r) => r.path === exactRegex("/api/feed") && r.originRequest === undefined)).toBe(true);
+    const listed = await cloudflare.listAccessApps("acc123");
+    const policies = await cloudflare.listAccessPolicies("acc123");
+    const ok = checkRouteAccess("svc1", site, listed, policies, policy.id);
+    expect(ok.ok, ok.detail).toBe(true);
+    // Without the exact path in config, the "/*" destination makes verify fail.
+    const plain: Route = { ...site, publicExact: [] };
+    expect(checkRouteAccess("svc1", plain, listed, policies, policy.id).ok).toBe(false);
+  });
+
+  it("verify from outside: the path is open, and its subpaths, trailing slash and longer names ask for the login", async () => {
+    const ok = await checkRouteOutside(simulate(site), site, team);
+    expect(ok.ok, ok.detail).toBe(true);
+    // A bypass that also opened subpaths (a prefix instead of the exact path) fails.
+    const prefixOpen: RawGet = async (host, path) => (path.startsWith("/api/feed") ? { status: 404, location: null, body: "<html>app</html>" } : simulate(site)(host, path));
+    const bad = await checkRouteOutside(prefixOpen, site, team);
+    expect(bad.ok).toBe(false);
+    expect(bad.detail).toMatch(/\/api\/feed\/ got origin, want access \(only \/api\/feed itself is public\)/);
+    expect(bad.detail).toMatch(/\/api\/feed[0-9a-f]{12} got origin/);
+    // The path itself asking for the login fails too.
+    const closed: RawGet = async (host, path) => (path === "/api/feed" ? login : simulate(site)(host, path));
+    expect((await checkRouteOutside(closed, site, team)).detail).toContain("/api/feed asks for the Access login");
   });
 });
