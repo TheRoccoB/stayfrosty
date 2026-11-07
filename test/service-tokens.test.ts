@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { checkAccess, type ServiceTokenAccess } from "../src/checks/edge.ts";
 import { main } from "../src/cli.ts";
-import { Cloudflare, isOurTokenPolicy, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfServiceToken } from "../src/cloudflare.ts";
+import { appFieldsFrostyWouldReset, Cloudflare, isOurTokenPolicy, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfServiceToken } from "../src/cloudflare.ts";
 import { runServiceTokens } from "../src/commands/service-tokens.ts";
 import { saveConfig, serviceTokensFor, validateConfig, type Config } from "../src/config.ts";
 import type { Deps } from "../src/context.ts";
@@ -111,6 +111,27 @@ describe("Cloudflare client guards for service tokens", () => {
     expect(http.writes()).toHaveLength(1);
   });
 
+  it("appFieldsFrostyWouldReset allows only empty values, defaults and the app's own domain", () => {
+    const base = { id: "a", aud: "x", name: "stayfrosty-box1", type: "self_hosted", domain: "ssh-box1.example.com", session_duration: "24h", app_launcher_visible: false, policies: [], created_at: "t", updated_at: "t" };
+    expect(appFieldsFrostyWouldReset({ ...base, allowed_idps: [], auto_redirect_to_identity: false, custom_deny_message: "", cors_headers: { allow_all_origins: false, allowed_origins: [] }, http_only_cookie_attribute: true, tags: [], self_hosted_domains: ["ssh-box1.example.com"], destinations: [{ type: "public", uri: "ssh-box1.example.com" }] })).toEqual([]);
+    expect(
+      appFieldsFrostyWouldReset({
+        ...base,
+        allowed_idps: ["x"],
+        auto_redirect_to_identity: true,
+        enable_binding_cookie: true,
+        same_site_cookie_attribute: "strict",
+        cors_headers: { allowed_origins: ["https://example.net"] },
+        custom_deny_url: "https://example.net",
+        skip_interstitial: true,
+        tags: ["t"],
+        http_only_cookie_attribute: false,
+        some_new_field: "on",
+        destinations: [{ type: "public", uri: "other.example.com" }],
+      }),
+    ).toEqual(["allowed_idps", "auto_redirect_to_identity", "enable_binding_cookie", "same_site_cookie_attribute", "cors_headers", "custom_deny_url", "skip_interstitial", "tags", "some_new_field", "destinations"]);
+  });
+
   it("putSshAppPolicies only sets the box's own email and token policies on its own SSH app", async () => {
     await expect(client.putSshAppPolicies("acc1", "box1", "app-ssh", ["pol-tok"], "24h")).rejects.toThrow(/not the box's allow-by-email policy/);
     await expect(client.putSshAppPolicies("acc1", "box1", "app-ssh", ["pol-email", "pol-other"], "24h")).rejects.toThrow(/not the box's service token policy/);
@@ -121,6 +142,11 @@ describe("Cloudflare client guards for service tokens", () => {
     cf.apps.push({ id: "app-ssh2", name: "stayfrosty-box1", type: "ssh", domain: "ssh-box1.example.com", policies: [] });
     await expect(client.putSshAppPolicies("acc1", "box1", "app-wild", ["pol-email"], "24h")).rejects.toThrow(/refused/);
     await expect(client.putSshAppPolicies("acc1", "box1", "app-ssh2", ["pol-email"], "24h")).rejects.toThrow(/refused/);
+    expect(http.writes()).toEqual([]);
+
+    (cf.apps[0] as Record<string, unknown>)["allowed_idps"] = ["x"];
+    await expect(client.putSshAppPolicies("acc1", "box1", "app-ssh", ["pol-email"], "24h")).rejects.toThrow(/has allowed_idps set, and frosty's update would reset them/);
+    delete (cf.apps[0] as Record<string, unknown>)["allowed_idps"];
     expect(http.writes()).toEqual([]);
 
     await client.putSshAppPolicies("acc1", "box1", "app-ssh", ["pol-email", "pol-tok"], "12h");
@@ -343,6 +369,55 @@ describe("frosty service-tokens", () => {
     cf.apps.pop();
     cf.apps.push({ id: "app-any", name: "any-app", type: "self_hosted", domain: "any.example.net", policies: [{ id: "inline-2", name: "machines", decision: "non_identity", include: [{ any_valid_service_token: {} }] }] });
     await expect(runServiceTokens(deps(new ScriptedIo()), { action: "sync", box: "box1" })).rejects.toThrow(/any-app \(policy machines\) lets in any valid service token/);
+    expect(http.writes()).toEqual([]);
+  });
+
+  it("refuses a token that an Access group names, wherever a policy uses that group", async () => {
+    cf.groups.push({ id: "grp-1", name: "machines", include: [{ service_token: { token_id: ID1 } }] });
+    cf.apps.push({ id: "app-other", name: "other-app", type: "self_hosted", domain: "other.example.net", policies: [{ id: "inline-1", name: "via-group", decision: "non_identity", include: [{ group: { id: "grp-1" } }] }] });
+    await expect(runServiceTokens(deps(new ScriptedIo()), { action: "sync", box: "box1" })).rejects.toThrow(/other-app \(policy via-group\) includes backup-puller-box1/);
+    cf.groups[0] = { id: "grp-1", name: "machines", include: [{ everyone: {} }], require: [{ any_valid_service_token: {} }] };
+    await expect(runServiceTokens(deps(new ScriptedIo()), { action: "sync", box: "box1" })).rejects.toThrow(/other-app \(policy via-group\) lets in any valid service token/);
+    expect(http.writes()).toEqual([]);
+  });
+
+  it("fails closed on a group it can't see, naming the groups permission", async () => {
+    cf.apps.push({ id: "app-other", name: "other-app", type: "self_hosted", domain: "other.example.net", policies: [{ id: "inline-1", name: "people", decision: "allow", include: [{ group: { id: "grp-unknown" } }] }] });
+    const error = (await runServiceTokens(deps(new ScriptedIo()), { action: "plan", box: "box1" }).catch((e: unknown) => e)) as { message: string; hint: string };
+    expect(error.message).toContain("can't check Access group grp-unknown");
+    expect(error.hint).toContain("Access: Organizations, Identity Providers, and Groups · Read");
+    http.on("GET", "api.cloudflare.com", "/client/v4/accounts/acc1/access/groups", { status: 403, body: { success: false, errors: [{ code: 10000, message: "Authentication error" }], result: null } });
+    await expect(runServiceTokens(deps(new ScriptedIo()), { action: "sync", box: "box1" })).rejects.toThrow(/can't check Access groups/);
+    expect(http.writes()).toEqual([]);
+  });
+
+  it("refuses an app whose policy requires any valid token, or is Service Auth for everyone", async () => {
+    cf.apps.push({ id: "app-other", name: "other-app", type: "self_hosted", domain: "other.example.net", policies: [{ id: "inline-1", name: "req", decision: "allow", include: [{ everyone: {} }], require: [{ any_valid_service_token: {} }] }] });
+    await expect(runServiceTokens(deps(new ScriptedIo()), { action: "sync", box: "box1" })).rejects.toThrow(/other-app \(policy req\) lets in any valid service token/);
+    cf.apps[1] = { id: "app-other", name: "other-app", type: "self_hosted", domain: "other.example.net", policies: [{ id: "inline-2", name: "svc-all", decision: "non_identity", include: [{ everyone: {} }] }] };
+    await expect(runServiceTokens(deps(new ScriptedIo()), { action: "sync", box: "box1" })).rejects.toThrow(/other-app \(policy svc-all\) lets in any valid service token/);
+    expect(http.writes()).toEqual([]);
+  });
+
+  it("checks reusable policies attached to other apps, from the policy list", async () => {
+    // The other app's list entry and its full read both carry only the reference.
+    cf.policies.push({ id: "pol-any", name: "machines-any", decision: "non_identity", include: [{ everyone: {} }] });
+    cf.apps.push({ id: "app-other", name: "other-app", type: "self_hosted", domain: "other.example.net", policies: [{ id: "pol-any", precedence: 1 }] });
+    http.on("GET", "api.cloudflare.com", "/client/v4/accounts/acc1/access/apps/app-other", () => ({ body: { success: true, errors: [], result: cf.apps[1] } }));
+    await expect(runServiceTokens(deps(new ScriptedIo()), { action: "sync", box: "box1" })).rejects.toThrow(/Access policy machines-any \(on other-app\) lets in any valid service token/);
+    // Not attached anywhere: not an opening.
+    cf.apps.pop();
+    expect(await runServiceTokens(deps(new ScriptedIo()), { action: "sync", box: "box1" })).toBe(0);
+  });
+
+  it("refuses to rewrite an SSH app with settings frosty would reset, before any write", async () => {
+    (cf.apps[0] as Record<string, unknown>)["allowed_idps"] = ["x"];
+    (cf.apps[0] as Record<string, unknown>)["tags"] = [];
+    (cf.apps[0] as Record<string, unknown>)["http_only_cookie_attribute"] = true;
+    const plan = new ScriptedIo();
+    expect(await runServiceTokens(deps(plan), { action: "plan", box: "box1" })).toBe(1);
+    expect(plan.text()).toContain("[problem] Access application stayfrosty-box1 has allowed_idps set, and frosty's update would reset them");
+    await expect(runServiceTokens(deps(new ScriptedIo()), { action: "sync", box: "box1" })).rejects.toThrow(/has allowed_idps set, and frosty's update would reset them/);
     expect(http.writes()).toEqual([]);
   });
 

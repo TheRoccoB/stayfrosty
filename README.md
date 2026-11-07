@@ -31,6 +31,7 @@ When it is released, it will install from a tagged version, never from `main`, a
   - Account: Access: Apps and Policies Edit
   - Account: Notifications Edit
   - Account: Access: Service Tokens Read (only if you use `serviceTokens`)
+  - Account: Access: Organizations, Identity Providers, and Groups Read (only if you use `serviceTokens`)
   - Zone (only your one domain, never all zones): DNS Edit
   - Zone (only your one domain, never all zones): Zone Read
 
@@ -155,10 +156,11 @@ An automated client on another machine, for example a backup puller, can't do th
 }
 ```
 
-- A token opens exactly one box. The same name under two boxes is a config error, and `sync` refuses (before any write) if any other policy or Access app already lets one of the box's tokens in, including an app that takes any valid service token. Make one token per client and box.
+- A token opens exactly one box. The same name under two boxes is a config error, and `sync` refuses (before any write) if any other policy or Access app already lets one of the box's tokens in: by naming it in an include or require rule, through an Access group, or by taking any valid service token (an `any_valid_service_token` rule, or a Service Auth policy for everyone). frosty reads every Access group for this and stops if a policy uses a group it can't see. Make one token per client and box.
+- `sync` rewrites the box's SSH Access app, and Cloudflare resets whatever the update doesn't carry. So it refuses (before any write) when the app has other settings, such as an identity provider list, cookie or CORS settings, a custom deny page or tags, and names them.
 - `sync` writes one policy, `stayfrosty-<box>:service-tokens` (decision Service Auth, one service token rule per configured token, nothing else), and then sets the box's SSH Access app to exactly its email policy plus that policy. Taking the box out of `serviceTokens` detaches the policy and then deletes it. `new` and `adopt` run the same sync before their final checks, and `destroy` deletes the policy with the box.
 - `plan` and `sync` print each token's expiry, and flag a token that expires within 30 days or already has. `verify` fails on an expired token, a token policy that lets in anything else, a token that also opens another app, and a token policy left on a box with none configured.
-- Reading tokens needs one more Cloudflare permission: Account, Access: Service Tokens Read. Without it Cloudflare returns an empty list, not an error, so frosty says the token wasn't found. Boxes without `serviceTokens` never read tokens, so the permission is only needed if you use them.
+- Reading tokens needs two more Cloudflare permissions: Account, Access: Service Tokens Read, and Account, Access: Organizations, Identity Providers, and Groups Read. Without the first, Cloudflare returns an empty list, not an error, so frosty says the token wasn't found. Without the second, frosty can't check groups and stops. Boxes without `serviceTokens` read neither, so the permissions are only needed if you use them.
 - A service token gets past Access only. The client still needs an SSH key the box accepts, such as a restricted user's from `ssh-users`.
 
 ## Reboot times

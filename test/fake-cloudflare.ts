@@ -17,6 +17,8 @@ export class FakeCloudflare {
   alerts: Item[] = [];
   // Access service tokens, made by hand in the dashboard; frosty only reads them.
   serviceTokens: Item[] = [];
+  // Access groups, read for the one-token-one-box check.
+  groups: Item[] = [];
   tokenFetches = 0;
   private next = 1;
 
@@ -84,6 +86,7 @@ export class FakeCloudflare {
         return cfOk(policy);
       })
       .on("GET", CF, `${ACCT}/access/service_tokens`, () => cfOk(this.serviceTokens, { total_pages: 1 }))
+      .on("GET", CF, `${ACCT}/access/groups`, () => cfOk(this.groups, { total_pages: 1 }))
       .on("DELETE", CF, `${ACCT}/access/policies/[^/]+`, (call) => {
         if (this.apps.some((a) => (a["policies"] as { id: string }[]).some((p) => p.id === lastId(call)))) {
           return { status: 409, body: { success: false, errors: [{ code: 12130, message: "policy is in use" }], result: null } };

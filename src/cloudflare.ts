@@ -177,6 +177,65 @@ export interface CfAccessApp {
   policies?: { id: string; name?: string; decision?: string; precedence?: number; include?: CfAccessRule[]; require?: CfAccessRule[]; exclude?: CfAccessRule[] }[];
 }
 
+// An Access group (reusable rule set). Policies reference one as { group: { id } }.
+export interface CfAccessGroup {
+  id: string;
+  name: string;
+  include?: CfAccessRule[];
+  require?: CfAccessRule[];
+  exclude?: CfAccessRule[];
+}
+
+// Fields of a live Access app that a PUT doesn't carry. Anything else the app has set (an IdP
+// list, cookie settings, CORS, deny pages, tags...) the PUT would reset, so putSshAppPolicies
+// refuses it. Only empty values (and Cloudflare's own defaults below) count as unset.
+const APP_FIELDS_KEPT = new Set(["id", "uid", "aud", "created_at", "updated_at", "name", "type", "domain", "session_duration", "policies", "app_launcher_visible", "self_hosted_domains", "destinations"]);
+const APP_DEFAULTS: Record<string, unknown[]> = { http_only_cookie_attribute: [true] };
+
+function isEmptyValue(value: unknown): boolean {
+  if (value === undefined || value === null || value === false || value === "" || value === 0) {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.length === 0;
+  }
+  if (typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).every(isEmptyValue);
+  }
+  return false;
+}
+
+// The live app's fields that a PUT of frosty's whitelist body would reset. Empty when the app
+// has only what frosty sets.
+export function appFieldsFrostyWouldReset(app: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  for (const [key, value] of Object.entries(app)) {
+    if (APP_FIELDS_KEPT.has(key)) {
+      continue;
+    }
+    if (isEmptyValue(value) || (APP_DEFAULTS[key] ?? []).includes(value)) {
+      continue;
+    }
+    out.push(key);
+  }
+  const domain = app["domain"];
+  if (app["app_launcher_visible"] === true) {
+    out.push("app_launcher_visible");
+  }
+  const hosts = app["self_hosted_domains"];
+  if (Array.isArray(hosts) && hosts.some((h) => h !== domain)) {
+    out.push("self_hosted_domains");
+  }
+  const dests = app["destinations"];
+  if (Array.isArray(dests) && dests.some((d: unknown) => {
+    const dest = (d ?? {}) as Record<string, unknown>;
+    return dest["uri"] !== domain || (dest["type"] !== undefined && dest["type"] !== "public") || Object.keys(dest).some((k) => k !== "uri" && k !== "type");
+  })) {
+    out.push("destinations");
+  }
+  return out;
+}
+
 // An Access service token, as the list returns it. frosty only ever reads these.
 export interface CfServiceToken {
   id: string;
@@ -457,6 +516,12 @@ export class Cloudflare {
     return this.listAll<CfServiceToken>(`${acct(accountId)}/access/service_tokens`);
   }
 
+  // Read-only, for the one-token-one-box check. Needs "Access: Organizations, Identity Providers,
+  // and Groups Read".
+  listAccessGroups(accountId: string): Promise<CfAccessGroup[]> {
+    return this.listAll<CfAccessGroup>(`${acct(accountId)}/access/groups`);
+  }
+
   // The box's service token policy (tokenPolicyName): non_identity, one service_token include per
   // id, nothing else. The body is built here from the ids. With policyId it replaces that policy,
   // re-read first and checked to carry the same name.
@@ -556,6 +621,14 @@ export class Cloudflare {
     const live = await this.getAccessApp(accountId, appId);
     if (live.name !== name || live.type !== "self_hosted" || !isSshHostname(live.domain, box)) {
       refuse(`app ${appId} is ${live.name} (${live.type}) for ${live.domain ?? "nothing"}, not the self-hosted app for ssh-${box}.<domain>`);
+    }
+    // The PUT replaces the whole app, so settings made outside frosty would be reset.
+    const reset = appFieldsFrostyWouldReset(live as unknown as Record<string, unknown>);
+    if (reset.length > 0) {
+      throw new FrostyError(
+        `frosty refused to set the policies of Access application ${name}: it has ${reset.join(", ")} set, and frosty's update would reset them.`,
+        "Clear those settings in the Cloudflare dashboard (Zero Trust, Access, Applications) if you don't need them, then run the command again. frosty only writes its own app shape.",
+      );
     }
     for (const [i, id] of policyIds.entries()) {
       const policy = await this.getAccessPolicy(accountId, id);

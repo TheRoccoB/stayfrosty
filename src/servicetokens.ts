@@ -1,9 +1,9 @@
 import { missingServiceTokenHint, type ServiceTokenAccess } from "./checks/edge.ts";
-import { isOurEmailPolicy, isOurTokenPolicy, serviceTokenIds, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfAccessRule } from "./cloudflare.ts";
+import { isOurEmailPolicy, isOurTokenPolicy, serviceTokenIds, tokenPolicyName, type CfAccessApp, type CfAccessGroup, type CfAccessPolicy, type CfAccessRule } from "./cloudflare.ts";
 import { serviceTokensFor } from "./config.ts";
 import type { Context } from "./context.ts";
 import { edgeName, sameEmails } from "./edge.ts";
-import { FrostyError } from "./errors.ts";
+import { ApiError, FrostyError } from "./errors.ts";
 
 // Cloudflare Access service tokens on a box's SSH app (config.serviceTokens). The user makes the
 // tokens in the dashboard; frosty only reads them, and writes one policy per box,
@@ -31,53 +31,130 @@ export async function resolveServiceTokens(ctx: Context, names: string[]): Promi
   return { tokens, problems };
 }
 
-function rulesNaming(rules: CfAccessRule[] | undefined, ids: Map<string, string>): string[] {
-  return serviceTokenIds(rules)
-    .filter((id) => ids.has(id))
-    .map((id) => ids.get(id) as string);
+// The permission the group check needs, named in its refusals.
+export const GROUPS_PERMISSION = "Account · Access: Organizations, Identity Providers, and Groups · Read";
+
+function groupRef(rule: CfAccessRule): string | undefined {
+  const group = rule["group"] as { id?: unknown } | undefined;
+  return group !== null && typeof group === "object" && typeof group.id === "string" ? group.id : undefined;
 }
 
-function hasAnyToken(rules: CfAccessRule[] | undefined): boolean {
-  return (rules ?? []).some((r) => "any_valid_service_token" in r);
+// What a set of rules lets in, as far as service tokens go: the configured tokens it names, and
+// whether it takes any valid service token. Groups are resolved from the account's list; an
+// unknown group fails closed. `nonIdentity` is true for a Service Auth policy's include, where any
+// rule that isn't a specific service_token (everyone, an IP range...) lets any token in.
+interface TokenReach {
+  named: string[];
+  any: boolean;
+}
+
+function reach(rules: CfAccessRule[], ids: Map<string, string>, groups: Map<string, CfAccessGroup>, nonIdentity: boolean, seen: Set<string> = new Set()): TokenReach {
+  const named: string[] = [];
+  let any = false;
+  for (const rule of rules) {
+    const tokenId = rule.service_token?.token_id;
+    if (typeof tokenId === "string") {
+      if (ids.has(tokenId)) {
+        named.push(ids.get(tokenId) as string);
+      }
+      continue;
+    }
+    if ("any_valid_service_token" in rule) {
+      any = true;
+      continue;
+    }
+    const groupId = groupRef(rule);
+    if (groupId !== undefined) {
+      const group = groups.get(groupId);
+      if (group === undefined) {
+        throw new FrostyError(
+          `frosty can't check Access group ${groupId}: a policy uses it, but it isn't in the account's list of groups.`,
+          `A service token opens exactly one box, so frosty must see every group a policy uses. Give the Cloudflare API token "${GROUPS_PERMISSION}" (without it Cloudflare may return an empty list), then run the command again.`,
+        );
+      }
+      if (seen.has(groupId)) {
+        continue;
+      }
+      const inner = reach([...(group.include ?? []), ...(group.require ?? [])], ids, groups, nonIdentity, new Set([...seen, groupId]));
+      named.push(...inner.named);
+      any ||= inner.any;
+      continue;
+    }
+    if (nonIdentity) {
+      any = true;
+    }
+  }
+  return { named, any };
+}
+
+function policyReach(p: { decision?: string; include?: CfAccessRule[]; require?: CfAccessRule[] }, ids: Map<string, string>, groups: Map<string, CfAccessGroup>): TokenReach {
+  const nonIdentity = p.decision === "non_identity";
+  const inc = reach(p.include ?? [], ids, groups, nonIdentity);
+  // A require rule narrows, so only an explicit token rule or group in it counts, never everyone.
+  const req = reach(p.require ?? [], ids, groups, false);
+  return { named: [...new Set([...inc.named, ...req.named])], any: inc.any || req.any };
+}
+
+async function readGroups(ctx: Context): Promise<Map<string, CfAccessGroup>> {
+  let groups: CfAccessGroup[];
+  try {
+    groups = await ctx.cloudflare.listAccessGroups(ctx.config.accountId);
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw new FrostyError(`frosty can't check Access groups: Cloudflare said ${error.status} ${error.message}.`, `A service token opens exactly one box, so frosty must read every Access group. Give the Cloudflare API token "${GROUPS_PERMISSION}", then run the command again.`);
+    }
+    throw error;
+  }
+  return new Map(groups.map((g) => [g.id, g]));
 }
 
 // Every other Access policy and app that would also let one of these tokens in: a policy that
-// names one, an app whose policies name one or take any valid service token, or an app that has
-// the box's own token policy attached. The list of apps may leave out policy rules, so an app
-// without them is read in full. `ids` maps token id to the name to print.
+// names one (directly, in include or require, or through an Access group); a policy attached to
+// another app that takes any valid service token (any_valid_service_token, or Service Auth with
+// everyone); or an app that has the box's own token policy attached. Lists that leave out rules
+// are read in full. `ids` maps token id to the name to print. Fails closed on groups it can't read.
 export async function tokensUsedElsewhere(ctx: Context, box: string, ids: Map<string, string>, own: { appId: string | undefined; policyId: string | undefined }): Promise<string[]> {
   if (ids.size === 0) {
     return [];
   }
   const { cloudflare, config } = ctx;
-  const [policies, apps] = await Promise.all([cloudflare.listAccessPolicies(config.accountId), cloudflare.listAccessApps(config.accountId)]);
+  const [listedPolicies, listedApps, groups] = await Promise.all([cloudflare.listAccessPolicies(config.accountId), cloudflare.listAccessApps(config.accountId), readGroups(ctx)]);
+  const policies = await Promise.all(listedPolicies.map((p) => (Array.isArray(p.include) ? p : cloudflare.getAccessPolicy(config.accountId, p.id))));
+  const apps = await Promise.all(
+    listedApps.filter((a) => a.id !== own.appId).map((a) => (a.policies === undefined || a.policies.some((p) => !Array.isArray(p.include)) ? cloudflare.getAccessApp(config.accountId, a.id) : a)),
+  );
+  const attachedElsewhere = new Map<string, string>();
+  for (const app of apps) {
+    for (const p of app.policies ?? []) {
+      attachedElsewhere.set(p.id, app.name);
+    }
+  }
   const out: string[] = [];
   for (const p of policies) {
     if (p.id === own.policyId) {
       continue;
     }
-    const named = [...rulesNaming(p.include, ids), ...rulesNaming(p.require, ids)];
-    if (named.length > 0) {
-      out.push(`Access policy ${p.name} includes ${[...new Set(named)].join(", ")}`);
+    const r = policyReach(p, ids, groups);
+    if (r.named.length > 0) {
+      out.push(`Access policy ${p.name} includes ${r.named.join(", ")}`);
+    }
+    const on = attachedElsewhere.get(p.id);
+    if (r.any && on !== undefined) {
+      out.push(`Access policy ${p.name} (on ${on}) lets in any valid service token`);
     }
   }
-  for (const listed of apps) {
-    if (listed.id === own.appId) {
-      continue;
-    }
-    const needsRead = listed.policies === undefined || listed.policies.some((p) => !Array.isArray(p.include));
-    const app: CfAccessApp = needsRead ? await cloudflare.getAccessApp(config.accountId, listed.id) : listed;
+  for (const app of apps) {
     for (const p of app.policies ?? []) {
       const label = `Access application ${app.name} (policy ${p.name ?? p.id})`;
       if (own.policyId !== undefined && p.id === own.policyId) {
         out.push(`${label} is ${tokenPolicyName(box)} itself`);
         continue;
       }
-      const named = [...rulesNaming(p.include, ids), ...rulesNaming(p.require, ids)];
-      if (named.length > 0) {
-        out.push(`${label} includes ${[...new Set(named)].join(", ")}`);
+      const r = policyReach(p, ids, groups);
+      if (r.named.length > 0) {
+        out.push(`${label} includes ${r.named.join(", ")}`);
       }
-      if (hasAnyToken(p.include)) {
+      if (r.any) {
         out.push(`${label} lets in any valid service token`);
       }
     }
@@ -135,6 +212,8 @@ export async function readTokenState(ctx: Context, box: string): Promise<TokenSt
 
 export interface TokenStep {
   describe: string;
+  // True for the step that rewrites the box's SSH app.
+  app?: boolean;
   run: () => Promise<void>;
 }
 
@@ -152,6 +231,7 @@ export function tokenSteps(ctx: Context, box: string, state: TokenState): TokenS
   const currentNames = (app.policies ?? []).map((p) => p.name ?? p.id).join(", ") || "none";
   // The ids are read when the step runs: a policy created by an earlier step has its id by then.
   const setPolicies = (ids: () => string[], names: string[]): TokenStep => ({
+    app: true,
     describe: `set the policies of Access application ${app.name} to ${names.join(", ")} (now ${currentNames})`,
     run: async () => {
       await cloudflare.putSshAppPolicies(config.accountId, box, app.id, ids(), config.accessSessionDuration);

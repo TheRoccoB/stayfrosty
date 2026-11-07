@@ -340,7 +340,7 @@ describe("frosty new and destroy", () => {
 
   it("never lists service tokens for a box without serviceTokens", async () => {
     expect(await runNew(deps(new ScriptedIo()), { box: "t1", resume: false, dryRun: false })).toBe(0);
-    expect(http.calls.some((c) => c.url.pathname.endsWith("/access/service_tokens"))).toBe(false);
+    expect(http.calls.some((c) => c.url.pathname.endsWith("/access/service_tokens") || c.url.pathname.endsWith("/access/groups"))).toBe(false);
     expect(cf.policies).toHaveLength(1);
   });
 
