@@ -338,6 +338,37 @@ describe("frosty new and destroy", () => {
     expect(io.text()).toContain("Box t1 is gone.");
   });
 
+  it("never lists service tokens for a box without serviceTokens", async () => {
+    expect(await runNew(deps(new ScriptedIo()), { box: "t1", resume: false, dryRun: false })).toBe(0);
+    expect(http.calls.some((c) => c.url.pathname.endsWith("/access/service_tokens") || c.url.pathname.endsWith("/access/groups"))).toBe(false);
+    expect(cf.policies).toHaveLength(1);
+  });
+
+  it("new attaches the box's service tokens before its checks, and destroy deletes the token policy after the app", async () => {
+    await saveConfig({ ...sampleConfig, serviceTokens: { t1: ["backup-puller-t1"] } }, env);
+    cf.serviceTokens.push({ id: "11111111-1111-4111-8111-111111111111", name: "backup-puller-t1", expires_at: new Date(1_790_000_000_000 + 100 * 86_400_000).toISOString() });
+    const io = new ScriptedIo();
+    expect(await runNew(deps(io), { box: "t1", resume: false, dryRun: false }), io.text()).toBe(0);
+    const token = cf.policies.find((p) => p["name"] === "stayfrosty-t1:service-tokens") as { id: string };
+    expect(token).toMatchObject({ decision: "non_identity", include: [{ service_token: { token_id: "11111111-1111-4111-8111-111111111111" } }] });
+    expect((cf.apps[0] as { policies: { id: string }[] }).policies.map((p) => p.id)).toEqual([(cf.policies[0] as { id: string }).id, token.id]);
+    expect(io.text()).toMatch(/pass\s+Access: only your emails and this box's service tokens\s+allow me@example.com; service tokens backup-puller-t1 \(100 days left\)/);
+
+    const dry = new ScriptedIo();
+    await runDestroy(deps(dry), { box: "t1", dryRun: true });
+    expect(dry.text()).toContain("Cloudflare Access policy stayfrosty-t1:service-tokens");
+    const before = http.writes().length;
+    expect(await runDestroy(deps(new ScriptedIo(["t1"])), { box: "t1", dryRun: false })).toBe(0);
+    expect([cf.apps, cf.policies]).toEqual([[], []]);
+    const deletes = http.writes().slice(before).map((c) => c.url.pathname);
+    const app = deletes.findIndex((p) => p.includes("/access/apps/"));
+    const tokenPolicy = deletes.indexOf(`/client/v4/accounts/acc123/access/policies/${token.id}`);
+    const emailPolicy = deletes.findIndex((p) => p.includes("/access/policies/") && !p.endsWith(token.id));
+    expect(app).toBeGreaterThanOrEqual(0);
+    expect(app).toBeLessThan(tokenPolicy);
+    expect(tokenPolicy).toBeLessThan(emailPolicy);
+  });
+
   it("destroy leaves unlabeled things alone and says when there is nothing", async () => {
     hz.servers.push({ id: 1, name: "t1", status: "running", labels: {}, server_type: { name: "x" }, public_net: { ipv4: null, ipv6: null } });
     cf.tunnels.push({ id: "theirs", name: "my-tunnel", status: "healthy" });

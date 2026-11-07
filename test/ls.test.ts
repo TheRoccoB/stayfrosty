@@ -81,6 +81,11 @@ describe("frosty ls", () => {
       ], { total_pages: 1 }));
     emptyCloudflare(http);
     http.on("GET", CF, "/client/v4/accounts/acc1/access/apps", cfOk([{ id: "a1", name: "stayfrosty-gone", type: "self_hosted" }, { id: "a2", name: "stayfrosty-web1", type: "self_hosted" }], { total_pages: 1 }));
+    http.on("GET", CF, "/client/v4/accounts/acc1/access/policies", cfOk([
+      { id: "p1", name: "stayfrosty-gone:service-tokens", decision: "non_identity", include: [] },
+      { id: "p2", name: "stayfrosty-web1:service-tokens", decision: "non_identity", include: [] },
+      { id: "p3", name: "stayfrosty-web1", decision: "allow", include: [] },
+    ], { total_pages: 1 }));
     http.on("GET", CF, "/client/v4/zones/zone123/dns_records", cfOk([{ id: "d1", type: "CNAME", name: "ssh-gone.example.com", content: "x", comment: "stayfrosty box gone" }], { total_pages: 1 }));
     const io = new ScriptedIo();
     await runLs({ io, env, fetch: http.fetch, sleep: noSleep, now: () => now });
@@ -92,6 +97,9 @@ describe("frosty ls", () => {
     expect(text).toContain("Cloudflare Access application stayfrosty-gone");
     expect(text).not.toContain("Cloudflare Access application stayfrosty-web1");
     expect(text).toContain("Cloudflare DNS record CNAME ssh-gone.example.com");
+    expect(text).toContain("Cloudflare Access policy stayfrosty-gone:service-tokens");
+    expect(text).not.toContain("stayfrosty-web1:service-tokens");
+    expect(text).not.toContain("Cloudflare Access policy stayfrosty-web1");
   });
 
   it("formats ages", () => {

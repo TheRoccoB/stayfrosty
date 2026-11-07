@@ -1,4 +1,4 @@
-import type { CfAccessApp, CfAccessPolicy, CfAccessRule, CfDnsRecord, CfIngressRule, CfNotificationPolicy, CfTunnel } from "../cloudflare.ts";
+import { isOurTokenPolicy, serviceTokenIds, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfAccessRule, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfServiceToken, type CfTunnel } from "../cloudflare.ts";
 import { sameIngress } from "../edge.ts";
 import type { HzFirewall, HzServer } from "../hetzner.ts";
 import { LABEL_ADOPTED, LABEL_WINDOW_OPENED } from "../hetzner.ts";
@@ -83,37 +83,145 @@ function ruleProblems(rules: CfAccessRule[] | undefined, emails: string[]): stri
   return problems;
 }
 
-export function checkAccess(box: string, app: CfAccessApp | undefined, policy: CfAccessPolicy | undefined, hostname: string, emails: string[]): CheckResult {
-  const name = "Access: only your emails, no bypass or everyone";
+// A box's configured service tokens, as verify and service-tokens sync found them.
+export interface ServiceTokenAccess {
+  // The names in serviceTokens.<box>, and the tokens they resolved to.
+  names: string[];
+  tokens: { name: string; token: CfServiceToken }[];
+  // Names that matched no token, or more than one.
+  problems: string[];
+  // Other policies and apps that would also let one of these tokens in.
+  elsewhere: string[];
+  now: number;
+}
+
+const DAY = 86_400_000;
+
+// "expires 2027-01-31, in 86 days", and whether the token has expired or expires within 30 days.
+export function tokenExpiry(token: CfServiceToken, now: number): { text: string; days: number | undefined; expired: boolean; soon: boolean } {
+  const at = token.expires_at === undefined ? NaN : Date.parse(token.expires_at);
+  if (!Number.isFinite(at)) {
+    return { text: "no expiry date", days: undefined, expired: false, soon: false };
+  }
+  const date = new Date(at).toISOString().slice(0, 10);
+  if (at <= now) {
+    const ago = Math.floor((now - at) / DAY);
+    return { text: `expired ${date}, ${ago} days ago`, days: -ago, expired: true, soon: false };
+  }
+  const days = Math.floor((at - now) / DAY);
+  return { text: `expires ${date}, in ${days} days`, days, expired: false, soon: days < 30 };
+}
+
+export const SERVICE_TOKEN_ELSEWHERE_FIX =
+  "A service token opens exactly one box: take it out of those policies and apps in the Cloudflare dashboard, or give the other app its own token.";
+
+export const SERVICE_TOKEN_EXPIRED_FIX = "Refresh or rotate the token in the Cloudflare dashboard (Zero Trust, Access, Service credentials), and give the client the new secret if it changed.";
+
+export function checkAccess(
+  box: string,
+  app: CfAccessApp | undefined,
+  policy: CfAccessPolicy | undefined,
+  hostname: string,
+  emails: string[],
+  tokenPolicy?: CfAccessPolicy,
+  tokens?: ServiceTokenAccess,
+): CheckResult {
+  const name = tokens === undefined ? "Access: only your emails, no bypass or everyone" : "Access: only your emails and this box's service tokens";
   if (app === undefined || policy === undefined) {
     return fail(name, app === undefined ? "no Access application" : "no Access policy", rebuild(box));
   }
   const problems: string[] = [];
+  const fixes = new Set<string>();
+  const generic = "Fix it in the Cloudflare dashboard to match, or destroy and recreate the box.";
+  const sync = `Run: frosty service-tokens sync ${box}`;
+  const add = (problem: string, fix: string): void => {
+    problems.push(problem);
+    fixes.add(fix);
+  };
   if (app.domain !== hostname) {
-    problems.push(`the app covers ${app.domain ?? "nothing"}, not ${hostname}`);
+    add(`the app covers ${app.domain ?? "nothing"}, not ${hostname}`, generic);
   }
   const appPolicies = app.policies ?? [];
-  if (appPolicies.length !== 1 || appPolicies[0]?.id !== policy.id) {
-    problems.push(`the app has ${appPolicies.length} policies, want only ${policy.name}`);
-  }
-  for (const p of [policy, ...appPolicies]) {
-    if (p.decision !== undefined && p.decision !== "allow") {
-      problems.push(`policy ${p.name ?? p.id} decides ${p.decision}`);
+  const ours = tokenPolicy !== undefined && isOurTokenPolicy(tokenPolicy, box);
+  if (tokens === undefined) {
+    if (appPolicies.length !== 1 || appPolicies[0]?.id !== policy.id) {
+      if (tokenPolicy !== undefined && appPolicies.some((p) => p.id === tokenPolicy.id)) {
+        add(`${tokenPolicyName(box)} is attached, but serviceTokens has no tokens for ${box}`, sync);
+      } else {
+        add(`the app has ${appPolicies.length} policies, want only ${policy.name}`, generic);
+      }
+    }
+  } else {
+    if (tokenPolicy === undefined) {
+      add(`no Access policy ${tokenPolicyName(box)}`, sync);
+    } else if (!ours) {
+      add(`${tokenPolicy.name} is not only service tokens (non_identity, service_token includes, no require or exclude)`, sync);
+    }
+    if (appPolicies.length !== 2 || appPolicies[0]?.id !== policy.id || appPolicies[1]?.id !== tokenPolicy?.id) {
+      add(`the app's policies are ${appPolicies.map((p) => p.name ?? p.id).join(", ") || "none"}, want ${policy.name}, ${tokenPolicyName(box)}`, sync);
+    }
+    if (tokenPolicy !== undefined) {
+      const want = new Set(tokens.tokens.map((t) => t.token.id));
+      const have = new Set(serviceTokenIds(tokenPolicy.include));
+      const extra = [...have].filter((id) => !want.has(id));
+      const missing = tokens.tokens.filter((t) => !have.has(t.token.id)).map((t) => t.name);
+      if (extra.length > 0) {
+        add(`${tokenPolicyName(box)} lets in token id(s) not in serviceTokens.${box}: ${extra.join(", ")}`, sync);
+      }
+      if (missing.length > 0) {
+        add(`${tokenPolicyName(box)} does not include ${missing.join(", ")}`, sync);
+      }
+    }
+    for (const problem of tokens.problems) {
+      add(problem, missingServiceTokenHint());
+    }
+    if (tokens.elsewhere.length > 0) {
+      add(`a token of ${box} also opens: ${tokens.elsewhere.join("; ")}`, SERVICE_TOKEN_ELSEWHERE_FIX);
+    }
+    for (const t of tokens.tokens) {
+      const expiry = tokenExpiry(t.token, tokens.now);
+      if (expiry.expired) {
+        add(`service token ${t.name} ${expiry.text}`, SERVICE_TOKEN_EXPIRED_FIX);
+      }
     }
   }
-  problems.push(...ruleProblems(policy.include, emails));
+  for (const p of [policy, ...appPolicies]) {
+    // frosty's own token policy is non_identity by design, and checked above.
+    if (ours && p.id === tokenPolicy.id) {
+      continue;
+    }
+    if (p.decision !== undefined && p.decision !== "allow") {
+      add(`policy ${p.name ?? p.id} decides ${p.decision}`, generic);
+    }
+  }
+  for (const problem of ruleProblems(policy.include, emails)) {
+    add(problem, generic);
+  }
   const listed = new Set((policy.include ?? []).map((r) => r.email?.email.toLowerCase()).filter((e): e is string => e !== undefined));
   const missing = emails.filter((e) => !listed.has(e.toLowerCase()));
   if (missing.length > 0) {
-    problems.push(`the policy does not include ${missing.join(", ")}`);
+    add(`the policy does not include ${missing.join(", ")}`, generic);
   }
   if ((policy.include ?? []).length === 0) {
-    problems.push("the policy includes nobody");
+    add("the policy includes nobody", generic);
   }
   if (problems.length > 0) {
-    return fail(name, [...new Set(problems)].join("; "), "Fix it in the Cloudflare dashboard to match, or destroy and recreate the box.");
+    return fail(name, [...new Set(problems)].join("; "), [...fixes].join(" "));
   }
-  return pass(name, `allow ${policy.include.map((r) => r.email?.email).join(", ")}`);
+  const allow = `allow ${policy.include.map((r) => r.email?.email).join(", ")}`;
+  if (tokens === undefined) {
+    return pass(name, allow);
+  }
+  const listing = tokens.tokens.map((t) => {
+    const e = tokenExpiry(t.token, tokens.now);
+    return `${t.name} (${e.days === undefined ? "no expiry" : `${e.days} days left${e.soon ? ", renew soon" : ""}`})`;
+  });
+  return pass(name, `${allow}; service tokens ${listing.join(", ")}`);
+}
+
+// Cloudflare returns an empty list, not an error, when the token lacks the permission to read them.
+export function missingServiceTokenHint(): string {
+  return 'Create the token in the Cloudflare dashboard (Zero Trust, Access, Service credentials), or fix its name in serviceTokens. If it exists, the Cloudflare API token may lack "Account · Access: Service Tokens · Read": without it Cloudflare returns an empty list, not an error.';
 }
 
 // Hetzner gives each box a /64; anything in it points at the box.

@@ -1,4 +1,4 @@
-import { BYPASS_POLICY_NAME, DNS_COMMENT_PREFIX, NAME_PREFIX, isOurBypassPolicy, isOurEmailPolicy, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel, type IngressSpec } from "./cloudflare.ts";
+import { BYPASS_POLICY_NAME, DNS_COMMENT_PREFIX, NAME_PREFIX, isOurBypassPolicy, isOurEmailPolicy, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel, type IngressSpec } from "./cloudflare.ts";
 import { accessUri, boxIngress, bypassPaths, frostyProtected, inZones, isRouteAppOf, publicAppName, routeAppName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
 import { runOrFail, type SshTarget } from "./box.ts";
 import { sshHostname, type Context } from "./context.ts";
@@ -82,6 +82,8 @@ export interface Edge {
   // stayfrosty-<box>:<route>[:public]: Access apps of the box's app routes.
   routeApps: CfAccessApp[];
   policy: CfAccessPolicy | undefined;
+  // stayfrosty-<box>:service-tokens, only with serviceTokens (frosty service-tokens sync).
+  tokenPolicy: CfAccessPolicy | undefined;
   alert: CfNotificationPolicy | undefined;
 }
 
@@ -103,12 +105,13 @@ export async function findEdge(ctx: Context, box: string): Promise<Edge> {
     app: apps.find((a) => a.name === name),
     routeApps: apps.filter((a) => isRouteAppOf(box, a.name)),
     policy: policies.find((p) => p.name === name),
+    tokenPolicy: policies.find((p) => p.name === tokenPolicyName(box)),
     alert: alerts.find((a) => a.name === name),
   };
 }
 
 export function edgeIsEmpty(edge: Edge): boolean {
-  return edge.tunnel === undefined && edge.dns.length === 0 && edge.app === undefined && edge.routeApps.length === 0 && edge.policy === undefined && edge.alert === undefined;
+  return edge.tunnel === undefined && edge.dns.length === 0 && edge.app === undefined && edge.routeApps.length === 0 && edge.policy === undefined && edge.tokenPolicy === undefined && edge.alert === undefined;
 }
 
 // Step 7: the tunnel and its ingress, managed from Cloudflare.
@@ -417,6 +420,11 @@ export async function removeEdge(ctx: Context, edge: Edge): Promise<void> {
     io.out(`Deleting Access application ${app.name}.`);
     await cloudflare.deleteAccessApp(config.accountId, app);
   }
+  // After the app that uses it, before the email policy.
+  if (edge.tokenPolicy !== undefined) {
+    io.out(`Deleting Access policy ${edge.tokenPolicy.name}.`);
+    await cloudflare.deleteAccessPolicy(config.accountId, edge.tokenPolicy);
+  }
   if (edge.policy !== undefined) {
     io.out(`Deleting Access policy ${edge.policy.name}.`);
     await cloudflare.deleteAccessPolicy(config.accountId, edge.policy);
@@ -450,6 +458,9 @@ export function describeEdge(edge: Edge): string[] {
   }
   if (edge.policy !== undefined) {
     lines.push(`Cloudflare Access policy ${edge.policy.name}`);
+  }
+  if (edge.tokenPolicy !== undefined) {
+    lines.push(`Cloudflare Access policy ${edge.tokenPolicy.name}`);
   }
   if (edge.alert !== undefined) {
     lines.push(`Cloudflare notification ${edge.alert.name}`);
