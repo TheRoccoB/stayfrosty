@@ -203,3 +203,11 @@ Design from a security review (2026-11). The first user is a backup host pulling
 - A separate `ssh-users sync` command rather than re-running adopt, because nothing else rewrites sshd on an existing box. It changes only the restricted users, their key files and the drop-in. A changed drop-in is checked with `sshd -t` and the admin's effective `AllowUsers`/`ForceCommand`/`PermitRootLogin` before reload, then proven with a fresh admin login, with the old file restored over the open connection if that fails.
 - verify's extra on-box round trip runs only for boxes with restricted users, so boxes without them make the same calls and get the same checks as before.
 - The on-box change log is the new optional `boxChangeLog`, in the same JSON-lines format as the API change logs. The box also logs each change to syslog (`logger -t stayfrosty`).
+
+## Service tokens (`frosty service-tokens`)
+
+- `serviceTokens` names tokens the user made in the dashboard; frosty only lists them (read-only permission) and never creates, rotates or deletes one. Why: the secret is shown once at creation and belongs on the client, never in frosty's config or logs. Alt: frosty creates the token and prints the secret.
+- One policy per box, `stayfrosty-<box>:service-tokens`: `non_identity` with only `{service_token: {token_id}}` includes, written by its own method. `createAccessPolicy` still refuses anything but plain email rules. The SSH app takes exactly `[email policy, token policy]`, set by a method that re-reads the app and both policies. Why: the token's Access permission is account-wide. Alt: add token rules to the email policy (it would no longer be allow-by-email).
+- A token opens exactly one box: config refuses a name under two boxes, and sync and verify refuse a token id that any other policy or app includes, an app with the box's token policy attached, or an app that lets in any valid service token. Why: a leaked backup token should reach one box. Alt: trust the config.
+- Order: write the policy, then attach it; detach, then delete. `new`/`adopt` sync tokens before the final checks, so a box with tokens doesn't end with a failed Access check and an open window.
+- A box without `serviceTokens` makes no service token call, so the extra permission is only needed by those who use it.

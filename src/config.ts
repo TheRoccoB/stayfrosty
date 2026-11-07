@@ -34,6 +34,9 @@ export interface Config {
   accessTeam?: string;
   // Extra forced-command-only SSH users (sshusers.ts), by box. Applied with frosty ssh-users sync.
   restrictedUsers?: Record<string, RestrictedUser[]>;
+  // Names of existing Cloudflare Access service tokens allowed into a box's SSH, by box. Applied
+  // with frosty service-tokens sync. A token opens exactly one box.
+  serviceTokens?: Record<string, string[]>;
 }
 
 export const DEFAULTS = {
@@ -189,10 +192,53 @@ export function validateConfig(value: unknown): string[] {
       }
     }
   }
+  problems.push(...validateServiceTokens(c["serviceTokens"]));
   for (const key of ["hetznerChangeLog", "cloudflareChangeLog", "boxChangeLog"]) {
     const v = c[key];
     if (v !== undefined && (typeof v !== "string" || !v.startsWith("/"))) {
       problems.push(`${key} must be an absolute path`);
+    }
+  }
+  return problems;
+}
+
+const SERVICE_TOKEN_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+export function validateServiceTokens(value: unknown): string[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return ["serviceTokens must be an object of box name to a list of service token names"];
+  }
+  const problems: string[] = [];
+  const owner = new Map<string, string>();
+  for (const [box, list] of Object.entries(value as Record<string, unknown>)) {
+    if (!/^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$/.test(box)) {
+      problems.push(`serviceTokens.${box}: not a box name`);
+      continue;
+    }
+    if (!Array.isArray(list)) {
+      problems.push(`serviceTokens.${box} must be a list of service token names`);
+      continue;
+    }
+    const seen = new Set<string>();
+    for (const name of list) {
+      if (typeof name !== "string" || !SERVICE_TOKEN_NAME.test(name)) {
+        problems.push(`serviceTokens.${box} has an invalid token name: ${JSON.stringify(name)} (letters, digits, dots, dashes and underscores, up to 64)`);
+        continue;
+      }
+      if (seen.has(name)) {
+        problems.push(`serviceTokens.${box} lists ${name} twice`);
+        continue;
+      }
+      seen.add(name);
+      const other = owner.get(name);
+      if (other !== undefined) {
+        problems.push(`service token ${name} is listed under both ${other} and ${box}: a service token opens exactly one box`);
+        continue;
+      }
+      owner.set(name, box);
     }
   }
   return problems;
@@ -245,6 +291,10 @@ export async function saveConfig(config: Config, env: Env = process.env): Promis
 
 export function restrictedUsersFor(config: Pick<Config, "restrictedUsers">, box: string): RestrictedUser[] {
   return config.restrictedUsers !== undefined && Object.hasOwn(config.restrictedUsers, box) ? (config.restrictedUsers[box] as RestrictedUser[]) : [];
+}
+
+export function serviceTokensFor(config: Pick<Config, "serviceTokens">, box: string): string[] {
+  return config.serviceTokens !== undefined && Object.hasOwn(config.serviceTokens, box) ? (config.serviceTokens[box] as string[]) : [];
 }
 
 export function rebootTimeFor(config: Pick<Config, "rebootTime" | "rebootTimes">, box: string): string {

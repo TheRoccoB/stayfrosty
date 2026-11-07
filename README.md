@@ -30,6 +30,7 @@ When it is released, it will install from a tagged version, never from `main`, a
   - Account: Cloudflare Tunnel Edit
   - Account: Access: Apps and Policies Edit
   - Account: Notifications Edit
+  - Account: Access: Service Tokens Read (only if you use `serviceTokens`)
   - Zone (only your one domain, never all zones): DNS Edit
   - Zone (only your one domain, never all zones): Zone Read
 
@@ -138,6 +139,27 @@ What `sync` does on the box, as root, through the tunnel:
 The drop-in is checked with `sshd -t` and the admin user's effective settings before sshd reloads, and the old file goes back if either fails. Then frosty opens a fresh admin login; if that fails it restores the old drop-in over the connection that is still open. Users taken out of config are removed (their key file, then the user) once sshd no longer lets them in. Set `boxChangeLog` to an absolute path to get a JSON line before and after each sync. `new` and `adopt` run the same sync before their final checks when the box has restricted users. With none, the drop-in is byte for byte the one in `cloud-init.yaml`.
 
 `verify` then allows exactly the admin user plus the configured users in `AllowUsers`, and only `Match User <configured user>` blocks. For each user it reads `sshd -T -C user=<name>,...` and checks the forced command, `AuthorizedKeysFile`, and every restriction above. It also checks the user's shell, home, groups and locked password, that the key directory, key file and forced command can only be changed by root, and that every key line starts with `restrict,from="127.0.0.1,::1",command="<command>"` and matches the config. A box without `restrictedUsers` is checked exactly as before.
+
+## `frosty service-tokens` (optional)
+
+```
+frosty service-tokens plan <box>     print exactly what sync would change (changes nothing)
+frosty service-tokens sync <box>     apply it, then check the box's Access
+```
+
+An automated client on another machine, for example a backup puller, can't do the browser login that `cloudflared access ssh` normally asks for. It can use a Cloudflare Access service token instead: cloudflared reads `TUNNEL_SERVICE_TOKEN_ID` and `TUNNEL_SERVICE_TOKEN_SECRET` from the environment. Create the token yourself in the Cloudflare dashboard (Zero Trust, Access, Service credentials) and keep its secret on the client. frosty never creates, rotates or deletes tokens; it only reads their names, ids and expiry. Then name the token per box:
+
+```json
+"serviceTokens": {
+  "box1": ["backup-puller-box1"]
+}
+```
+
+- A token opens exactly one box. The same name under two boxes is a config error, and `sync` refuses (before any write) if any other policy or Access app already lets one of the box's tokens in, including an app that takes any valid service token. Make one token per client and box.
+- `sync` writes one policy, `stayfrosty-<box>:service-tokens` (decision Service Auth, one service token rule per configured token, nothing else), and then sets the box's SSH Access app to exactly its email policy plus that policy. Taking the box out of `serviceTokens` detaches the policy and then deletes it. `new` and `adopt` run the same sync before their final checks, and `destroy` deletes the policy with the box.
+- `plan` and `sync` print each token's expiry, and flag a token that expires within 30 days or already has. `verify` fails on an expired token, a token policy that lets in anything else, a token that also opens another app, and a token policy left on a box with none configured.
+- Reading tokens needs one more Cloudflare permission: Account, Access: Service Tokens Read. Without it Cloudflare returns an empty list, not an error, so frosty says the token wasn't found. Boxes without `serviceTokens` never read tokens, so the permission is only needed if you use them.
+- A service token gets past Access only. The client still needs an SSH key the box accepts, such as a restricted user's from `ssh-users`.
 
 ## Reboot times
 

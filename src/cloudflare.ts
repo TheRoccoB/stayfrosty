@@ -55,6 +55,40 @@ export function isOurEmailPolicy(policy: { name?: string; decision?: string; inc
 
 const BOX = /^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$/;
 
+// The policy that lets a box's configured Access service tokens into its SSH app. Its name keeps
+// the box first, so ls attributes it like a route app.
+export function tokenPolicyName(box: string): string {
+  return `${NAME_PREFIX}${box}:service-tokens`;
+}
+
+// Exactly { service_token: { token_id } }: one key, one key inside, nothing else.
+function serviceTokenRule(rule: CfAccessRule): boolean {
+  const inner = rule.service_token;
+  return Object.keys(rule).length === 1 && inner !== null && typeof inner === "object" && !Array.isArray(inner) && Object.keys(inner).length === 1 && typeof inner.token_id === "string";
+}
+
+// frosty's service token policy for one box: its exact name, non_identity, only service_token
+// includes (never any_valid_service_token, everyone or emails), no require or exclude.
+export function isOurTokenPolicy(policy: { name?: string; decision?: string; include?: CfAccessRule[]; require?: CfAccessRule[]; exclude?: CfAccessRule[] }, box: string): boolean {
+  const include = policy.include ?? [];
+  return (
+    BOX.test(box) &&
+    policy.name === tokenPolicyName(box) &&
+    policy.decision === "non_identity" &&
+    include.length > 0 &&
+    include.every(serviceTokenRule) &&
+    (policy.require ?? []).length === 0 &&
+    (policy.exclude ?? []).length === 0
+  );
+}
+
+// The token ids a policy's rules name.
+export function serviceTokenIds(rules: CfAccessRule[] | undefined): string[] {
+  return (rules ?? []).flatMap((r) => (typeof r.service_token?.token_id === "string" ? [r.service_token.token_id] : []));
+}
+
+const SERVICE_TOKEN_ID = /^[0-9a-f-]{36}$/;
+
 // The box a frosty name belongs to, or a refusal.
 function boxOf(kind: string, name: string | undefined): string {
   ours(kind, name);
@@ -118,6 +152,7 @@ export interface IngressSpec {
 export interface CfAccessRule {
   email?: { email: string };
   everyone?: Record<string, never>;
+  service_token?: { token_id: string };
   [other: string]: unknown;
 }
 
@@ -139,7 +174,16 @@ export interface CfAccessApp {
   self_hosted_domains?: string[];
   type: string;
   session_duration?: string;
-  policies?: { id: string; name?: string; decision?: string; precedence?: number; include?: CfAccessRule[] }[];
+  policies?: { id: string; name?: string; decision?: string; precedence?: number; include?: CfAccessRule[]; require?: CfAccessRule[]; exclude?: CfAccessRule[] }[];
+}
+
+// An Access service token, as the list returns it. frosty only ever reads these.
+export interface CfServiceToken {
+  id: string;
+  name: string;
+  client_id?: string;
+  expires_at?: string;
+  duration?: string;
 }
 
 export interface CfNotificationPolicy {
@@ -407,6 +451,41 @@ export class Cloudflare {
     return this.listAll<CfAccessPolicy>(`${acct(accountId)}/access/policies`);
   }
 
+  // Read-only: frosty never creates, rotates or deletes service tokens. Without the token permission
+  // "Access: Service Tokens Read", Cloudflare answers with an empty list, not an error.
+  listServiceTokens(accountId: string): Promise<CfServiceToken[]> {
+    return this.listAll<CfServiceToken>(`${acct(accountId)}/access/service_tokens`);
+  }
+
+  // The box's service token policy (tokenPolicyName): non_identity, one service_token include per
+  // id, nothing else. The body is built here from the ids. With policyId it replaces that policy,
+  // re-read first and checked to carry the same name.
+  async putTokenPolicy(accountId: string, box: string, tokenIds: string[], policyId?: string): Promise<CfAccessPolicy> {
+    const name = tokenPolicyName(box);
+    const refuse = (why: string): never => {
+      throw new FrostyError(`frosty refused to write Access policy ${name}: ${why}.`, "This is a bug in frosty. Please report it.");
+    };
+    if (boxOf("Access policy", `${NAME_PREFIX}${box}`) !== box) {
+      refuse("bad box name");
+    }
+    const ids = [...new Set(tokenIds)].sort();
+    if (ids.length === 0 || ids.length !== tokenIds.length || ids.some((id) => !SERVICE_TOKEN_ID.test(id))) {
+      refuse("it needs one or more distinct service token ids");
+    }
+    const body = { name, decision: "non_identity", include: ids.map((id) => ({ service_token: { token_id: id } })) };
+    if (!isOurTokenPolicy(body, box)) {
+      refuse("wrong shape");
+    }
+    if (policyId === undefined) {
+      return this.request<CfAccessPolicy>("POST", `${acct(accountId)}/access/policies`, body);
+    }
+    const live = await this.getAccessPolicy(accountId, policyId);
+    if (live.name !== name) {
+      refuse(`policy ${policyId} is named ${live.name}`);
+    }
+    return this.request<CfAccessPolicy>("PUT", `${acct(accountId)}/access/policies/${encodeURIComponent(live.id)}`, body, live);
+  }
+
   async createAccessPolicy(accountId: string, policy: { name: string; decision: string; include: CfAccessRule[]; session_duration?: string }): Promise<CfAccessPolicy> {
     // Only "allow these emails": never bypass, everyone, groups, IdP orgs, IP ranges or service tokens.
     if (!isOurEmailPolicy(policy) || Object.keys(policy).some((k) => !["name", "decision", "include", "session_duration"].includes(k))) {
@@ -458,6 +537,48 @@ export class Cloudflare {
       }
     }
     return this.request<CfAccessApp>("POST", `${acct(accountId)}/access/apps`, app);
+  }
+
+  // Sets the policies of a box's SSH app: first its email policy, then optionally its service token
+  // policy, each re-read and checked. The live app is re-read too and must be the box's own
+  // self-hosted app for ssh-<box>.<domain>. The body is the same whitelist createAccessApp takes.
+  async putSshAppPolicies(accountId: string, box: string, appId: string, policyIds: string[], sessionDuration: string): Promise<CfAccessApp> {
+    const name = `${NAME_PREFIX}${box}`;
+    const refuse = (why: string): never => {
+      throw new FrostyError(`frosty refused to set the policies of Access application ${name}: ${why}.`, "This is a bug in frosty. Please report it.");
+    };
+    if (boxOf("Access application", name) !== box) {
+      refuse("bad box name");
+    }
+    if (policyIds.length === 0 || policyIds.length > 2 || new Set(policyIds).size !== policyIds.length) {
+      refuse("it takes the email policy and at most the service token policy");
+    }
+    const live = await this.getAccessApp(accountId, appId);
+    if (live.name !== name || live.type !== "self_hosted" || !isSshHostname(live.domain, box)) {
+      refuse(`app ${appId} is ${live.name} (${live.type}) for ${live.domain ?? "nothing"}, not the self-hosted app for ssh-${box}.<domain>`);
+    }
+    for (const [i, id] of policyIds.entries()) {
+      const policy = await this.getAccessPolicy(accountId, id);
+      if (i === 0 && (!isOurEmailPolicy(policy) || policy.name !== name)) {
+        refuse(`policy ${policy.name} is not the box's allow-by-email policy ${name}`);
+      }
+      if (i === 1 && !isOurTokenPolicy(policy, box)) {
+        refuse(`policy ${policy.name} is not the box's service token policy ${tokenPolicyName(box)}`);
+      }
+    }
+    const duration = live.session_duration !== undefined && /^\d+(m|h)$/.test(live.session_duration) ? live.session_duration : sessionDuration;
+    if (!/^\d+(m|h)$/.test(duration)) {
+      refuse("no valid session duration");
+    }
+    const body = {
+      name,
+      type: "self_hosted",
+      domain: live.domain as string,
+      session_duration: duration,
+      app_launcher_visible: false,
+      policies: policyIds.map((id, i) => ({ id, precedence: i + 1 })),
+    };
+    return this.request<CfAccessApp>("PUT", `${acct(accountId)}/access/apps/${encodeURIComponent(live.id)}`, body, live);
   }
 
   // A route's Access app (routes.ts). "protected": stayfrosty-<box>:<route> on the route's own

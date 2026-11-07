@@ -15,6 +15,8 @@ export class FakeCloudflare {
   apps: Item[] = [];
   policies: Item[] = [];
   alerts: Item[] = [];
+  // Access service tokens, made by hand in the dashboard; frosty only reads them.
+  serviceTokens: Item[] = [];
   tokenFetches = 0;
   private next = 1;
 
@@ -75,6 +77,13 @@ export class FakeCloudflare {
         return cfOk(policy);
       })
       .on("GET", CF, `${ACCT}/access/policies/[^/]+`, (call) => cfOk(this.policies.find((p) => p["id"] === lastId(call))))
+      .on("PUT", CF, `${ACCT}/access/policies/[^/]+`, (call) => {
+        const i = this.policies.findIndex((p) => p["id"] === lastId(call));
+        const policy = { id: (this.policies[i] as Item)["id"], ...body(call) };
+        this.policies[i] = policy;
+        return cfOk(policy);
+      })
+      .on("GET", CF, `${ACCT}/access/service_tokens`, () => cfOk(this.serviceTokens, { total_pages: 1 }))
       .on("DELETE", CF, `${ACCT}/access/policies/[^/]+`, (call) => {
         if (this.apps.some((a) => (a["policies"] as { id: string }[]).some((p) => p.id === lastId(call)))) {
           return { status: 409, body: { success: false, errors: [{ code: 12130, message: "policy is in use" }], result: null } };

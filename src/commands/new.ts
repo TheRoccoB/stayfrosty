@@ -4,9 +4,9 @@ import { checkOnlyPublickey, checkRootRefused } from "../checks/login.ts";
 import { runOnBoxChecks } from "../checks/onbox.ts";
 import type { CheckResult } from "../checks/types.ts";
 import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
-import { rebootTimeFor, restrictedUsersFor } from "../config.ts";
+import { rebootTimeFor, restrictedUsersFor, serviceTokensFor } from "../config.ts";
 import { assertBoxName, buildContext, directTarget, requireCloudflared, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
-import { checkAccess, checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
+import { checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
 import { checkTokenNotExposed } from "../checks/token.ts";
 import { checkRouteAccess, checkRouteMissing, checkRouteOutside, checkRoutePorts } from "../checks/routes.ts";
 import { boxRoutes, ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, ingressSpec, installConnector, specIngress, waitForDns, waitForHealthyTunnel } from "../edge.ts";
@@ -29,6 +29,7 @@ import {
 import { green, red, table } from "../io.ts";
 import { windowSource } from "../ip.ts";
 import { hasPassword, setConsolePassword } from "../password.ts";
+import { accessCheck, syncServiceTokens } from "./service-tokens.ts";
 import { syncSshUsers } from "./ssh-users.ts";
 
 export interface NewOptions {
@@ -216,6 +217,11 @@ export async function finishBox(ctx: Context, input: FinishInput): Promise<numbe
     await syncSshUsers(ctx, box, tunnelTarget(ctx, box));
   }
 
+  // 14c. Service tokens on the SSH Access app, if the box has any (the same as frosty service-tokens sync).
+  if (serviceTokensFor(config, box).length > 0) {
+    await syncServiceTokens(ctx, box);
+  }
+
   // 15. Every check except the window's, through the tunnel. The window closes only if they pass,
   // so a box that is not right yet stays reachable (from this laptop's IP only) to fix.
   const before = await checkBox(ctx, box, tunnelTarget(ctx, box), server, { tunnel: true, token, window: false });
@@ -389,7 +395,6 @@ export async function checkBox(
   const hostname = sshHostname(ctx, box);
   const [edge, records] = await Promise.all([findEdge(ctx, box), cloudflare.listDnsRecords(config.zoneId)]);
   const ingress = edge.tunnel === undefined ? [] : await cloudflare.getTunnelIngress(config.accountId, edge.tunnel.id);
-  const app = edge.app === undefined ? undefined : await cloudflare.getAccessApp(config.accountId, edge.app.id);
   const routes = boxRoutes(ctx, box);
   // Every app re-read one by one: the list may leave out destinations and policies, and the bypass
   // policy must be on no app but the route bypass apps.
@@ -410,7 +415,7 @@ export async function checkBox(
     ...(opts.window === false ? [] : await windowChecks(ctx, box, server)),
     ...[checkProtected(server)].filter((c): c is CheckResult => c !== undefined),
     checkTunnel(box, edge.tunnel, ingress, hostname, specIngress(spec), spec.routes.length),
-    checkAccess(box, app, edge.policy, hostname, config.accessEmails),
+    await accessCheck(ctx, box, edge),
     checkDns(box, records, hostname, edge.tunnel?.id, server.public_net.ipv4?.ip, server.public_net.ipv6?.ip),
     checkAlert(box, edge.alert, edge.tunnel?.id),
     await checkAccessLogin(ctx.fetch, hostname),
