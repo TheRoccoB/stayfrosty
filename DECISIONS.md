@@ -173,7 +173,7 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
   - a bypass destination for the path;
   - a more specific `<path>/*` destination on frosty's own protected app, so Access sends subpaths to the login.
 
-  Behind those, a neighbour that reaches the tunnel hits the protected prefix's rule with cloudflared's own Access check. So the path must sit inside a protected prefix of frosty's own app (an external app can't be given the `/*`). verify checks the path, its trailing slash, a subpath and a longer name. Alt: a separate hostname for the endpoint, which costs a DNS record and a route.
+  Behind those, a neighbour that reaches the tunnel hits the protected prefix's rule with cloudflared's own Access check. So the path must sit inside a protected prefix of frosty's own app (an external app can't be given the `/*`). verify checks that the path reaches the app, and that its trailing slash, a subpath, a longer name and the upper-cased path get the login or cloudflared's 403. Both stop short of the app, so verify doesn't insist on the login (Access matches paths as prefixes, and an edge rule just to turn the 403 into a login isn't worth it; the-bouncer). Alt: a separate hostname for the endpoint, which costs a DNS record and a route.
 - `frosty route sync` writes the Access apps before the ingress that routes their paths. A route whose apps are missing stays out of the ingress, so its paths 404. A route removed from config leaves the ingress first, and its apps are deleted after. `new` and `adopt --resume` keep the routes whose apps exist. Why: a protected path is never reachable without Access in front, even for a moment.
 - DNS for route hostnames isn't frosty's to write. Its token stays limited to the frosty domain, and `route plan` prints the CNAME to add elsewhere.
 - verify, per route, from outside with no credentials, sending each path exactly as written:
@@ -181,7 +181,7 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
   - nine path tricks (`/api/public/../settings`, `..%2f`, `//api/settings`, `/API/settings`, `/api;/settings`, ...) get the login or the tunnel's 404, and anything from the app fails;
   - unlisted paths get the tunnel's 404;
   - public paths never ask for a login;
-  - each `publicExact` path doesn't ask for one, while its trailing slash, a random subpath and a longer name do;
+  - each `publicExact` path reaches the app, while its trailing slash, a random subpath, a longer name and the upper-cased path get the login or cloudflared's 403;
   - `probe` answers 200 from the app.
 
   The tunnel's 404 is told apart from the app's by its empty body. From inside, verify checks that each route's port listens on 127.0.0.1 only and that nothing listens on 5432.

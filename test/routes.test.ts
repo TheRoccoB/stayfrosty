@@ -579,10 +579,27 @@ describe("exact public paths (publicExact)", () => {
     const prefixOpen: RawGet = async (host, path) => (path.startsWith("/api/feed") ? { status: 404, location: null, body: "<html>app</html>" } : simulate(site)(host, path));
     const bad = await checkRouteOutside(prefixOpen, site, team);
     expect(bad.ok).toBe(false);
-    expect(bad.detail).toMatch(/\/api\/feed\/ got origin, want access \(only \/api\/feed itself is public\)/);
+    expect(bad.detail).toMatch(/\/api\/feed\/ got origin, want access or tunnel-403 \(only \/api\/feed itself is public\)/);
     expect(bad.detail).toMatch(/\/api\/feed[0-9a-f]{12} got origin/);
     // The path itself asking for the login fails too.
     const closed: RawGet = async (host, path) => (path === "/api/feed" ? login : simulate(site)(host, path));
-    expect((await checkRouteOutside(closed, site, team)).detail).toContain("/api/feed asks for the Access login");
+    expect((await checkRouteOutside(closed, site, team)).detail).toContain("/api/feed got access, want origin");
+    // An edge that lets the neighbours by (a prefix-style Access match) is fine while cloudflared's own
+    // check stops them: its 403 counts like the login.
+    const tunnel403 = { status: 403, location: null, body: "Forbidden" };
+    const edgeLeaky: RawGet = async (host, path) => (path !== "/api/feed" && path.startsWith("/api/feed") ? tunnel403 : simulate(site)(host, path));
+    const okLeaky = await checkRouteOutside(edgeLeaky, site, team);
+    expect(okLeaky.ok, okLeaky.detail).toBe(true);
+    // The exact rule missing (or mis-escaped): the path meets the protected rule's own check, so it
+    // isn't public at all. Verify must fail, not just "it didn't ask for the login".
+    const noExactRule: Route = { ...site, publicExact: [] };
+    const missing = await checkRouteOutside(simulate(noExactRule), site, team);
+    expect(missing.ok).toBe(false);
+    expect(missing.detail).toContain("/api/feed got access, want origin (public, exact path)");
+    const missing403: RawGet = async (host, path) => (path === "/api/feed" ? tunnel403 : simulate(site)(host, path));
+    expect((await checkRouteOutside(missing403, site, team)).detail).toContain("/api/feed got tunnel-403, want origin");
+    // The upper-cased path is a neighbour too.
+    const caseOpen: RawGet = async (host, path) => (path === "/API/FEED" ? { status: 401, location: null, body: "{}" } : simulate(site)(host, path));
+    expect((await checkRouteOutside(caseOpen, site, team)).detail).toContain("/API/FEED got origin");
   });
 });

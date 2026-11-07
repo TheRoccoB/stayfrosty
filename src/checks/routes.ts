@@ -93,14 +93,14 @@ export async function checkRouteOutside(get: RawGet, route: Route, team: string)
   for (const p of [`/${rand}`, "/install", `${(route.protected[0] ?? route.public[0] ?? "/x").replace(/\/$/, "") || "/x"}${rand}`]) {
     await expect(p, ...notListed);
   }
-  // An exact public path is open, and nothing under or next to it: those keep the protected prefix's login.
+  // An exact public path reaches the app through the tunnel (any answer from the app: it may well say
+  // 401 without its own token), and nothing under or next to it does. Those get the login, or
+  // cloudflared's own 403 when the edge lets them by (Access's path match is a prefix): both stop
+  // short of the app.
   for (const e of exactPaths(route)) {
-    const got = await ask(e);
-    if (got === "access") {
-      problems.push(`${e} asks for the Access login, but it's public`);
-    }
-    for (const near of [`${e}/`, `${e}/${rand}`, `${e}${rand}`]) {
-      await expect(near, ["access"], `only ${e} itself is public`);
+    await expect(e, ["origin"], "public, exact path");
+    for (const near of [`${e}/`, `${e}/${rand}`, `${e}${rand}`, e.toUpperCase()]) {
+      await expect(near, ["access", "tunnel-403"], `only ${e} itself is public`);
     }
   }
   for (const p of route.public) {
