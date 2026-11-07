@@ -113,7 +113,7 @@ describe("Cloudflare client guards for service tokens", () => {
 
   it("appFieldsFrostyWouldReset allows only empty values, defaults and the app's own domain", () => {
     const base = { id: "a", aud: "x", name: "stayfrosty-box1", type: "self_hosted", domain: "ssh-box1.example.com", session_duration: "24h", app_launcher_visible: false, policies: [], created_at: "t", updated_at: "t" };
-    expect(appFieldsFrostyWouldReset({ ...base, allowed_idps: [], auto_redirect_to_identity: false, custom_deny_message: "", cors_headers: { allow_all_origins: false, allowed_origins: [] }, http_only_cookie_attribute: true, tags: [], self_hosted_domains: ["ssh-box1.example.com"], destinations: [{ type: "public", uri: "ssh-box1.example.com" }] })).toEqual([]);
+    expect(appFieldsFrostyWouldReset({ ...base, allowed_idps: [], auto_redirect_to_identity: false, custom_deny_message: "", cors_headers: { allow_all_origins: false, allowed_origins: [] }, http_only_cookie_attribute: true, eager_redirect_cookie_setting: true, tags: [], self_hosted_domains: ["ssh-box1.example.com"], destinations: [{ type: "public", uri: "ssh-box1.example.com" }] })).toEqual([]);
     expect(
       appFieldsFrostyWouldReset({
         ...base,

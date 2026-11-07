@@ -190,7 +190,9 @@ export interface CfAccessGroup {
 // list, cookie settings, CORS, deny pages, tags...) the PUT would reset, so putSshAppPolicies
 // refuses it. Only empty values (and Cloudflare's own defaults below) count as unset.
 const APP_FIELDS_KEPT = new Set(["id", "uid", "aud", "created_at", "updated_at", "name", "type", "domain", "session_duration", "policies", "app_launcher_visible", "self_hosted_domains", "destinations"]);
-const APP_DEFAULTS: Record<string, unknown[]> = { http_only_cookie_attribute: [true] };
+// Every frosty-made Access app reads back with these two set (checked on a real account, 2026-11): they
+// are Cloudflare's defaults for a new app, so a PUT that leaves them out changes nothing.
+const APP_DEFAULTS: Record<string, unknown[]> = { http_only_cookie_attribute: [true], eager_redirect_cookie_setting: [true] };
 
 function isEmptyValue(value: unknown): boolean {
   if (value === undefined || value === null || value === false || value === "" || value === 0) {
