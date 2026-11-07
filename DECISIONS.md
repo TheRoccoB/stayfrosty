@@ -168,6 +168,12 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
 
   Why: an existing app with its own people and policy shouldn't have to move under frosty to be served. Alt: frosty takes the paths over.
 - **One Access app per hostname for protected paths.** A route's protected prefixes are either all frosty's own app or all one `externalAccess` app, never a mix, and validation refuses a mix. Why: two Access apps on one hostname share the `CF_Authorization` cookie, so logging in to one replaces the other's token. A single-page app that calls its API from the browser then gets redirected to the login and breaks (CORS), and cloudflared's check sees the other app's AUD. Found in review before going live. Alt: two apps and two logins.
+- **Exact public paths (`publicExact`).** One endpoint (a JSON feed other servers poll, say) can be public while everything next to it stays protected. A prefix can't do that: Access treats a destination's path as a prefix, so a bypass on `/api/feed` alone would also open `/api/feed/anything`. So the path gets three things, and each layer refuses the neighbours on its own:
+  - an exact `^…$` ingress rule, case-sensitive, before the prefixes;
+  - a bypass destination for the path;
+  - a more specific `<path>/*` destination on frosty's own protected app, so Access sends subpaths to the login.
+
+  Behind those, a neighbour that reaches the tunnel hits the protected prefix's rule with cloudflared's own Access check. So the path must sit inside a protected prefix of frosty's own app (an external app can't be given the `/*`). verify checks that the path reaches the app, and that its trailing slash, a subpath, a longer name and the upper-cased path get the login or cloudflared's 403. Both stop short of the app, so verify doesn't insist on the login (Access matches paths as prefixes, and an edge rule just to turn the 403 into a login isn't worth it; the-bouncer). Alt: a separate hostname for the endpoint, which costs a DNS record and a route.
 - `frosty route sync` writes the Access apps before the ingress that routes their paths. A route whose apps are missing stays out of the ingress, so its paths 404. A route removed from config leaves the ingress first, and its apps are deleted after. `new` and `adopt --resume` keep the routes whose apps exist. Why: a protected path is never reachable without Access in front, even for a moment.
 - DNS for route hostnames isn't frosty's to write. Its token stays limited to the frosty domain, and `route plan` prints the CNAME to add elsewhere.
 - verify, per route, from outside with no credentials, sending each path exactly as written:
@@ -175,6 +181,7 @@ One line per judgment call: what, why, and the alternative. Tagged by milestone.
   - nine path tricks (`/api/public/../settings`, `..%2f`, `//api/settings`, `/API/settings`, `/api;/settings`, ...) get the login or the tunnel's 404, and anything from the app fails;
   - unlisted paths get the tunnel's 404;
   - public paths never ask for a login;
+  - each `publicExact` path reaches the app, while its trailing slash, a random subpath, a longer name and the upper-cased path get the login or cloudflared's 403;
   - `probe` answers 200 from the app.
 
   The tunnel's 404 is told apart from the app's by its empty body. From inside, verify checks that each route's port listens on 127.0.0.1 only and that nothing listens on 5432.

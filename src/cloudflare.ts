@@ -2,7 +2,7 @@ import { ApiError, FrostyError } from "./errors.ts";
 import { logDone, summarize, type ChangeLog } from "./changelog.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
 import { redact, registerSecret } from "./redact.ts";
-import { accessUri, boxIngress, bypassPaths, frostyProtected, inZones, publicAppName, routeAppName, validateRouteHostnames, validateRoutes, type IngressRule, type Route } from "./routes.ts";
+import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, protectedUris, publicAppName, routeAppName, validateRouteHostnames, validateRoutes, type IngressRule, type Route } from "./routes.ts";
 
 export const CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4";
 
@@ -677,8 +677,8 @@ export class Cloudflare {
     if (problems.length > 0 || inZones(route.hostname, [spec.domain]) || route.hostname.startsWith("ssh-")) {
       refuse(problems.join("; ") || `${route.hostname} is not an app hostname`);
     }
-    const paths = kind === "protected" ? frostyProtected(route) : bypassPaths(route);
-    if (paths.length === 0 || spec.policyIds.length === 0 || (kind === "public" && spec.policyIds.length !== 1) || !/^\d+(m|h)$/.test(spec.sessionDuration)) {
+    const uris = kind === "protected" ? protectedUris(route) : bypassUris(route);
+    if (uris.length === 0 || spec.policyIds.length === 0 || (kind === "public" && spec.policyIds.length !== 1) || !/^\d+(m|h)$/.test(spec.sessionDuration)) {
       refuse("nothing to cover, or the wrong number of policies");
     }
     for (const id of spec.policyIds) {
@@ -688,7 +688,6 @@ export class Cloudflare {
         refuse(`policy ${live.name} is not ${kind === "public" ? "frosty's bypass policy" : "one of frosty's allow-by-email policies"}`);
       }
     }
-    const uris = paths.map((p) => accessUri(route.hostname, p));
     const body = {
       name,
       type: "self_hosted",

@@ -1,7 +1,7 @@
 import { assertBoxName, buildContext, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { boxRoutes, checkExternalAccess, describeIncludes, findEdge, routeApps, routeAuds, syncRoutes } from "../edge.ts";
-import { accessUri, bypassPaths, frostyProtected, publicAppName, routeAppName } from "../routes.ts";
+import { bypassUris, exactPaths, frostyProtected, protectedUris, publicAppName, routeAppName } from "../routes.ts";
 
 export interface RouteOptions {
   action: string | undefined;
@@ -38,11 +38,14 @@ export async function runRoute(deps: Deps, opts: RouteOptions): Promise<number> 
     io.out(`${route.name}: ${route.hostname} -> ${route.service}`);
     io.out(`  public: ${route.public.join(" ")}`);
     io.out(`  protected: ${route.protected.join(" ")}`);
-    if (frostyProtected(route).length > 0) {
-      io.out(`  Access ${routeAppName(box, route)} (your emails): ${frostyProtected(route).map((p) => accessUri(route.hostname, p)).join(", ")}${have.app === undefined ? "  [missing]" : ""}`);
+    if (exactPaths(route).length > 0) {
+      io.out(`  public, exact path only: ${exactPaths(route).join(" ")}`);
     }
-    if (bypassPaths(route).length > 0) {
-      io.out(`  Access ${publicAppName(box, route)} (bypass): ${bypassPaths(route).map((p) => accessUri(route.hostname, p)).join(", ")}${have.publicApp === undefined ? "  [missing]" : ""}`);
+    if (frostyProtected(route).length > 0) {
+      io.out(`  Access ${routeAppName(box, route)} (your emails): ${protectedUris(route).join(", ")}${have.app === undefined ? "  [missing]" : ""}`);
+    }
+    if (bypassUris(route).length > 0) {
+      io.out(`  Access ${publicAppName(box, route)} (bypass): ${bypassUris(route).join(", ")}${have.publicApp === undefined ? "  [missing]" : ""}`);
     }
     // The same checks sync makes, so a plan that looks fine never ends in a refused sync.
     for (const c of await checkExternalAccess(ctx, route, have)) {

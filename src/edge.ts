@@ -1,5 +1,5 @@
 import { BYPASS_POLICY_NAME, DNS_COMMENT_PREFIX, NAME_PREFIX, isOurBypassPolicy, isOurEmailPolicy, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel, type IngressSpec } from "./cloudflare.ts";
-import { accessUri, boxIngress, bypassPaths, frostyProtected, inZones, isRouteAppOf, publicAppName, routeAppName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
+import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, isRouteAppOf, protectedUris, publicAppName, routeAppName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
 import { runOrFail, type SshTarget } from "./box.ts";
 import { sshHostname, type Context } from "./context.ts";
 import { FrostyError } from "./errors.ts";
@@ -53,7 +53,7 @@ export function routeAuds(r: RouteApps): Record<string, string[]> | undefined {
     }
     auds[prefix] = [app.aud];
   }
-  if (bypassPaths(r.route).length > 0 && r.publicApp === undefined) {
+  if (bypassUris(r.route).length > 0 && r.publicApp === undefined) {
     return undefined;
   }
   return auds;
@@ -175,18 +175,18 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
       io.out(`Access app ${c.name} (not frosty's) covers ${c.uri} and lets in ${describeIncludes(c.app!)}.`);
     }
     if (frostyProtected(route).length > 0) {
-      const want = frostyProtected(route).map((p) => accessUri(route.hostname, p));
+      const want = protectedUris(route);
       if (have.app === undefined || !appMatches(await cloudflare.getAccessApp(config.accountId, have.app.id), want, [(emailPolicy as CfAccessPolicy).id])) {
         io.out(`${have.app === undefined ? "Creating" : "Updating"} Access application ${routeAppName(box, route)} for ${want.join(", ")}.`);
         await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "protected", policyIds: [(emailPolicy as CfAccessPolicy).id] }, have.app?.id);
       }
     }
-    if (bypassPaths(route).length > 0) {
+    if (bypassUris(route).length > 0) {
       if (bypass === undefined) {
         io.out(`Creating Access policy ${BYPASS_POLICY_NAME} (for public paths under a protected prefix only).`);
         bypass = await cloudflare.createBypassPolicy(config.accountId);
       }
-      const want = bypassPaths(route).map((p) => accessUri(route.hostname, p));
+      const want = bypassUris(route);
       if (have.publicApp === undefined || !appMatches(await cloudflare.getAccessApp(config.accountId, have.publicApp.id), want, [bypass.id])) {
         io.out(`${have.publicApp === undefined ? "Creating" : "Updating"} Access application ${publicAppName(box, route)} (bypass) for ${want.join(", ")}.`);
         await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "public", policyIds: [bypass.id] }, have.publicApp?.id);
@@ -194,7 +194,7 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
     }
   }
   await ensureIngress(ctx, box, tunnel);
-  const wanted = new Set(routes.flatMap((r) => [...(frostyProtected(r).length > 0 ? [routeAppName(box, r)] : []), ...(bypassPaths(r).length > 0 ? [publicAppName(box, r)] : [])]));
+  const wanted = new Set(routes.flatMap((r) => [...(frostyProtected(r).length > 0 ? [routeAppName(box, r)] : []), ...(bypassUris(r).length > 0 ? [publicAppName(box, r)] : [])]));
   for (const app of apps.filter((a) => isRouteAppOf(box, a.name) && !wanted.has(a.name))) {
     io.out(`Deleting Access application ${app.name}: its route is no longer in config.`);
     await cloudflare.deleteAccessApp(config.accountId, app);

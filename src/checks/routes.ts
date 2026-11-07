@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { BYPASS_POLICY_NAME, isOurBypassPolicy, isOurEmailPolicy, type CfAccessApp, type CfAccessPolicy } from "../cloudflare.ts";
 import { appCovers, appMatches, describeIncludes, externalPolicyProblems, routeApps } from "../edge.ts";
-import { ROOT, accessUri, isUnder, bypassPaths, frostyProtected, publicAppName, routeAppName, servicePort, type Route } from "../routes.ts";
+import { ROOT, accessUri, isUnder, bypassUris, exactPaths, frostyProtected, protectedUris, publicAppName, routeAppName, servicePort, type Route } from "../routes.ts";
 import type { RawGet, RawResponse } from "../rawget.ts";
 import { parseSs, type Listener } from "./listeners.ts";
 import { fail, pass, type CheckResult } from "./types.ts";
@@ -93,6 +93,16 @@ export async function checkRouteOutside(get: RawGet, route: Route, team: string)
   for (const p of [`/${rand}`, "/install", `${(route.protected[0] ?? route.public[0] ?? "/x").replace(/\/$/, "") || "/x"}${rand}`]) {
     await expect(p, ...notListed);
   }
+  // An exact public path reaches the app through the tunnel (any answer from the app: it may well say
+  // 401 without its own token), and nothing under or next to it does. Those get the login, or
+  // cloudflared's own 403 when the edge lets them by (Access's path match is a prefix): both stop
+  // short of the app.
+  for (const e of exactPaths(route)) {
+    await expect(e, ["origin"], "public, exact path");
+    for (const near of [`${e}/`, `${e}/${rand}`, `${e}${rand}`, e.toUpperCase()]) {
+      await expect(near, ["access", "tunnel-403"], `only ${e} itself is public`);
+    }
+  }
   for (const p of route.public) {
     const path = p.endsWith("/") ? `${p}${rand}` : p;
     const got = await ask(path);
@@ -125,7 +135,7 @@ export function checkRouteAccess(box: string, route: Route, apps: CfAccessApp[],
   const bypass = policies.find((p) => p.name === BYPASS_POLICY_NAME);
   const prot = frostyProtected(route);
   if (prot.length > 0) {
-    const want = prot.map((p) => accessUri(route.hostname, p));
+    const want = protectedUris(route);
     if (have.app === undefined || emailPolicy === undefined || !isOurEmailPolicy(emailPolicy) || !appMatches(have.app, want, [emailPolicy.id])) {
       problems.push(`${routeAppName(box, route)} should cover exactly ${want.join(", ")} with only frosty's email policy`);
     }
@@ -133,9 +143,9 @@ export function checkRouteAccess(box: string, route: Route, apps: CfAccessApp[],
     problems.push(`${routeAppName(box, route)} exists but covers nothing`);
   }
   const externals: string[] = [];
-  const bp = bypassPaths(route);
+  const bp = bypassUris(route);
   if (bp.length > 0) {
-    const want = bp.map((p) => accessUri(route.hostname, p));
+    const want = bp;
     if (have.publicApp === undefined || bypass === undefined || !isOurBypassPolicy(bypass) || !appMatches(have.publicApp, want, [bypass.id])) {
       problems.push(`${publicAppName(box, route)} should cover exactly ${want.join(", ")} with only ${BYPASS_POLICY_NAME}`);
     }

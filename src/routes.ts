@@ -5,6 +5,8 @@
 // ingress is generated from that list and is itself an allowlist: unlisted paths, and any path with
 // `..`, `//`, a backslash, `;` or `%`, get the tunnel's 404 and never reach the app. Protected rules
 // also make cloudflared check the Access token itself, so a mistake at the edge can't open them.
+// `publicExact` opens single paths inside a protected prefix, and nothing under or next to them: a
+// public /api/feed leaves /api/feed/x, /api/feed/ and /api/feedx behind Access (exactUris).
 // Pure: no I/O.
 
 export interface Route {
@@ -13,6 +15,8 @@ export interface Route {
   service: string;
   protected: string[];
   public: string[];
+  // Exact public paths: each opens that one path, inside a protected prefix of frosty's own app.
+  publicExact?: string[];
   // Protected prefixes covered by an Access app frosty doesn't own (read-only), by app name.
   externalAccess?: Record<string, string>;
   // A public path that must answer 200 from the app, so verify can tell the app from the tunnel's 404.
@@ -69,6 +73,30 @@ export function frostyProtected(route: Route): string[] {
   return route.protected.filter((p) => route.externalAccess?.[p] === undefined);
 }
 
+export function exactPaths(route: Route): string[] {
+  return route.publicExact ?? [];
+}
+
+// An exact path matches itself only: no subpaths, no trailing slash, case-sensitive.
+export function exactRegex(path: string): string {
+  return `^${path.replace(/[.*+?^${}()|[\]\\/-]/g, "\\$&")}$`;
+}
+
+// The Access destinations of frosty's own app: each protected prefix, plus "<exact path>/*" for each
+// exact public path. Access matches a destination's path and everything under it, so the bypass for an
+// exact path also covers its subpaths; the more specific "/*" destination takes them back.
+export function protectedUris(route: Route): string[] {
+  return [
+    ...frostyProtected(route).map((p) => accessUri(route.hostname, p)),
+    ...exactPaths(route).map((e) => `${accessUri(route.hostname, e)}/*`),
+  ];
+}
+
+// The bypass app's destinations: public prefixes inside protected ones, and the exact public paths.
+export function bypassUris(route: Route): string[] {
+  return [...bypassPaths(route), ...exactPaths(route)].map((p) => accessUri(route.hostname, p));
+}
+
 // stayfrosty-<box>:<route> and stayfrosty-<box>:<route>:public. The colon can't be in a box name,
 // so a route app is never mistaken for another box's app (box "web1-x" vs route "x" of "web1").
 export function routeAppName(box: string, route: Pick<Route, "name">): string {
@@ -111,7 +139,7 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
       continue;
     }
     const r = raw as Record<string, unknown>;
-    const extra = Object.keys(r).filter((k) => !["name", "hostname", "service", "protected", "public", "externalAccess", "probe"].includes(k));
+    const extra = Object.keys(r).filter((k) => !["name", "hostname", "service", "protected", "public", "publicExact", "externalAccess", "probe"].includes(k));
     if (extra.length > 0) {
       problems.push(`${where} has unknown keys: ${extra.join(", ")}`);
     }
@@ -161,6 +189,29 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
         }
       }
     }
+    const exactRaw = r["publicExact"];
+    let exact: string[] = [];
+    if (exactRaw !== undefined) {
+      if (!Array.isArray(exactRaw) || exactRaw.some((p) => !isPrefix(p) || p === ROOT || p.endsWith("/") || /\/\//.test(p))) {
+        problems.push(`${where}.publicExact must be a list of exact paths like /api/feed (no trailing slash, not "/")`);
+      } else {
+        exact = exactRaw as string[];
+      }
+    }
+    const externalMap = r["externalAccess"] !== null && typeof r["externalAccess"] === "object" && !Array.isArray(r["externalAccess"]) ? (r["externalAccess"] as Record<string, unknown>) : {};
+    for (const e of exact) {
+      if (exact.filter((x) => x === e).length > 1 || prot.includes(e) || pub.includes(e)) {
+        problems.push(`${where} lists ${e} twice`);
+        continue;
+      }
+      // It must sit inside a protected prefix of frosty's own app (which gets "<e>/*"), and no public
+      // prefix may cover it already (that would make it public with its subpaths).
+      if (!prot.some((q) => isUnder(e, q) && externalMap[q] === undefined)) {
+        problems.push(`${where}.publicExact ${e} must be under a protected path of frosty's own Access app`);
+      } else if (pub.some((p) => p !== ROOT && isUnder(e, p))) {
+        problems.push(`${where}.publicExact ${e} is under public ${pub.find((p) => p !== ROOT && isUnder(e, p))}, which already makes it and its subpaths public`);
+      }
+    }
     const external = r["externalAccess"];
     if (external !== undefined) {
       if (external === null || typeof external !== "object" || Array.isArray(external)) {
@@ -183,7 +234,7 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
       }
     }
     const probe = r["probe"];
-    if (probe !== undefined && (typeof probe !== "string" || !isPrefix(probe) || !pub.some((p) => isUnder(probe, p) && !prot.some((q) => isUnder(probe, q))))) {
+    if (probe !== undefined && (typeof probe !== "string" || !isPrefix(probe) || !(exact.includes(probe) || pub.some((p) => isUnder(probe, p) && !prot.some((q) => isUnder(probe, q)))))) {
       problems.push(`${where}.probe must be a path under a public prefix that isn't protected`);
     }
   }
@@ -223,14 +274,16 @@ function bySpecificity(a: string, b: string): number {
   return b.length - a.length;
 }
 
-// One route's rules: the trick-path 404, then every listed prefix by specificity (protected ones with
-// cloudflared's own Access check), then a 404 for everything else on the host.
+// One route's rules: the trick-path 404, the exact public paths (each matches one path, so order among
+// them doesn't matter), then every listed prefix by specificity (protected ones with cloudflared's own
+// Access check), then a 404 for everything else on the host.
 export function routeIngress(route: Route, teamName: string, audFor: (prefix: string) => string[]): IngressRule[] {
   const { hostname, service } = route;
   const listed = [...route.public.map((p) => ({ p, protect: false })), ...route.protected.map((p) => ({ p, protect: true }))];
   const ordered = listed.map((x, i) => ({ ...x, i })).sort((a, b) => bySpecificity(a.p, b.p) || a.i - b.i);
   return [
     { hostname, path: SUSPICIOUS_PATH, service: "http_status:404" },
+    ...exactPaths(route).map((e): IngressRule => ({ hostname, path: exactRegex(e), service })),
     ...ordered.map(({ p, protect }): IngressRule => (protect
       ? { hostname, path: prefixRegex(p, { caseInsensitive: true }), service, originRequest: { access: { required: true as const, teamName, audTag: audFor(p) } } }
       : { hostname, path: prefixRegex(p), service })),
