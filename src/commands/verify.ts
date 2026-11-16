@@ -4,6 +4,10 @@ import { FrostyError } from "../errors.ts";
 import { LABEL_BOX, MANAGED_SELECTOR, boxSelector } from "../hetzner.ts";
 import { checkBox, printResults } from "./new.ts";
 
+// verify --all's exit code when every box it could check passed, but a provider was skipped
+// (its token isn't set). 1 still means a check failed.
+export const VERIFY_SKIPPED = 3;
+
 export interface VerifyOptions {
   box: string | undefined;
   all: boolean;
@@ -50,5 +54,6 @@ export async function runVerify(deps: Deps, opts: VerifyOptions): Promise<number
     return 1;
   }
   ctx.io.out(`All checks passed on ${servers.length} box(es)${ctx.skipped.length === 0 ? "" : `; ${ctx.skipped.map((p) => p.label).join(" and ")} boxes were skipped, not checked`}.`);
-  return 0;
+  // A run that couldn't check every box is not a pass: a cron that lost a token must not go green.
+  return ctx.skipped.length === 0 || box !== undefined ? 0 : VERIFY_SKIPPED;
 }

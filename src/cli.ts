@@ -22,7 +22,8 @@ Usage:
   frosty init                         write config, check tokens (creates nothing)
   frosty new <box> [--type T] [--location L] [--resume]
   frosty adopt <box> --ip <ip> [--user U] (--host-key SHA256:... | --trust-first-use) [--resume]
-  frosty verify (<box> | --all)       check a box again, through the tunnel (changes nothing)
+  frosty verify (<box> | --all)       check a box again, through the tunnel (changes nothing);
+                                      exit 1 if a check failed, 3 if --all skipped a provider
   frosty detach-foreign <box>         detach other firewalls from an adopted box (keeps frosty's)
   frosty route (plan | sync) <box>    web apps through the box's tunnel (config: routes)
   frosty ssh-users (plan | sync) <box>  forced-command-only SSH users (config: restrictedUsers)

@@ -309,7 +309,8 @@ describe("DigitalOcean boxes", () => {
       expect(io.text()).toMatch(/mon1 +running/);
       expect(io.text()).not.toContain("Leftovers");
       const v = new ScriptedIo();
-      expect(await runVerify(deps(v), { box: undefined, all: true }), v.text()).toBe(0);
+      // Not a pass: some boxes couldn't be checked.
+      expect(await runVerify(deps(v), { box: undefined, all: true }), v.text()).toBe(3);
       expect(v.text()).toContain("Skipped Hetzner boxes (HCLOUD_TOKEN is not set)");
       expect(v.text()).toContain("All checks passed on 1 box(es); Hetzner boxes were skipped, not checked.");
       expect(v.text()).not.toContain("web1:");
