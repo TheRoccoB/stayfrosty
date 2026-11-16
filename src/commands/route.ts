@@ -1,7 +1,9 @@
 import { assertBoxName, buildContext, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { boxRoutes, checkExternalAccess, describeIncludes, findEdge, routeApps, routeAuds, syncRoutes } from "../edge.ts";
-import { bypassUris, exactPaths, frostyProtected, protectedUris, publicAppName, routeAppName } from "../routes.ts";
+import { tokenExpiry } from "../checks/edge.ts";
+import { bypassUris, exactPaths, frostyProtected, isRouteTokenPolicyOf, protectedUris, publicAppName, routeAppName, routeServiceTokens, routeTokenPolicyName } from "../routes.ts";
+import { planRouteTokens } from "../servicetokens.ts";
 
 export interface RouteOptions {
   action: string | undefined;
@@ -27,12 +29,19 @@ export async function runRoute(deps: Deps, opts: RouteOptions): Promise<number> 
   if (opts.action === "sync") {
     await syncRoutes(ctx, box, edge.tunnel);
   }
-  const apps = await cloudflare.listAccessApps(config.accountId);
+  const [apps, policies] = await Promise.all([cloudflare.listAccessApps(config.accountId), cloudflare.listAccessPolicies(config.accountId)]);
+  // Token policies no route wants: sync deletes them.
+  const wantedPolicies = new Set(routes.filter((r) => routeServiceTokens(r).length > 0).map((r) => routeTokenPolicyName(box, r)));
+  const stray = policies.filter((p) => isRouteTokenPolicyOf(box, p.name) && !wantedPolicies.has(p.name));
+  for (const p of stray) {
+    io.out(`Access policy ${p.name}: no route lists service tokens for it${opts.action === "sync" ? "" : "; sync deletes it"}.`);
+  }
   if (routes.length === 0) {
     io.out(`${box} has no routes in config.${opts.action === "sync" ? " Its tunnel carries SSH only." : ""}`);
     return 0;
   }
   let problems = 0;
+  let tokenProblems = 0;
   for (const route of routes) {
     const have = routeApps(apps, box, route);
     io.out(`${route.name}: ${route.hostname} -> ${route.service}`);
@@ -43,6 +52,19 @@ export async function runRoute(deps: Deps, opts: RouteOptions): Promise<number> 
     }
     if (frostyProtected(route).length > 0) {
       io.out(`  Access ${routeAppName(box, route)} (your emails): ${protectedUris(route).join(", ")}${have.app === undefined ? "  [missing]" : ""}`);
+    }
+    // The same checks sync makes before any write, so a plan that looks fine never ends in a refused sync.
+    const plan = await planRouteTokens(ctx, box, route, have.app?.id, policies.find((p) => p.name === routeTokenPolicyName(box, route)), false);
+    if (plan !== undefined) {
+      io.out(`  Access ${plan.policyName} (service tokens, on ${routeAppName(box, route)}): ${plan.names.join(", ")}${plan.policy === undefined ? "  [missing]" : ""}`);
+      for (const t of plan.tokens) {
+        const e = tokenExpiry(t.token, plan.now);
+        io.out(`    service token ${t.name}: ${e.text}${e.expired ? "  [EXPIRED: refresh or rotate it in the Cloudflare dashboard]" : e.soon ? "  [expires within 30 days]" : ""}`);
+      }
+      for (const problem of [...plan.problems, ...plan.elsewhere.map((w) => `a token of this route also opens: ${w}`)]) {
+        tokenProblems++;
+        io.out(`    [problem: ${problem}]`);
+      }
     }
     if (bypassUris(route).length > 0) {
       io.out(`  Access ${publicAppName(box, route)} (bypass): ${bypassUris(route).join(", ")}${have.publicApp === undefined ? "  [missing]" : ""}`);
@@ -60,8 +82,13 @@ export async function runRoute(deps: Deps, opts: RouteOptions): Promise<number> 
     io.out(`  DNS (add it outside frosty): ${route.hostname} CNAME ${edge.tunnel.id}.cfargotunnel.com, proxied, comment "stayfrosty route ${box} ${route.name}"`);
   }
   io.out("");
+  if (tokenProblems > 0) {
+    io.out(`${tokenProblems} service token problem(s) above: sync would refuse. A service token opens exactly one box or route, and must exist under exactly that name.`);
+  }
   if (problems > 0) {
     io.out(`${problems} externalAccess problem(s) above: sync would refuse. frosty doesn't change those apps; fix them in the Cloudflare dashboard, or take the paths out of externalAccess.`);
+  }
+  if (problems > 0 || tokenProblems > 0) {
     return 1;
   }
   io.out(`Then check it: frosty verify ${box}`);

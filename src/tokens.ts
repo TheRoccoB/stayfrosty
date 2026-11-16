@@ -22,9 +22,10 @@ export const TOKEN_HELP = `Tokens are read from the environment, never from the 
       Account  Cloudflare Tunnel           Edit
       Account  Access: Apps and Policies   Edit
       Account  Notifications               Edit
-      Account  Access: Service Tokens      Read   (only with serviceTokens)
+      Account  Access: Service Tokens      Read   (only with serviceTokens,
+                                                   on a box or a route)
       Account  Access: Organizations, Identity Providers, and Groups
-                                           Read   (only with serviceTokens)
+                                           Read   (same)
       Zone     DNS                         Edit
       Zone     Zone                        Read
     Cloudflare is renaming "Edit" to "Write"; either name is the same permission.
