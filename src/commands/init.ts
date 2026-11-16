@@ -212,6 +212,16 @@ export async function runInit(deps: InitDeps): Promise<number> {
   if (previous?.cloudflareChangeLog !== undefined) {
     config.cloudflareChangeLog = previous.cloudflareChangeLog;
   }
+  // DigitalOcean boxes are set up by editing the config (README); init only asks about Hetzner.
+  if (previous?.boxProviders !== undefined) {
+    config.boxProviders = previous.boxProviders;
+  }
+  if (previous?.digitalocean !== undefined) {
+    config.digitalocean = previous.digitalocean;
+  }
+  if (previous?.digitaloceanChangeLog !== undefined) {
+    config.digitaloceanChangeLog = previous.digitaloceanChangeLog;
+  }
 
   const keys = await hetzner.listSshKeys();
   const keyBody = publicKey.split(/\s+/).slice(0, 2).join(" ");

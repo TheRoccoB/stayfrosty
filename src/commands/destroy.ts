@@ -1,9 +1,10 @@
 import { hostKeyAlias } from "../box.ts";
-import { assertBoxName, buildContext, type Deps } from "../context.ts";
+import { assertBoxName, buildContext, providerFor, type Deps } from "../context.ts";
 import { describeEdge, edgeIsEmpty, findEdge, removeEdge, removeTunnel } from "../edge.ts";
 import { ApiError, FrostyError } from "../errors.ts";
 import { boxSelector, isUntouchable } from "../hetzner.ts";
 import { tildify, writeSshConfig } from "../sshconfig.ts";
+import type { FirewallId } from "../provider.ts";
 import { sshConfigEntries } from "./new.ts";
 
 export interface DestroyOptions {
@@ -11,13 +12,14 @@ export interface DestroyOptions {
   dryRun: boolean;
 }
 
-// Deletes everything frosty created for one box: found by label in Hetzner and by name in
-// Cloudflare. Never anything else.
+// Deletes everything frosty created for one box: found by label (tag) at its provider and by name
+// in Cloudflare. Never anything else.
 export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<number> {
   const box = assertBoxName(opts.box);
   const ctx = await buildContext(deps);
-  const { io, hetzner } = ctx;
-  const [servers, firewalls, edge] = await Promise.all([hetzner.listServers(boxSelector(box)), hetzner.listFirewalls(boxSelector(box)), findEdge(ctx, box)]);
+  const { io } = ctx;
+  const provider = providerFor(ctx, box);
+  const [servers, firewalls, edge] = await Promise.all([provider.listServers(boxSelector(box)), provider.listFirewalls(boxSelector(box)), findEdge(ctx, box)]);
   if (servers.length === 0 && firewalls.length === 0 && edgeIsEmpty(edge)) {
     io.out(`frosty has nothing named ${box}. Nothing to destroy. See what exists with: frosty ls`);
     return 0;
@@ -27,21 +29,21 @@ export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<numb
   // its whole setup.
   // The servers its firewalls are attached to count too: labels can be removed by hand.
   const attachedIds = firewalls.flatMap((f) => f.applied_to.flatMap((a) => (a.type === "server" && a.server !== undefined ? [a.server.id] : [])));
-  const attached = await Promise.all(attachedIds.filter((id) => !servers.some((s) => s.id === id)).map((id) => hetzner.getServer(id)));
+  const attached = await Promise.all(attachedIds.filter((id) => !servers.some((s) => s.id === id)).map((id) => provider.getServer(id)));
   const adopted = [...servers, ...attached].filter((s) => isUntouchable(s));
   if (adopted.length > 0) {
     throw new FrostyError(
       `${box} is an adopted or delete/rebuild protected server. frosty never deletes a server it did not create, or one you protected.`,
-      "Delete it yourself in the Hetzner Cloud Console if you really mean to (turn off its protection first).",
+      provider.kind === "hetzner" ? "Delete it yourself in the Hetzner Cloud Console if you really mean to (turn off its protection first)." : `Delete it yourself in ${provider.consoleName} if you really mean to.`,
     );
   }
 
   io.out(`${opts.dryRun ? "Would delete" : "This deletes"}, permanently:`);
   for (const server of servers) {
-    io.out(`  Hetzner server ${server.name} (id ${server.id}, ${server.public_net.ipv4?.ip ?? "no IPv4"}) and its disk`);
+    io.out(`  ${provider.label} server ${server.name} (id ${server.id}, ${server.public_net.ipv4?.ip ?? "no IPv4"}) and its disk`);
   }
   for (const firewall of firewalls) {
-    io.out(`  Hetzner firewall ${firewall.name} (id ${firewall.id})`);
+    io.out(`  ${provider.label} firewall ${firewall.name} (id ${firewall.id})`);
   }
   for (const line of describeEdge(edge)) {
     io.out(`  ${line}`);
@@ -60,12 +62,12 @@ export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<numb
   await removeEdge(ctx, edge);
   for (const server of servers) {
     io.out(`Deleting server ${server.name}.`);
-    await hetzner.waitForAction(await hetzner.deleteServer(server.id));
+    await provider.waitForAction(await provider.deleteServer(server.id));
   }
   await ctx.forgetHost(hostKeyAlias(box));
   for (const firewall of firewalls) {
     io.out(`Deleting firewall ${firewall.name}.`);
-    await deleteFirewallWhenFree(ctx.hetzner, firewall.id, ctx.sleep, ctx.now);
+    await deleteFirewallWhenFree(provider, firewall.id, ctx.sleep, ctx.now);
   }
   // The connector is gone with the server; now the tunnel can go.
   await removeTunnel(ctx, edge);
@@ -75,9 +77,9 @@ export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<numb
     io.out(`Removed ${box} from ${tildify(written.path, ctx.env)}.`);
   }
 
-  const [leftServers, leftFirewalls, leftEdge] = await Promise.all([hetzner.listServers(boxSelector(box)), hetzner.listFirewalls(boxSelector(box)), findEdge(ctx, box)]);
+  const [leftServers, leftFirewalls, leftEdge] = await Promise.all([provider.listServers(boxSelector(box)), provider.listFirewalls(boxSelector(box)), findEdge(ctx, box)]);
   if (leftServers.length > 0 || leftFirewalls.length > 0 || !edgeIsEmpty(leftEdge)) {
-    throw new FrostyError(`Some of ${box} is still there after deleting: ${describeEdge(leftEdge).join(", ") || "Hetzner resources"}.`, `Run frosty destroy ${box} again, then: frosty ls`);
+    throw new FrostyError(`Some of ${box} is still there after deleting: ${describeEdge(leftEdge).join(", ") || `${provider.label} resources`}.`, `Run frosty destroy ${box} again, then: frosty ls`);
   }
   io.out(`Box ${box} is gone. Check with: frosty ls`);
   return 0;
@@ -85,15 +87,15 @@ export async function runDestroy(deps: Deps, opts: DestroyOptions): Promise<numb
 
 // A firewall stays "in use" for a moment after its server is deleted.
 async function deleteFirewallWhenFree(
-  hetzner: { deleteFirewall(id: number): Promise<void> },
-  id: number,
+  provider: { deleteFirewall(id: FirewallId): Promise<void> },
+  id: FirewallId,
   sleep: (ms: number) => Promise<void>,
   now: () => number,
 ): Promise<void> {
   const deadline = now() + 120_000;
   for (;;) {
     try {
-      await hetzner.deleteFirewall(id);
+      await provider.deleteFirewall(id);
       return;
     } catch (error) {
       if (error instanceof ApiError && error.code === "resource_in_use" && now() < deadline) {

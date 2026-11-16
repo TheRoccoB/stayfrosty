@@ -4,7 +4,7 @@ import { isIPv4 } from "node:net";
 import { hardenScript, parseCloudInit, userScript } from "../adoptscript.ts";
 import { FRESH_CONNECTION, hostKeyAlias, knownHostsPath, runOrFail, waitForSsh, type ScannedKey, type SshTarget } from "../box.ts";
 import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
-import { rebootTimeFor } from "../config.ts";
+import { providerKindFor, rebootTimeFor } from "../config.ts";
 import { assertBoxName, buildContext, requireCloudflared, type Context, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { LABEL_ADOPTED, LABEL_BOX, LABEL_MANAGED, LABEL_WINDOW_OPENED, boxLabels, boxSelector, type HzFirewall, type HzServer } from "../hetzner.ts";
@@ -46,6 +46,14 @@ export async function runAdopt(deps: Deps, opts: AdoptOptions): Promise<number> 
   const ip = opts.ip;
   const ctx = await buildContext(deps);
   const { io, hetzner, config } = ctx;
+  // A droplet has no delete or rebuild protection, so nothing would keep a server that can't be
+  // recreated safe from a click in the control panel. frosty adopts Hetzner servers only.
+  if (providerKindFor(config, box) !== "hetzner") {
+    throw new FrostyError(
+      `frosty adopt works on Hetzner servers only, and ${box} is on ${providerKindFor(config, box)} in boxProviders.`,
+      "DigitalOcean has no delete or rebuild protection to keep an adopted server safe. Create a new box with: frosty new <box>",
+    );
+  }
 
   // 1. Preflight, all reads.
   requireCloudflared(ctx);

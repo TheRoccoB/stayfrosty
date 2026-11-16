@@ -1,6 +1,7 @@
 import { ApiError, FrostyError } from "./errors.ts";
 import { logDone, summarize, type ChangeLog } from "./changelog.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
+import type { Provider } from "./provider.ts";
 import { redact } from "./redact.ts";
 
 export const HETZNER_BASE_URL = "https://api.hetzner.cloud/v1";
@@ -106,7 +107,12 @@ export interface HzSshKey {
 const READ_ONLY_HINT =
   "The Hetzner token looks read-only. Create a Read & Write token in the Hetzner Cloud Console (Security, API tokens) and set HCLOUD_TOKEN to it.";
 
-export class Hetzner {
+export class Hetzner implements Provider {
+  readonly kind = "hetzner" as const;
+  readonly label = "Hetzner";
+  readonly consoleName = "the Hetzner Cloud Console";
+  readonly accountName = "Hetzner project";
+  readonly webConsoleName = "Hetzner web console";
   private readonly token: string;
   private readonly fetchImpl: Fetch;
   private readonly sleep: Sleep;
@@ -184,6 +190,14 @@ export class Hetzner {
 
   listFirewalls(labelSelector?: string): Promise<HzFirewall[]> {
     return this.listAll<HzFirewall>("/firewalls", "firewalls", { label_selector: labelSelector });
+  }
+
+  serversNamed(name: string): Promise<HzServer[]> {
+    return this.listAll<HzServer>("/servers", "servers", { name });
+  }
+
+  firewallsNamed(name: string): Promise<HzFirewall[]> {
+    return this.listAll<HzFirewall>("/firewalls", "firewalls", { name });
   }
 
   listLocations(): Promise<HzLocation[]> {
@@ -396,12 +410,12 @@ export function boxSelector(box: string): string {
   return `${MANAGED_SELECTOR},${LABEL_BOX}=${box}`;
 }
 
-export function serverLocation(server: HzServer): string {
+export function serverLocation(server: Pick<HzServer, "location">): string {
   return server.location?.name ?? "?";
 }
 
 // A server frosty must never delete or recreate: adopted, or protected by its owner.
-export function isUntouchable(server: HzServer): boolean {
+export function isUntouchable(server: Pick<HzServer, "labels" | "protection">): boolean {
   return server.labels[LABEL_ADOPTED] !== undefined || server.protection?.delete === true || server.protection?.rebuild === true;
 }
 

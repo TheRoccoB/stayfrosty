@@ -13,6 +13,8 @@ const PATTERNS: RegExp[] = [
   /\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi,
   // Prefixed Cloudflare API tokens (user, account, global key).
   /\bcf(?:ut|at|k)_[A-Za-z0-9_-]{40,}/g,
+  // DigitalOcean personal access and OAuth tokens.
+  /\bdo[por]_v1_[a-f0-9]{64}\b/g,
   // Cloudflare tunnel tokens are base64 JSON that starts with {"a":"
   /eyJhIjoi[A-Za-z0-9+/=_-]{20,}/g,
   // Any other JWT-shaped value.

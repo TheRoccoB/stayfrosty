@@ -5,7 +5,8 @@ import { runOnBoxChecks } from "../checks/onbox.ts";
 import type { CheckResult } from "../checks/types.ts";
 import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
 import { rebootTimeFor, restrictedUsersFor, serviceTokensFor } from "../config.ts";
-import { assertBoxName, buildContext, directTarget, requireCloudflared, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
+import { allProviders, assertBoxName, buildContext, directTarget, providerFor, requireCloudflared, serverSettings, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
+import type { Firewall, Provider, Server } from "../provider.ts";
 import { checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
 import { checkTokenNotExposed } from "../checks/token.ts";
 import { checkRouteAccess, checkRouteMissing, checkRouteOutside, checkRoutePorts } from "../checks/routes.ts";
@@ -22,9 +23,7 @@ import {
   boxLabels,
   boxSelector,
   isUntouchable,
-  type HzFirewall,
   type HzFirewallRule,
-  type HzServer,
 } from "../hetzner.ts";
 import { green, red, table } from "../io.ts";
 import { windowSource } from "../ip.ts";
@@ -59,19 +58,21 @@ export function sameRules(a: HzFirewallRule[], b: HzFirewallRule[]): boolean {
 export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   const box = assertBoxName(opts.box);
   const ctx = await buildContext(deps);
-  const { io, hetzner, config } = ctx;
-  const serverType = opts.serverType ?? config.serverType;
-  const location = opts.location ?? config.location;
+  const { io, config } = ctx;
+  const provider = providerFor(ctx, box);
+  const settings = serverSettings(config, box);
+  const serverType = opts.serverType ?? settings.serverType;
+  const location = opts.location ?? settings.location;
 
   // 1. Preflight.
   requireCloudflared(ctx);
   const userData = renderCloudInit(loadTemplate(), { adminUser: config.adminUser, sshPublicKey: ctx.publicKey, rebootTime: rebootTimeFor(config, box) });
   const laptop = await ctx.laptopIp();
   const source = windowSource(laptop);
-  const [servers, firewalls] = await Promise.all([hetzner.listServers(boxSelector(box)), hetzner.listFirewalls(boxSelector(box))]);
+  const [servers, firewalls] = await Promise.all([provider.listServers(boxSelector(box)), provider.listFirewalls(boxSelector(box))]);
   let server = servers[0];
   let firewall = firewalls[0];
-  await refuseForeign(ctx, box, server, firewall);
+  await refuseForeign(provider, box, server, firewall);
   if (server !== undefined && isUntouchable(server)) {
     throw new FrostyError(`${box} is an adopted or protected server, which frosty new never touches.`, `Re-apply its setup with: frosty adopt ${box} --ip ${server.public_net.ipv4?.ip ?? "<ip>"} --resume`);
   }
@@ -82,9 +83,9 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
     );
   }
 
-  io.out(`${opts.dryRun ? "Would create" : "Creating"} box ${box}: ${serverType} in ${location}, ${config.image}, admin user ${config.adminUser}.`);
-  io.out(`  Hetzner firewall ${firewallName(box)}: ${firewall === undefined ? "create" : "keep"}, inbound only TCP 22 from this laptop (${source.cidr}).`);
-  io.out(`  Hetzner server ${box}: ${server === undefined ? "create with the firewall attached and cloud-init.yaml as user data" : `keep (${server.status})`}.`);
+  io.out(`${opts.dryRun ? "Would create" : "Creating"} box ${box}: ${serverType} in ${location}, ${settings.image}, admin user ${config.adminUser}.`);
+  io.out(`  ${provider.label} firewall ${firewallName(box)}: ${firewall === undefined ? "create" : "keep"}, inbound only TCP 22 from this laptop (${source.cidr}).`);
+  io.out(`  ${provider.label} server ${box}: ${server === undefined ? "create with the firewall attached and cloud-init.yaml as user data" : `keep (${server.status})`}.`);
   io.out("  Then wait for cloud-init and set the console password.");
   io.out(`  Cloudflare: tunnel ${firewallName(box)}, proxied CNAME ssh-${box}.${config.domain}, Access app and policy for ${config.accessEmails.join(", ")}, tunnel alert to ${config.alertEmail}.`);
   io.out(`  ~/.ssh/stayfrosty.conf gets a "Host ${box}" block, then the window closes and everything is checked through the tunnel.`);
@@ -94,50 +95,50 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   }
 
   // The public key is uploaded once and shared by every box.
-  const sshKeyId = await ensureSshKey(ctx);
+  const sshKeyId = await ensureSshKey(ctx, provider);
 
   // 2. Box firewall with only the window, before the server exists.
   const rules = [windowRule(source.cidr)];
   const windowLabels = boxLabels(box, { [LABEL_WINDOW_OPENED]: String(Math.floor(ctx.now() / 1000)) });
   if (firewall === undefined) {
     io.out(`Creating firewall ${firewallName(box)}.`);
-    const created = await hetzner.createFirewall(firewallName(box), windowLabels, rules);
+    const created = await provider.createFirewall(firewallName(box), windowLabels, rules);
     for (const action of created.actions) {
-      await hetzner.waitForAction(action);
+      await provider.waitForAction(action);
     }
     firewall = created.firewall;
   } else if (!sameRules(firewall.rules, rules)) {
     io.out(`Setting firewall ${firewall.name} to admit only ${source.cidr} on TCP 22.`);
-    for (const action of await hetzner.setFirewallRules(firewall.id, rules)) {
-      await hetzner.waitForAction(action);
+    for (const action of await provider.setFirewallRules(firewall.id, rules)) {
+      await provider.waitForAction(action);
     }
-    await hetzner.updateFirewallLabels(firewall.id, { ...firewall.labels, ...windowLabels });
+    await provider.updateFirewallLabels(firewall.id, { ...firewall.labels, ...windowLabels });
   }
 
   // 3. Server, with the firewall attached at creation.
   if (server === undefined) {
     io.out(`Creating server ${box}.`);
-    const created = await hetzner.createServer({
+    const created = await provider.createServer({
       name: box,
       serverType,
-      image: config.image,
+      image: settings.image,
       location,
       sshKeyIds: [sshKeyId],
       userData,
       labels: boxLabels(box),
       firewallIds: [firewall.id],
     });
-    await hetzner.waitForAction(created.action);
+    await provider.waitForAction(created.action);
     for (const action of created.next_actions) {
-      await hetzner.waitForAction(action);
+      await provider.waitForAction(action);
     }
-    server = await hetzner.getServer(created.server.id);
+    server = await provider.getServer(created.server.id);
     // A new box has a new host key; forget the pin of any earlier box with this name.
     await ctx.forgetHost(hostKeyAlias(box));
   } else if (!(server.public_net.firewalls ?? []).some((f) => f.id === firewall.id)) {
     io.out(`Attaching firewall ${firewall.name} to ${box}.`);
-    for (const action of await hetzner.applyFirewall(firewall.id, server.id)) {
-      await hetzner.waitForAction(action);
+    for (const action of await provider.applyFirewall(firewall.id, server.id)) {
+      await provider.waitForAction(action);
     }
   }
   const target = directTarget(ctx, box, server, source.family);
@@ -147,15 +148,15 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   await waitForSsh({ ssh: ctx.ssh, target, timeoutMs: SSH_UP_TIMEOUT, sleep: ctx.sleep, now: ctx.now });
   io.out("Waiting for cloud-init to finish (it installs updates, usually a few minutes).");
   await waitForCloudInit(ctx, target);
-  await rebootIfRequired(ctx, target);
+  await rebootIfRequired(ctx, target, rebootHint(provider));
 
   return finishBox(ctx, { box, server, firewall, target, resume: opts.resume });
 }
 
 export interface FinishInput {
   box: string;
-  server: HzServer;
-  firewall: HzFirewall;
+  server: Server;
+  firewall: Firewall;
   // The box's IP during the window, as the admin user.
   target: SshTarget;
   resume: boolean;
@@ -171,7 +172,7 @@ export async function finishBox(ctx: Context, input: FinishInput): Promise<numbe
   if (opts.resume && (await hasPassword(ctx.ssh, target, config.adminUser))) {
     io.out(`Console password for ${config.adminUser} is already set; leaving it. Rotate it with: frosty console-password ${box}`);
   } else {
-    await setConsolePassword(ctx, { box, target, user: config.adminUser, passwordCommand: config.passwordCommand });
+    await setConsolePassword(ctx, { box, target, user: config.adminUser, passwordCommand: config.passwordCommand, consoleName: providerFor(ctx, box).webConsoleName });
   }
 
   // 7 to 12: tunnel, token, DNS, Access, alert, then wait until Cloudflare sees it healthy.
@@ -235,9 +236,10 @@ export async function finishBox(ctx: Context, input: FinishInput): Promise<numbe
 
   // 16. Close the window: no rules on frosty's firewall, which stays attached, so the box denies
   // all inbound. Then check the window and the firewall again.
-  await closeWindow(ctx, firewall);
+  const provider = providerFor(ctx, box);
+  await closeWindow(provider, firewall);
   io.out(`Closed the window. The box firewall now admits nothing.`);
-  const after = await windowChecks(ctx, box, await ctx.hetzner.getServer(server.id));
+  const after = await windowChecks(ctx, box, await provider.getServer(server.id));
   const results = [...before, ...after];
   printResults(ctx, results);
   const failed = results.filter((r) => !r.ok);
@@ -250,20 +252,20 @@ export async function finishBox(ctx: Context, input: FinishInput): Promise<numbe
   return 0;
 }
 
-async function closeWindow(ctx: Context, firewall: HzFirewall): Promise<void> {
-  for (const action of await ctx.hetzner.setFirewallRules(firewall.id, [])) {
-    await ctx.hetzner.waitForAction(action);
+async function closeWindow(provider: Provider, firewall: Firewall): Promise<void> {
+  for (const action of await provider.setFirewallRules(firewall.id, [])) {
+    await provider.waitForAction(action);
   }
-  const current = (await ctx.hetzner.listFirewalls(boxSelector(firewall.labels[LABEL_BOX] ?? ""))).find((f) => f.id === firewall.id) ?? firewall;
+  const current = (await provider.listFirewalls(boxSelector(firewall.labels[LABEL_BOX] ?? ""))).find((f) => f.id === firewall.id) ?? firewall;
   const labels = { ...current.labels };
   delete labels[LABEL_WINDOW_OPENED];
-  await ctx.hetzner.updateFirewallLabels(firewall.id, labels);
+  await provider.updateFirewallLabels(firewall.id, labels);
 }
 
-// One Host block per labeled server. The API is the source of truth, not the file.
+// One Host block per labeled server, on every provider. The APIs are the source of truth, not the file.
 export async function sshConfigEntries(ctx: Context): Promise<SshConfigEntry[]> {
   const cloudflared = requireCloudflared(ctx);
-  const servers = await ctx.hetzner.listServers(MANAGED_SELECTOR);
+  const servers = (await Promise.all(allProviders(ctx).map((p) => p.listServers(MANAGED_SELECTOR)))).flat();
   return servers
     .map((s) => s.labels[LABEL_BOX])
     .filter((b): b is string => b !== undefined)
@@ -279,17 +281,17 @@ export async function sshConfigEntries(ctx: Context): Promise<SshConfigEntry[]> 
 }
 
 // A server or firewall with frosty's name but without its labels belongs to someone else.
-async function refuseForeign(ctx: Context, box: string, server: HzServer | undefined, firewall: HzFirewall | undefined): Promise<void> {
+async function refuseForeign(provider: Provider, box: string, server: Server | undefined, firewall: Firewall | undefined): Promise<void> {
   if (server === undefined) {
-    const named = (await ctx.hetzner.listAll<HzServer>("/servers", "servers", { name: box }))[0];
+    const named = (await provider.serversNamed(box))[0];
     if (named !== undefined && named.labels[LABEL_MANAGED] !== "1") {
-      throw new FrostyError(`A server named ${box} already exists in this Hetzner project, and frosty did not create it.`, "Pick another box name. frosty never touches what it did not create.");
+      throw new FrostyError(`A server named ${box} already exists in this ${provider.accountName}, and frosty did not create it.`, "Pick another box name. frosty never touches what it did not create.");
     }
   }
   if (firewall === undefined) {
-    const named = (await ctx.hetzner.listAll<HzFirewall>("/firewalls", "firewalls", { name: firewallName(box) }))[0];
+    const named = (await provider.firewallsNamed(firewallName(box)))[0];
     if (named !== undefined && named.labels[LABEL_MANAGED] !== "1") {
-      throw new FrostyError(`A firewall named ${firewallName(box)} already exists, and frosty did not create it.`, "Rename or delete it in the Hetzner Cloud Console, or pick another box name.");
+      throw new FrostyError(`A firewall named ${firewallName(box)} already exists, and frosty did not create it.`, `Rename or delete it in ${provider.consoleName}, or pick another box name.`);
     }
   }
 }
@@ -298,15 +300,15 @@ function keyBody(publicKey: string): string {
   return publicKey.split(/\s+/).slice(0, 2).join(" ");
 }
 
-async function ensureSshKey(ctx: Context): Promise<number> {
+async function ensureSshKey(ctx: Context, provider: Provider): Promise<number> {
   const body = keyBody(ctx.publicKey);
-  const existing = (await ctx.hetzner.listSshKeys()).find((k) => keyBody(k.public_key) === body);
+  const existing = (await provider.listSshKeys()).find((k) => keyBody(k.public_key) === body);
   if (existing !== undefined) {
     return existing.id;
   }
   const name = `stayfrosty-${createHash("sha256").update(body).digest("hex").slice(0, 12)}`;
-  ctx.io.out(`Uploading your SSH public key to Hetzner as ${name}.`);
-  const created = await ctx.hetzner.createSshKey(name, body, { [LABEL_MANAGED]: "1" });
+  ctx.io.out(`Uploading your SSH public key to ${provider.label} as ${name}.`);
+  const created = await provider.createSshKey(name, body, { [LABEL_MANAGED]: "1" });
   return created.id;
 }
 
@@ -336,7 +338,11 @@ export function failureExcerpt(log: string, before = 25): string {
 
 // A first-boot upgrade often brings a new kernel. Reboot now rather than at the nightly window,
 // and tell the reboot apart from the old boot by its boot ID.
-export async function rebootIfRequired(ctx: Context, target: SshTarget): Promise<void> {
+export function rebootHint(provider: Provider): string {
+  return provider.kind === "hetzner" ? "Check it in the Hetzner Cloud Console (Console tab), then run the command again with --resume." : `Check it in ${provider.consoleName} (${provider.webConsoleName}), then run the command again with --resume.`;
+}
+
+export async function rebootIfRequired(ctx: Context, target: SshTarget, hint = "Check it in the Hetzner Cloud Console (Console tab), then run the command again with --resume."): Promise<void> {
   const probe = await ctx.ssh(target, "test -f /var/run/reboot-required && cat /proc/sys/kernel/random/boot_id || true", { timeoutMs: 30_000 });
   const bootId = probe.stdout.trim();
   if (bootId.length === 0) {
@@ -354,7 +360,7 @@ export async function rebootIfRequired(ctx: Context, target: SshTarget): Promise
       return;
     }
     if (ctx.now() >= deadline) {
-      throw new FrostyError("The box did not come back from its reboot within 5 minutes.", "Check it in the Hetzner Cloud Console (Console tab), then run the command again with --resume.");
+      throw new FrostyError("The box did not come back from its reboot within 5 minutes.", hint);
     }
   }
 }
@@ -362,16 +368,17 @@ export async function rebootIfRequired(ctx: Context, target: SshTarget): Promise
 // The checks of section 6 that exist so far. With `tunnel`, also the Cloudflare side and the
 // closed window; with `token`, a search of the box for the tunnel token.
 // The checks that close (or would catch an open) front door on the Hetzner side.
-async function windowChecks(ctx: Context, box: string, server: HzServer): Promise<CheckResult[]> {
-  const firewalls = await ctx.hetzner.listFirewalls(boxSelector(box));
-  return [checkWindowClosed(box, firewalls[0], ctx.now()), checkOnlyOurFirewall(box, server, firewalls[0])];
+async function windowChecks(ctx: Context, box: string, server: Server): Promise<CheckResult[]> {
+  const provider = providerFor(ctx, box);
+  const firewalls = await provider.listFirewalls(boxSelector(box));
+  return [checkWindowClosed(box, firewalls[0], ctx.now()), checkOnlyOurFirewall(box, server, firewalls[0], provider.consoleName)];
 }
 
 export async function checkBox(
   ctx: Context,
   box: string,
   target: SshTarget,
-  server: HzServer,
+  server: Server,
   opts: { tunnel: boolean; token?: string; window?: boolean },
 ): Promise<CheckResult[]> {
   const login = [await checkRootRefused(ctx.ssh, target, box), await checkOnlyPublickey(ctx.ssh, target, box)];

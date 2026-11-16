@@ -11,7 +11,9 @@ export class FrostyError extends Error {
   }
 }
 
-export type ApiName = "hetzner" | "cloudflare";
+export type ApiName = "hetzner" | "cloudflare" | "digitalocean";
+
+export const API_LABELS: Record<ApiName, string> = { hetzner: "Hetzner", cloudflare: "Cloudflare", digitalocean: "DigitalOcean" };
 
 export class ApiError extends FrostyError {
   readonly api: ApiName;
@@ -29,7 +31,7 @@ export class ApiError extends FrostyError {
     path: string;
     hint?: string | undefined;
   }) {
-    const label = opts.api === "hetzner" ? "Hetzner" : "Cloudflare";
+    const label = API_LABELS[opts.api];
     const codePart = opts.code === undefined ? "" : ` (${opts.code})`;
     super(`${label} API ${opts.method} ${opts.path} failed with HTTP ${opts.status}${codePart}: ${opts.message}`, opts.hint);
     this.name = "ApiError";

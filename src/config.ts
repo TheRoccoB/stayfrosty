@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { FrostyError } from "./errors.ts";
 import { validateRouteHostnames, validateRoutes, type Route } from "./routes.ts";
+import { PROVIDER_KINDS, type ProviderKind } from "./provider.ts";
 import { validateRestrictedUsers, type RestrictedUser } from "./sshusers.ts";
 
 export interface Config {
@@ -37,6 +38,20 @@ export interface Config {
   // Names of existing Cloudflare Access service tokens allowed into a box's SSH, by box. Applied
   // with frosty service-tokens sync. A token opens exactly one box.
   serviceTokens?: Record<string, string[]>;
+  // Boxes that live on another cloud than Hetzner, by box name. Boxes not listed are Hetzner's.
+  boxProviders?: Record<string, ProviderKind>;
+  // Settings for boxes on DigitalOcean. Needed once any box is on DigitalOcean.
+  digitalocean?: DigitalOceanSettings;
+  digitaloceanChangeLog?: string;
+}
+
+export interface DigitalOceanSettings {
+  // Slugs, e.g. "fra1", "s-1vcpu-512mb-10gb", "ubuntu-24-04-x64".
+  region: string;
+  size: string;
+  image: string;
+  // DigitalOcean's weekly droplet backups (a paid add-on).
+  backups?: boolean;
 }
 
 export const DEFAULTS = {
@@ -193,11 +208,53 @@ export function validateConfig(value: unknown): string[] {
     }
   }
   problems.push(...validateServiceTokens(c["serviceTokens"]));
-  for (const key of ["hetznerChangeLog", "cloudflareChangeLog", "boxChangeLog"]) {
+  problems.push(...validateProviders(c["boxProviders"], c["digitalocean"]));
+  for (const key of ["hetznerChangeLog", "cloudflareChangeLog", "boxChangeLog", "digitaloceanChangeLog"]) {
     const v = c[key];
     if (v !== undefined && (typeof v !== "string" || !v.startsWith("/"))) {
       problems.push(`${key} must be an absolute path`);
     }
+  }
+  return problems;
+}
+
+const SLUG = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+export function validateProviders(boxProviders: unknown, digitalocean: unknown): string[] {
+  const problems: string[] = [];
+  let usesDigitalOcean = false;
+  if (boxProviders !== undefined) {
+    if (boxProviders === null || typeof boxProviders !== "object" || Array.isArray(boxProviders)) {
+      problems.push("boxProviders must be an object of box name to a provider (hetzner or digitalocean)");
+    } else {
+      for (const [box, kind] of Object.entries(boxProviders as Record<string, unknown>)) {
+        if (!/^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$/.test(box) || typeof kind !== "string" || !(PROVIDER_KINDS as readonly string[]).includes(kind)) {
+          problems.push(`boxProviders.${box} must be a box name mapped to ${PROVIDER_KINDS.join(" or ")}`);
+        }
+        usesDigitalOcean ||= kind === "digitalocean";
+      }
+    }
+  }
+  if (digitalocean !== undefined) {
+    if (digitalocean === null || typeof digitalocean !== "object" || Array.isArray(digitalocean)) {
+      problems.push("digitalocean must be an object with region, size and image");
+    } else {
+      const d = digitalocean as Record<string, unknown>;
+      for (const key of ["region", "size", "image"]) {
+        if (typeof d[key] !== "string" || !SLUG.test(d[key] as string)) {
+          problems.push(`digitalocean.${key} must be a DigitalOcean slug, e.g. ${key === "region" ? "fra1" : key === "size" ? "s-1vcpu-512mb-10gb" : "ubuntu-24-04-x64"}`);
+        }
+      }
+      if (d["backups"] !== undefined && typeof d["backups"] !== "boolean") {
+        problems.push("digitalocean.backups must be true or false");
+      }
+      const extra = Object.keys(d).filter((k) => !["region", "size", "image", "backups"].includes(k));
+      if (extra.length > 0) {
+        problems.push(`digitalocean has unknown setting(s): ${extra.join(", ")}`);
+      }
+    }
+  } else if (usesDigitalOcean) {
+    problems.push("a box is on digitalocean in boxProviders, so the config needs a digitalocean section (region, size, image)");
   }
   return problems;
 }
@@ -295,6 +352,10 @@ export function restrictedUsersFor(config: Pick<Config, "restrictedUsers">, box:
 
 export function serviceTokensFor(config: Pick<Config, "serviceTokens">, box: string): string[] {
   return config.serviceTokens !== undefined && Object.hasOwn(config.serviceTokens, box) ? (config.serviceTokens[box] as string[]) : [];
+}
+
+export function providerKindFor(config: Pick<Config, "boxProviders">, box: string): ProviderKind {
+  return config.boxProviders !== undefined && Object.hasOwn(config.boxProviders, box) ? (config.boxProviders[box] as ProviderKind) : "hetzner";
 }
 
 export function rebootTimeFor(config: Pick<Config, "rebootTime" | "rebootTimes">, box: string): string {
