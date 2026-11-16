@@ -1,11 +1,11 @@
 import { Cloudflare, NAME_PREFIX, type CfTunnel, BYPASS_POLICY_NAME } from "../cloudflare.ts";
-import { loadConfig, type Env } from "../config.ts";
+import { loadConfig, providerKindFor, type Env } from "../config.ts";
 import { DigitalOcean } from "../digitalocean.ts";
 import { Hetzner, LABEL_BOX, LABEL_WINDOW_OPENED, MANAGED_SELECTOR, serverLocation } from "../hetzner.ts";
-import type { Firewall, Provider } from "../provider.ts";
+import type { Firewall, Provider, ProviderKind } from "../provider.ts";
 import type { Fetch, Sleep } from "../http.ts";
 import { table, yellow, type Io } from "../io.ts";
-import { loadDigitalOceanToken, loadTokens } from "../tokens.ts";
+import { DIGITALOCEAN_TOKEN_ENV, HETZNER_TOKEN_ENV, loadProviderTokens } from "../tokens.ts";
 
 export interface LsDeps {
   io: Io;
@@ -19,11 +19,25 @@ export async function runLs(deps: LsDeps): Promise<number> {
   const env = deps.env ?? process.env;
   const io = deps.io;
   const now = deps.now ?? (() => new Date());
-  const tokens = loadTokens(env);
+  const tokens = loadProviderTokens(env);
   const config = await loadConfig(env, (line) => io.err(line));
-  const providers: Provider[] = [new Hetzner({ token: tokens.hetzner, fetch: deps.fetch, sleep: deps.sleep })];
+  // Each provider whose token is set; the others are named, and nothing of theirs counts as a leftover.
+  const providers: Provider[] = [];
+  const skipped: { kind: ProviderKind; label: string; envVar: string }[] = [];
+  if (tokens.hetzner !== undefined) {
+    providers.push(new Hetzner({ token: tokens.hetzner, fetch: deps.fetch, sleep: deps.sleep }));
+  } else {
+    skipped.push({ kind: "hetzner", label: "Hetzner", envVar: HETZNER_TOKEN_ENV });
+  }
   if (config.digitalocean !== undefined) {
-    providers.push(new DigitalOcean({ token: loadDigitalOceanToken(env), fetch: deps.fetch, sleep: deps.sleep }));
+    if (tokens.digitalocean !== undefined) {
+      providers.push(new DigitalOcean({ token: tokens.digitalocean, fetch: deps.fetch, sleep: deps.sleep }));
+    } else {
+      skipped.push({ kind: "digitalocean", label: "DigitalOcean", envVar: DIGITALOCEAN_TOKEN_ENV });
+    }
+  }
+  for (const s of skipped) {
+    io.out(yellow(`${s.label} boxes not listed: ${s.envVar} is not set.`));
   }
   const cloudflare = new Cloudflare({ token: tokens.cloudflare, fetch: deps.fetch, sleep: deps.sleep });
 
@@ -62,7 +76,7 @@ export async function runLs(deps: LsDeps): Promise<number> {
   }
 
   if (servers.length === 0) {
-    io.out("No boxes. Create one with: frosty new <box>");
+    io.out(skipped.length === 0 ? "No boxes. Create one with: frosty new <box>" : `No boxes on ${providers.map((p) => p.label).join(" or ") || "any provider frosty could list"}.`);
   } else {
     for (const line of table(rows)) {
       io.out(line);
@@ -81,7 +95,9 @@ export async function runLs(deps: LsDeps): Promise<number> {
   }
   // stayfrosty-<box>, or a route app stayfrosty-<box>:<route>[:public]. The shared bypass policy
   // belongs to no box.
-  const orphan = (name: string): boolean => name.startsWith(NAME_PREFIX) && name !== BYPASS_POLICY_NAME && !boxNames.has(name.slice(NAME_PREFIX.length).split(":")[0] as string);
+  // A box on a skipped provider wasn't listed, so its Cloudflare side is never called a leftover.
+  const unseen = (box: string): boolean => !boxNames.has(box) && !skipped.some((p) => p.kind === providerKindFor(config, box));
+  const orphan = (name: string): boolean => name.startsWith(NAME_PREFIX) && name !== BYPASS_POLICY_NAME && unseen(name.slice(NAME_PREFIX.length).split(":")[0] as string);
   for (const tunnel of tunnels.filter((t) => orphan(t.name))) {
     leftovers.push(`Cloudflare tunnel ${tunnel.name}`);
   }
@@ -94,7 +110,7 @@ export async function runLs(deps: LsDeps): Promise<number> {
   for (const alert of alerts.filter((a) => orphan(a.name))) {
     leftovers.push(`Cloudflare notification ${alert.name}`);
   }
-  for (const record of records.filter((r) => !boxNames.has((r.comment ?? "").slice("stayfrosty box ".length)))) {
+  for (const record of records.filter((r) => unseen((r.comment ?? "").slice("stayfrosty box ".length)))) {
     leftovers.push(`Cloudflare DNS record ${record.type} ${record.name}`);
   }
   if (leftovers.length > 0) {

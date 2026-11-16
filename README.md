@@ -24,7 +24,9 @@ When it is released, it will install from a tagged version, never from `main`, a
 
 ## Tokens
 
-`frosty` reads two tokens from the environment and nowhere else, plus a third for boxes on DigitalOcean.
+`frosty` reads its tokens from the environment and nowhere else. `CLOUDFLARE_API_TOKEN` is always needed. A provider's token is needed only for commands on that provider's boxes: `HCLOUD_TOKEN` for Hetzner boxes (every box not listed as `digitalocean` in `boxProviders`), `DIGITALOCEAN_TOKEN` for DigitalOcean boxes. So a run that should only touch a DigitalOcean box can leave the Hetzner token out, and the other way round. `init` needs the Hetzner and Cloudflare tokens.
+
+Commands over every box (`ls`, `verify --all`, `ssh-config`, and the SSH config that `new` and `destroy` rewrite) list the providers whose token is set and say which they skipped. A skipped provider's boxes are never taken for gone: `ls` doesn't call their Cloudflare side leftovers, `verify --all` says they weren't checked, and their blocks in `~/.ssh/stayfrosty.conf` are kept as they were.
 
 - `HCLOUD_TOKEN`: a Hetzner Cloud **Read & Write** token, in a project used only for stayfrosty boxes. One project per purpose limits what a leaked token can create or delete.
 - `CLOUDFLARE_API_TOKEN`: a custom Cloudflare token with exactly these permissions. Cloudflare is renaming "Edit" to "Write", and either name is the same permission.

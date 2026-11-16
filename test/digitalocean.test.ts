@@ -264,6 +264,80 @@ describe("DigitalOcean boxes", () => {
     expect(fw.droplet_ids).toEqual([droplet.id]);
   });
 
+  describe("with only one provider's token", () => {
+    const hzCalls = (): number => http.calls.filter((c) => c.url.host === "api.hetzner.cloud").length;
+    const doCalls = (): number => http.calls.filter((c) => c.url.host === DO).length;
+
+    it("a DigitalOcean box needs no HCLOUD_TOKEN, makes no Hetzner call, and keeps the Hetzner boxes' SSH blocks", async () => {
+      await runNew(deps(new ScriptedIo()), { box: "web1", resume: false, dryRun: false });
+      delete env["HCLOUD_TOKEN"];
+      const before = hzCalls();
+      const io = new ScriptedIo();
+      expect(await runNew(deps(io), { box: "mon1", resume: false, dryRun: false }), io.text()).toBe(0);
+      expect(hzCalls()).toBe(before);
+      expect(io.text()).toContain("HCLOUD_TOKEN is not set, so Hetzner boxes were not listed");
+      const conf = readFileSync(join(home, ".ssh", "stayfrosty.conf"), "utf8");
+      expect(conf).toContain("Host web1");
+      expect(conf).toContain("Host mon1");
+      // destroy of the DigitalOcean box keeps them too.
+      expect(await runDestroy(deps(new ScriptedIo(["mon1"])), { box: "mon1", dryRun: false })).toBe(0);
+      expect(readFileSync(join(home, ".ssh", "stayfrosty.conf"), "utf8")).toContain("Host web1");
+      expect(hz.servers).toHaveLength(1);
+    });
+
+    it("fails closed: a Hetzner box, or one not in boxProviders, still needs HCLOUD_TOKEN, before any call", async () => {
+      delete env["HCLOUD_TOKEN"];
+      for (const run of [
+        () => runNew(deps(new ScriptedIo()), { box: "web1", resume: false, dryRun: true }),
+        () => runDestroy(deps(new ScriptedIo(["web1"])), { box: "web1", dryRun: false }),
+        () => runVerify(deps(new ScriptedIo()), { box: "web1", all: false }),
+        () => runAdopt(deps(new ScriptedIo()), { box: "web1", ip: "192.0.2.10", user: "root", hostKey: undefined, trustFirstUse: true, resume: false, dryRun: true }),
+        () => runDetachForeign(deps(new ScriptedIo()), { box: "web1", dryRun: false }),
+      ]) {
+        await expect(run()).rejects.toThrow(/Missing HCLOUD_TOKEN in the environment: web1 is a Hetzner box/);
+      }
+      expect(http.calls).toEqual([]);
+    });
+
+    it("ls and verify --all name the skipped provider, and never call its boxes' Cloudflare side leftovers", async () => {
+      await runNew(deps(new ScriptedIo()), { box: "web1", resume: false, dryRun: false });
+      await runNew(deps(new ScriptedIo()), { box: "mon1", resume: false, dryRun: false });
+      delete env["HCLOUD_TOKEN"];
+      const io = new ScriptedIo();
+      expect(await runLs({ io, env, fetch: http.fetch, sleep: noSleep })).toBe(0);
+      expect(io.text()).toContain("Hetzner boxes not listed: HCLOUD_TOKEN is not set.");
+      expect(io.text()).toMatch(/mon1 +running/);
+      expect(io.text()).not.toContain("Leftovers");
+      const v = new ScriptedIo();
+      expect(await runVerify(deps(v), { box: undefined, all: true }), v.text()).toBe(0);
+      expect(v.text()).toContain("Skipped Hetzner boxes (HCLOUD_TOKEN is not set)");
+      expect(v.text()).toContain("All checks passed on 1 box(es); Hetzner boxes were skipped, not checked.");
+      expect(v.text()).not.toContain("web1:");
+    });
+
+    it("a Hetzner box needs no DIGITALOCEAN_TOKEN, and the DigitalOcean boxes keep their SSH blocks", async () => {
+      await runNew(deps(new ScriptedIo()), { box: "mon1", resume: false, dryRun: false });
+      delete env["DIGITALOCEAN_TOKEN"];
+      const before = doCalls();
+      const io = new ScriptedIo();
+      expect(await runNew(deps(io), { box: "web1", resume: false, dryRun: false }), io.text()).toBe(0);
+      expect(doCalls()).toBe(before);
+      const conf = readFileSync(join(home, ".ssh", "stayfrosty.conf"), "utf8");
+      expect(conf).toContain("Host mon1");
+      expect(conf).toContain("Host web1");
+      await expect(runVerify(deps(new ScriptedIo()), { box: "mon1", all: false })).rejects.toThrow(/Missing DIGITALOCEAN_TOKEN in the environment: mon1 is on digitalocean/);
+      const ls = new ScriptedIo();
+      expect(await runLs({ io: ls, env, fetch: http.fetch, sleep: noSleep })).toBe(0);
+      expect(ls.text()).toContain("DigitalOcean boxes not listed: DIGITALOCEAN_TOKEN is not set.");
+      expect(ls.text()).not.toContain("Leftovers");
+    });
+
+    it("still needs the Cloudflare token", async () => {
+      delete env["CLOUDFLARE_API_TOKEN"];
+      await expect(runNew(deps(new ScriptedIo()), { box: "mon1", resume: false, dryRun: true })).rejects.toThrow(/Missing CLOUDFLARE_API_TOKEN/);
+    });
+  });
+
   it("adopt and detach-foreign refuse DigitalOcean boxes before any call", async () => {
     await expect(runAdopt(deps(new ScriptedIo()), { box: "mon1", ip: "203.0.113.40", user: "root", hostKey: undefined, trustFirstUse: true, resume: false, dryRun: false })).rejects.toThrow(
       /frosty adopt works on Hetzner servers only/,

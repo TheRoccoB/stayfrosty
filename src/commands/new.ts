@@ -4,7 +4,7 @@ import { checkOnlyPublickey, checkRootRefused } from "../checks/login.ts";
 import { runOnBoxChecks } from "../checks/onbox.ts";
 import type { CheckResult } from "../checks/types.ts";
 import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
-import { rebootTimeFor, restrictedUsersFor, serviceTokensFor } from "../config.ts";
+import { providerKindFor, rebootTimeFor, restrictedUsersFor, serviceTokensFor } from "../config.ts";
 import { allProviders, assertBoxName, buildContext, directTarget, providerFor, requireCloudflared, serverSettings, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
 import type { Firewall, Provider, Server } from "../provider.ts";
 import { checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
@@ -13,7 +13,7 @@ import { checkRouteAccess, checkRouteMissing, checkRouteOutside, checkRoutePorts
 import { routeServiceTokens, routeTokenPolicyName } from "../routes.ts";
 import { planRouteTokens } from "../servicetokens.ts";
 import { boxRoutes, routeApps, ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, ingressSpec, installConnector, specIngress, waitForDns, waitForHealthyTunnel } from "../edge.ts";
-import { tildify, writeSshConfig, type SshConfigEntry } from "../sshconfig.ts";
+import { readSshConfigEntries, tildify, writeSshConfig, type SshConfigEntry } from "../sshconfig.ts";
 import { FrostyError } from "../errors.ts";
 import {
   LABEL_ADOPTED,
@@ -297,11 +297,20 @@ async function closeWindow(provider: Provider, firewall: Firewall): Promise<void
   await provider.updateFirewallLabels(firewall.id, labels);
 }
 
-// One Host block per labeled server, on every provider. The APIs are the source of truth, not the file.
+// One Host block per labeled server, on every provider. The APIs are the source of truth, not the
+// file, except for a provider whose token isn't set: its boxes keep the blocks the file already has,
+// so a run with only one provider's token never drops another provider's boxes.
 export async function sshConfigEntries(ctx: Context): Promise<SshConfigEntry[]> {
   const cloudflared = requireCloudflared(ctx);
   const servers = (await Promise.all(allProviders(ctx).map((p) => p.listServers(MANAGED_SELECTOR)))).flat();
-  return servers
+  const kept =
+    ctx.skipped.length === 0
+      ? []
+      : (await readSshConfigEntries(ctx.env)).filter((e) => ctx.skipped.some((s) => s.kind === providerKindFor(ctx.config, e.box)) && !servers.some((s) => s.labels[LABEL_BOX] === e.box));
+  for (const s of ctx.skipped) {
+    ctx.io.err(`${s.envVar} is not set, so ${s.label} boxes were not listed: their blocks in ~/.ssh/stayfrosty.conf are kept as they were.`);
+  }
+  const fresh = servers
     .map((s) => s.labels[LABEL_BOX])
     .filter((b): b is string => b !== undefined)
     .map((b) => ({
@@ -313,6 +322,7 @@ export async function sshConfigEntries(ctx: Context): Promise<SshConfigEntry[]> 
       knownHosts: tildify(knownHostsPath(ctx.env), ctx.env),
       hostKeyAlias: hostKeyAlias(b),
     }));
+  return [...fresh, ...kept];
 }
 
 // A server or firewall with frosty's name but without its labels belongs to someone else.

@@ -41,6 +41,36 @@ export function renderSshConfig(entries: SshConfigEntry[]): string {
   return `${HEADER}\n${blocks.join("\n\n")}${blocks.length > 0 ? "\n" : ""}`;
 }
 
+// Reads back the Host blocks renderSshConfig wrote. Blocks of any other shape are left out.
+export function parseSshConfig(text: string): SshConfigEntry[] {
+  const entries: SshConfigEntry[] = [];
+  for (const block of text.split(/\n\s*\n/)) {
+    const field = (name: string): string | undefined => new RegExp(`^\\s*${name} (.+)$`, "m").exec(block)?.[1]?.trim();
+    const box = /^Host (\S+)$/m.exec(block)?.[1];
+    const proxy = /^\s*ProxyCommand (.+) access ssh --hostname %h$/m.exec(block)?.[1];
+    const hostname = field("HostName");
+    const user = field("User");
+    const identityFile = field("IdentityFile");
+    const hostKeyAlias = field("HostKeyAlias");
+    const knownHosts = field("UserKnownHostsFile");
+    if (box !== undefined && proxy !== undefined && hostname !== undefined && user !== undefined && identityFile !== undefined && hostKeyAlias !== undefined && knownHosts !== undefined) {
+      entries.push({ box, hostname, user, identityFile, cloudflared: proxy, knownHosts, hostKeyAlias });
+    }
+  }
+  return entries;
+}
+
+export async function readSshConfigEntries(env: Env): Promise<SshConfigEntry[]> {
+  try {
+    return parseSshConfig(await readFile(join(sshDir(env), "stayfrosty.conf"), "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+}
+
 const INCLUDE = /^\s*Include\s+("?)(~\/\.ssh\/|.*\/\.ssh\/)?stayfrosty\.conf\1\s*$/im;
 
 export function hasInclude(config: string): boolean {

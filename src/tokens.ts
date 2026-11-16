@@ -58,6 +58,39 @@ export function loadDigitalOceanToken(env: Env = process.env): string {
   return token;
 }
 
+export interface ProviderTokens {
+  // Each provider's token, when it is set. Which ones a command needs depends on the boxes it
+  // touches (context.ts): a box needs its own provider's token, and nothing else does.
+  hetzner: string | undefined;
+  digitalocean: string | undefined;
+  cloudflare: string;
+}
+
+// For box commands: Cloudflare's token is always needed; the providers' only for their boxes.
+export function loadProviderTokens(env: Env = process.env): ProviderTokens {
+  const read = (name: string): string | undefined => {
+    const value = env[name]?.trim() ?? "";
+    registerSecret(value);
+    return value.length === 0 ? undefined : value;
+  };
+  const hetzner = read(HETZNER_TOKEN_ENV);
+  const digitalocean = read(DIGITALOCEAN_TOKEN_ENV);
+  const cloudflare = read(CLOUDFLARE_TOKEN_ENV);
+  if (cloudflare === undefined) {
+    throw new FrostyError(`Missing ${CLOUDFLARE_TOKEN_ENV} in the environment.`, TOKEN_HELP);
+  }
+  return { hetzner, digitalocean, cloudflare };
+}
+
+export function missingHetznerToken(box: string): FrostyError {
+  return new FrostyError(`Missing ${HETZNER_TOKEN_ENV} in the environment: ${box} is a Hetzner box (every box not listed as digitalocean in boxProviders is).`, TOKEN_HELP);
+}
+
+export function missingDigitalOceanToken(box: string): FrostyError {
+  return new FrostyError(`Missing ${DIGITALOCEAN_TOKEN_ENV} in the environment: ${box} is on digitalocean in boxProviders.`, DIGITALOCEAN_TOKEN_HELP);
+}
+
+// init, which only sets up Hetzner and Cloudflare, needs both.
 export function loadTokens(env: Env = process.env): Tokens {
   const hetzner = env[HETZNER_TOKEN_ENV]?.trim() ?? "";
   const cloudflare = env[CLOUDFLARE_TOKEN_ENV]?.trim() ?? "";

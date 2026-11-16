@@ -1,4 +1,5 @@
-import { allProviders, assertBoxName, buildContext, providerFor, requireCloudflared, tunnelTarget, type Deps } from "../context.ts";
+import { providerKindFor } from "../config.ts";
+import { allProviders, assertBoxName, buildContext, providerFor, requireCloudflared, skippedNote, tunnelTarget, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { LABEL_BOX, MANAGED_SELECTOR, boxSelector } from "../hetzner.ts";
 import { checkBox, printResults } from "./new.ts";
@@ -19,13 +20,18 @@ export async function runVerify(deps: Deps, opts: VerifyOptions): Promise<number
   requireCloudflared(ctx);
   const servers =
     box === undefined ? (await Promise.all(allProviders(ctx).map((p) => p.listServers(MANAGED_SELECTOR)))).flat() : await providerFor(ctx, box).listServers(boxSelector(box));
+  // --all over the providers whose token is set; the others are named, never taken for absent.
+  const note = box === undefined ? skippedNote(ctx) : undefined;
+  if (note !== undefined) {
+    ctx.io.err(note);
+  }
   if (servers.length === 0) {
-    throw new FrostyError(box === undefined ? "frosty manages no boxes in this project." : `frosty has no box named ${box}.`, "See what exists with: frosty ls");
+    throw new FrostyError(box === undefined ? `frosty manages no boxes in this project${note === undefined ? "" : " on the providers it could list"}.` : `frosty has no box named ${box}.`, "See what exists with: frosty ls");
   }
   // A rebootTimes key that names no box would silently leave that box on the default time.
   if (box === undefined) {
     const names = new Set(servers.map((s) => s.labels[LABEL_BOX] ?? s.name));
-    const unknown = Object.keys(ctx.config.rebootTimes ?? {}).filter((b) => !names.has(b));
+    const unknown = Object.keys(ctx.config.rebootTimes ?? {}).filter((b) => !names.has(b) && !ctx.skipped.some((s) => s.kind === providerKindFor(ctx.config, b)));
     if (unknown.length > 0) {
       ctx.io.err(`Warning: rebootTimes names ${unknown.join(", ")}, which frosty does not manage. A typo? Those boxes use rebootTime.`);
     }
@@ -43,6 +49,6 @@ export async function runVerify(deps: Deps, opts: VerifyOptions): Promise<number
     ctx.io.err(`${failed} check(s) failed. The fixes are listed above.`);
     return 1;
   }
-  ctx.io.out(`All checks passed on ${servers.length} box(es).`);
+  ctx.io.out(`All checks passed on ${servers.length} box(es)${ctx.skipped.length === 0 ? "" : `; ${ctx.skipped.map((p) => p.label).join(" and ")} boxes were skipped, not checked`}.`);
   return 0;
 }

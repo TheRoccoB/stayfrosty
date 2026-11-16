@@ -13,8 +13,8 @@ import { realSleep, type Fetch, type Sleep } from "./http.ts";
 import type { Io } from "./io.ts";
 import { findLaptopIp, type LaptopIp } from "./ip.ts";
 import { shellPasswordCommand, type PasswordCommandRunner } from "./password.ts";
-import type { Provider, Server, ServerSettings } from "./provider.ts";
-import { loadDigitalOceanToken, loadTokens } from "./tokens.ts";
+import type { Provider, ProviderKind, Server, ServerSettings } from "./provider.ts";
+import { DIGITALOCEAN_TOKEN_ENV, HETZNER_TOKEN_ENV, loadProviderTokens, missingDigitalOceanToken, missingHetznerToken } from "./tokens.ts";
 import { rawGet, type RawGet } from "./rawget.ts";
 import { findCommand, findStableCommand } from "./which.ts";
 
@@ -47,9 +47,12 @@ export interface Context {
   io: Io;
   env: Env;
   config: Config;
-  hetzner: Hetzner;
-  // Only when the config has a digitalocean section.
+  // Each only when its token is set (and, for DigitalOcean, the config has its section). A box's
+  // provider is reached through providerFor, which refuses when that provider's token is missing.
+  hetzner: Hetzner | undefined;
   digitalocean: DigitalOcean | undefined;
+  // Providers the config has but whose token isn't set: commands over every box say they skipped them.
+  skipped: SkippedProvider[];
   cloudflare: Cloudflare;
   sleep: Sleep;
   now: () => number;
@@ -74,7 +77,7 @@ export interface Context {
 
 export async function buildContext(deps: Deps): Promise<Context> {
   const env = deps.env ?? process.env;
-  const tokens = loadTokens(env);
+  const tokens = loadProviderTokens(env);
   const config = await loadConfig(env, (line) => deps.io.err(line));
   const sleep = deps.sleep ?? realSleep;
   const keyPath = expandHome(config.sshKey, env);
@@ -88,11 +91,12 @@ export async function buildContext(deps: Deps): Promise<Context> {
     throw new FrostyError(`${keyPath}.pub is not a single OpenSSH public key line.`, "Point sshKey at a valid key: frosty init");
   }
   const fetchImpl = deps.fetch ?? globalThis.fetch;
+  const doToken = tokens.digitalocean;
   const digitalocean =
-    config.digitalocean === undefined
+    config.digitalocean === undefined || doToken === undefined
       ? undefined
       : new DigitalOcean({
-          token: loadDigitalOceanToken(env),
+          token: doToken,
           fetch: fetchImpl,
           sleep,
           backups: config.digitalocean.backups,
@@ -103,8 +107,15 @@ export async function buildContext(deps: Deps): Promise<Context> {
     io: deps.io,
     env,
     config,
-    hetzner: new Hetzner({ token: tokens.hetzner, fetch: fetchImpl, sleep, changeLog: config.hetznerChangeLog === undefined ? undefined : fileChangeLog(config.hetznerChangeLog) }),
+    hetzner:
+      tokens.hetzner === undefined
+        ? undefined
+        : new Hetzner({ token: tokens.hetzner, fetch: fetchImpl, sleep, changeLog: config.hetznerChangeLog === undefined ? undefined : fileChangeLog(config.hetznerChangeLog) }),
     digitalocean,
+    skipped: [
+      ...(tokens.hetzner === undefined ? [{ kind: "hetzner" as const, label: "Hetzner", envVar: HETZNER_TOKEN_ENV }] : []),
+      ...(config.digitalocean !== undefined && doToken === undefined ? [{ kind: "digitalocean" as const, label: "DigitalOcean", envVar: DIGITALOCEAN_TOKEN_ENV }] : []),
+    ],
     cloudflare: new Cloudflare({ token: tokens.cloudflare, fetch: fetchImpl, sleep, changeLog: config.cloudflareChangeLog === undefined ? undefined : fileChangeLog(config.cloudflareChangeLog) }),
     sleep,
     now: deps.now ?? Date.now,
@@ -128,20 +139,46 @@ export async function buildContext(deps: Deps): Promise<Context> {
   };
 }
 
-// The cloud a box lives on, from boxProviders (Hetzner unless listed).
+export interface SkippedProvider {
+  kind: ProviderKind;
+  label: string;
+  envVar: string;
+}
+
+// The cloud a box lives on, from boxProviders (Hetzner unless listed). Fails closed: a box not
+// listed as digitalocean is a Hetzner box and needs HCLOUD_TOKEN.
 export function providerFor(ctx: Pick<Context, "config" | "hetzner" | "digitalocean">, box: string): Provider {
   if (providerKindFor(ctx.config, box) === "digitalocean") {
-    if (ctx.digitalocean === undefined) {
+    if (ctx.config.digitalocean === undefined) {
       throw new FrostyError(`${box} is on digitalocean in boxProviders, but the config has no digitalocean section.`, "Add it (region, size, image), then run the command again.");
     }
+    if (ctx.digitalocean === undefined) {
+      throw missingDigitalOceanToken(box);
+    }
     return ctx.digitalocean;
+  }
+  return requireHetzner(ctx, box);
+}
+
+export function requireHetzner(ctx: Pick<Context, "hetzner">, box: string): Hetzner {
+  if (ctx.hetzner === undefined) {
+    throw missingHetznerToken(box);
   }
   return ctx.hetzner;
 }
 
-// Every cloud frosty may have boxes on: Hetzner, then DigitalOcean if the config has it.
+// The clouds whose token is set: Hetzner, then DigitalOcean if the config has it. Commands over
+// every box must say which ones they skipped (ctx.skipped), and never take a skipped provider's
+// boxes for absent.
 export function allProviders(ctx: Pick<Context, "hetzner" | "digitalocean">): Provider[] {
-  return ctx.digitalocean === undefined ? [ctx.hetzner] : [ctx.hetzner, ctx.digitalocean];
+  return [ctx.hetzner, ctx.digitalocean].filter((p): p is Hetzner | DigitalOcean => p !== undefined);
+}
+
+export function skippedNote(ctx: Pick<Context, "skipped">): string | undefined {
+  if (ctx.skipped.length === 0) {
+    return undefined;
+  }
+  return `Skipped ${ctx.skipped.map((s) => `${s.label} boxes (${s.envVar} is not set)`).join(" and ")}: they were not listed, and nothing was assumed about them.`;
 }
 
 // What new creates a box with: its provider's settings.
