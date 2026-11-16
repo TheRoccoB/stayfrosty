@@ -5,7 +5,7 @@ import { hardenScript, parseCloudInit, userScript } from "../adoptscript.ts";
 import { FRESH_CONNECTION, hostKeyAlias, knownHostsPath, runOrFail, waitForSsh, type ScannedKey, type SshTarget } from "../box.ts";
 import { loadTemplate, renderCloudInit } from "../cloudinit.ts";
 import { providerKindFor, rebootTimeFor } from "../config.ts";
-import { assertBoxName, buildContext, requireCloudflared, type Context, type Deps } from "../context.ts";
+import { assertBoxName, buildContext, requireCloudflared, requireHetzner, type Context, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { LABEL_ADOPTED, LABEL_BOX, LABEL_MANAGED, LABEL_WINDOW_OPENED, boxLabels, boxSelector, type HzFirewall, type HzServer } from "../hetzner.ts";
 import { windowSource } from "../ip.ts";
@@ -45,7 +45,7 @@ export async function runAdopt(deps: Deps, opts: AdoptOptions): Promise<number> 
   }
   const ip = opts.ip;
   const ctx = await buildContext(deps);
-  const { io, hetzner, config } = ctx;
+  const { io, config } = ctx;
   // A droplet has no delete or rebuild protection, so nothing would keep a server that can't be
   // recreated safe from a click in the control panel. frosty adopts Hetzner servers only.
   if (providerKindFor(config, box) !== "hetzner") {
@@ -54,6 +54,7 @@ export async function runAdopt(deps: Deps, opts: AdoptOptions): Promise<number> 
       "DigitalOcean has no delete or rebuild protection to keep an adopted server safe. Create a new box with: frosty new <box>",
     );
   }
+  const hetzner = requireHetzner(ctx, box);
 
   // 1. Preflight, all reads.
   requireCloudflared(ctx);
@@ -202,7 +203,7 @@ export function refuseUnadoptable(box: string, server: HzServer): void {
 
 async function refuseForeignNamedFirewall(ctx: Context, box: string, firewall: HzFirewall | undefined): Promise<void> {
   if (firewall === undefined) {
-    const named = (await ctx.hetzner.listAll<HzFirewall>("/firewalls", "firewalls", { name: firewallName(box) }))[0];
+    const named = (await requireHetzner(ctx, box).listAll<HzFirewall>("/firewalls", "firewalls", { name: firewallName(box) }))[0];
     if (named !== undefined) {
       throw new FrostyError(`A firewall named ${firewallName(box)} already exists, and frosty did not create it.`, "Rename or delete it in the Hetzner Cloud Console.");
     }
@@ -210,7 +211,8 @@ async function refuseForeignNamedFirewall(ctx: Context, box: string, firewall: H
 }
 
 async function openWindow(ctx: Context, box: string, server: HzServer, existing: HzFirewall | undefined, cidr: string): Promise<HzFirewall> {
-  const { hetzner, io } = ctx;
+  const { io } = ctx;
+  const hetzner = requireHetzner(ctx, box);
   const rules = [windowRule(cidr)];
   const windowLabels = boxLabels(box, { [LABEL_WINDOW_OPENED]: String(Math.floor(ctx.now() / 1000)) });
   let firewall = existing;
