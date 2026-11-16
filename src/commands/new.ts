@@ -8,8 +8,10 @@ import { rebootTimeFor, restrictedUsersFor, serviceTokensFor } from "../config.t
 import { assertBoxName, buildContext, directTarget, requireCloudflared, sshHostname, tunnelTarget, type Context, type Deps } from "../context.ts";
 import { checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
 import { checkTokenNotExposed } from "../checks/token.ts";
-import { checkRouteAccess, checkRouteMissing, checkRouteOutside, checkRoutePorts } from "../checks/routes.ts";
-import { boxRoutes, ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, ingressSpec, installConnector, specIngress, waitForDns, waitForHealthyTunnel } from "../edge.ts";
+import { checkRouteAccess, checkRouteMissing, checkRouteOutside, checkRoutePorts, checkRouteServiceTokens, checkStrayRouteTokenPolicies } from "../checks/routes.ts";
+import { routeServiceTokens, routeTokenPolicyName } from "../routes.ts";
+import { planRouteTokens } from "../servicetokens.ts";
+import { boxRoutes, routeApps, ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, ingressSpec, installConnector, specIngress, waitForDns, waitForHealthyTunnel } from "../edge.ts";
 import { tildify, writeSshConfig, type SshConfigEntry } from "../sshconfig.ts";
 import { FrostyError } from "../errors.ts";
 import {
@@ -407,9 +409,20 @@ export async function checkBox(
     const ss = await runOrFail(ctx.ssh, target, "ss -tulnpH", "Listing listening sockets");
     routeResults.push(checkRoutePorts(routes, ss));
     for (const route of routes) {
-      routeResults.push(spec.routes.some((r) => r.route === route) ? checkRouteAccess(box, route, apps, policies, edge.policy?.id) : checkRouteMissing(box, route));
+      const tokenListed = policies.find((p) => p.name === routeTokenPolicyName(box, route));
+      const plan = await planRouteTokens(ctx, box, route, routeApps(apps, box, route).app?.id, tokenListed, true);
+      routeResults.push(spec.routes.some((r) => r.route === route) ? checkRouteAccess(box, route, apps, policies, edge.policy?.id, plan?.policy) : checkRouteMissing(box, route));
+      if (plan !== undefined) {
+        routeResults.push(checkRouteServiceTokens(box, route, plan));
+      }
       routeResults.push(await checkRouteOutside(ctx.rawGet, route, config.accessTeam ?? ""));
     }
+  }
+  // Token policies of routes that no longer list service tokens (or are gone), from findEdge.
+  const wantedTokenPolicies = new Set(routes.filter((r) => routeServiceTokens(r).length > 0).map((r) => routeTokenPolicyName(box, r)));
+  const stray = checkStrayRouteTokenPolicies(box, edge.routeTokenPolicies.filter((p) => !wantedTokenPolicies.has(p.name)));
+  if (stray !== undefined) {
+    routeResults.push(stray);
   }
   const api = [
     ...(opts.window === false ? [] : await windowChecks(ctx, box, server)),
