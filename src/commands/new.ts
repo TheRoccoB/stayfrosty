@@ -267,6 +267,10 @@ export async function finishBox(ctx: Context, input: FinishInput): Promise<numbe
   // all inbound. Then check the window and the firewall again.
   const provider = providerFor(ctx, box);
   await closeWindow(provider, firewall);
+  // On DigitalOcean the rule change is pending for a few seconds; check the applied state.
+  if (provider.kind === "digitalocean") {
+    await waitForFirewallApplied(ctx, provider, server, firewall);
+  }
   io.out(`Closed the window. The box firewall now admits nothing.`);
   const after = await windowChecks(ctx, box, await provider.getServer(server.id));
   const results = [...before, ...after];

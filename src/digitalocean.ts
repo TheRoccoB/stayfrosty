@@ -41,6 +41,8 @@ interface DoTargets {
 
 export interface DoRule {
   protocol: string;
+  // DigitalOcean returns "allow" on every rule it reads back; frosty never sends it.
+  action?: string;
   ports?: string;
   sources?: DoTargets;
   destinations?: DoTargets;
@@ -129,7 +131,9 @@ function ruleKey(r: DoRule, direction: "in" | "out" = "in"): string {
   const ports = r.protocol === "icmp" ? "" : r.ports === undefined || r.ports === "" || r.ports === "all" ? "0" : r.ports;
   const t = (direction === "in" ? r.sources : r.destinations) ?? {};
   const others = [...(t.droplet_ids ?? []).map((d) => `droplet:${d}`), ...(t.load_balancer_uids ?? []).map((u) => `lb:${u}`), ...(t.kubernetes_ids ?? []).map((k) => `k8s:${k}`), ...(t.tags ?? []).map((g) => `tag:${g}`)];
-  return `${r.protocol}|${ports}|${[...(t.addresses ?? []).map(withPrefix), ...others].sort().join(",")}`;
+  // Anything but an allow rule never matches one of frosty's (a window is always an allow).
+  const protocol = r.action === undefined || r.action === "allow" ? r.protocol : `${r.action}:${r.protocol}`;
+  return `${protocol}|${ports}|${[...(t.addresses ?? []).map(withPrefix), ...others].sort().join(",")}`;
 }
 
 function sameOutbound(a: DoRule[], b: DoRule[]): boolean {
@@ -151,8 +155,9 @@ type DropletTags = Map<number, string[]>;
 
 // The box a firewall belongs to, if it has exactly frosty's shape (see the top of this file). Every
 // droplet it is attached to by id must carry the box's tag too: a stranger attached by hand would
-// otherwise get frosty's window, and lose its firewall on destroy. A droplet missing from
-// `dropletTags` counts as a stranger.
+// otherwise get frosty's window, and lose its firewall on destroy. An id missing from
+// `dropletTags` is a droplet that no longer exists (DigitalOcean drops it from the firewall a little
+// after deleting it); every droplet that exists in the team is in the map.
 export function frostyFirewallBox(fw: Pick<DoFirewall, "name" | "tags" | "outbound_rules" | "droplet_ids" | "inbound_rules">, dropletTags: DropletTags): string | undefined {
   const m = /^stayfrosty-(.+)$/.exec(fw.name);
   const box = m?.[1];
@@ -177,7 +182,11 @@ export function frostyFirewallBox(fw: Pick<DoFirewall, "name" | "tags" | "outbou
     return undefined;
   }
   const managed = labelTag(LABEL_MANAGED, "1");
-  if ((fw.droplet_ids ?? []).some((id) => !(dropletTags.get(id) ?? []).includes(boxTag(box)) || !(dropletTags.get(id) ?? []).includes(managed))) {
+  const stranger = (id: number): boolean => {
+    const tags = dropletTags.get(id);
+    return tags !== undefined && (!tags.includes(boxTag(box)) || !tags.includes(managed));
+  };
+  if ((fw.droplet_ids ?? []).some(stranger)) {
     return undefined;
   }
   return box;
@@ -484,6 +493,7 @@ export class DigitalOcean implements Provider {
   async deleteFirewall(id: FirewallId): Promise<void> {
     const live = await this.ourFirewall(id);
     const tagged = await this.listAll<DoDroplet>("/droplets", "droplets", { tag_name: boxTag(live.box) });
+    // live.dropletTags holds only droplets that still exist.
     const covered = [...live.dropletTags.keys(), ...tagged.map((d) => d.id)];
     if (covered.length > 0) {
       throw new FrostyError(

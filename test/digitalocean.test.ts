@@ -150,6 +150,24 @@ describe("DigitalOcean boxes", () => {
     expect(waited).toBeLessThan(firstSsh);
   });
 
+  it("new waits for the closed window to be applied before its last checks", async () => {
+    let pendingAfterClose = 0;
+    http.on("DELETE", DO, "/v2/firewalls/[0-9a-f-]+/rules", (call) => {
+      const firewall = dig.firewalls.find((f) => f["id"] === call.url.pathname.split("/")[3]) as Record<string, unknown>;
+      firewall["inbound_rules"] = [];
+      pendingAfterClose = 2;
+      return { status: 204 };
+    });
+    http.on("GET", DO, "/v2/firewalls", () => {
+      const pending = pendingAfterClose > 0;
+      pendingAfterClose = Math.max(0, pendingAfterClose - 1);
+      return { body: { firewalls: dig.firewalls.map((f) => ({ ...f, status: pending ? "waiting" : "succeeded", pending_changes: pending ? dig.droplets.map((d) => ({ droplet_id: d["id"], removing: false, status: "waiting" })) : [] })), links: {} } };
+    });
+    const io = new ScriptedIo();
+    expect(await runNew(deps(io), { box: "mon1", resume: false, dryRun: false }), io.text()).toBe(0);
+    expect(io.text()).toContain("pass  Box firewall is the only one attached");
+  });
+
   it("a Hetzner box in the same config never writes to DigitalOcean, and ssh config lists both", async () => {
     await runNew(deps(new ScriptedIo()), { box: "mon1", resume: false, dryRun: false });
     const before = doWrites().length;
@@ -278,6 +296,8 @@ describe("DigitalOcean client guards", () => {
     expect(frostyFirewallBox({ ...ours(), tags: [] }, new Map())).toBeUndefined();
     expect(frostyFirewallBox({ ...ours(), inbound_rules: [{ protocol: "tcp", ports: "443", sources: { addresses: ["0.0.0.0/0", "::/0"] } }] }, new Map())).toBeUndefined();
     expect(frostyFirewallBox({ ...ours(), inbound_rules: [{ protocol: "tcp", ports: "22", sources: { addresses: ["198.51.100.7"] } }] }, new Map())).toBe("mon1");
+    expect(frostyFirewallBox({ ...ours(), inbound_rules: [{ protocol: "tcp", ports: "22", action: "allow", sources: { addresses: ["198.51.100.7/32"] } }], outbound_rules: OUTBOUND_RULES.map((r) => ({ ...r, action: "allow" })) }, new Map())).toBe("mon1");
+    expect(frostyFirewallBox({ ...ours(), inbound_rules: [{ protocol: "tcp", ports: "22", action: "deny", sources: { addresses: ["198.51.100.7/32"] } }] }, new Map())).toBeUndefined();
     expect(frostyFirewallBox({ ...ours(), tags: ["stayfrosty:1"] }, new Map())).toBeUndefined();
     expect(frostyFirewallBox({ ...ours(), tags: ["stayfrosty-box:other"] }, new Map())).toBeUndefined();
     expect(frostyFirewallBox({ ...ours(), outbound_rules: OUTBOUND_RULES.slice(0, 2) }, new Map())).toBeUndefined();
@@ -287,7 +307,8 @@ describe("DigitalOcean client guards", () => {
     expect(frostyFirewallBox({ ...ours(), droplet_ids: [7] }, new Map([[7, ["stayfrosty:1", "stayfrosty-box:mon1"]]]))).toBe("mon1");
     expect(frostyFirewallBox({ ...ours(), droplet_ids: [7, 8] }, new Map([[7, ["stayfrosty:1", "stayfrosty-box:mon1"]], [8, ["db"]]]))).toBeUndefined();
     expect(frostyFirewallBox({ ...ours(), droplet_ids: [7] }, new Map([[7, ["stayfrosty-box:mon1"]]]))).toBeUndefined();
-    expect(frostyFirewallBox({ ...ours(), droplet_ids: [9] }, new Map())).toBeUndefined();
+    // An id DigitalOcean hasn't dropped yet after deleting the droplet.
+    expect(frostyFirewallBox({ ...ours(), droplet_ids: [9] }, new Map())).toBe("mon1");
     // DigitalOcean may say "all" or leave out ports and prefix lengths; the same rules either way.
     expect(frostyFirewallBox({ ...ours(), outbound_rules: [{ protocol: "icmp", ports: "0", destinations: { addresses: ["::/0", "0.0.0.0/0"] } }, ...OUTBOUND_RULES.slice(0, 2).map((r) => ({ ...r, ports: "all" }))] }, new Map())).toBe("mon1");
   });
