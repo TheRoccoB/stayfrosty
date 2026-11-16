@@ -1,5 +1,7 @@
-import { BYPASS_POLICY_NAME, DNS_COMMENT_PREFIX, NAME_PREFIX, isOurBypassPolicy, isOurEmailPolicy, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel, type IngressSpec } from "./cloudflare.ts";
-import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, isRouteAppOf, protectedUris, publicAppName, routeAppName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
+import { BYPASS_POLICY_NAME, DNS_COMMENT_PREFIX, NAME_PREFIX, isOurBypassPolicy, isOurEmailPolicy, isOurTokenPolicy, serviceTokenIds, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel, type IngressSpec } from "./cloudflare.ts";
+import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, isRouteAppOf, isRouteTokenPolicyOf, protectedUris, publicAppName, routeAppName, routeTokenPolicyName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
+import { missingServiceTokenHint, SERVICE_TOKEN_ELSEWHERE_FIX, tokenExpiry } from "./checks/edge.ts";
+import { planRouteTokens, type RouteTokenPlan } from "./servicetokens.ts";
 import { runOrFail, type SshTarget } from "./box.ts";
 import { sshHostname, type Context } from "./context.ts";
 import { FrostyError } from "./errors.ts";
@@ -84,6 +86,8 @@ export interface Edge {
   policy: CfAccessPolicy | undefined;
   // stayfrosty-<box>:service-tokens, only with serviceTokens (frosty service-tokens sync).
   tokenPolicy: CfAccessPolicy | undefined;
+  // stayfrosty-<box>:<route>:service-tokens, only for routes with serviceTokens (frosty route sync).
+  routeTokenPolicies: CfAccessPolicy[];
   alert: CfNotificationPolicy | undefined;
 }
 
@@ -106,12 +110,13 @@ export async function findEdge(ctx: Context, box: string): Promise<Edge> {
     routeApps: apps.filter((a) => isRouteAppOf(box, a.name)),
     policy: policies.find((p) => p.name === name),
     tokenPolicy: policies.find((p) => p.name === tokenPolicyName(box)),
+    routeTokenPolicies: policies.filter((p) => isRouteTokenPolicyOf(box, p.name)),
     alert: alerts.find((a) => a.name === name),
   };
 }
 
 export function edgeIsEmpty(edge: Edge): boolean {
-  return edge.tunnel === undefined && edge.dns.length === 0 && edge.app === undefined && edge.routeApps.length === 0 && edge.policy === undefined && edge.tokenPolicy === undefined && edge.alert === undefined;
+  return edge.tunnel === undefined && edge.dns.length === 0 && edge.app === undefined && edge.routeApps.length === 0 && edge.policy === undefined && edge.tokenPolicy === undefined && edge.routeTokenPolicies.length === 0 && edge.alert === undefined;
 }
 
 // Step 7: the tunnel and its ingress, managed from Cloudflare.
@@ -166,6 +171,27 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
     throw new FrostyError(`Access policy ${BYPASS_POLICY_NAME} is not frosty's bypass shape (decision bypass, include everyone, nothing else).`, "Delete it in the Cloudflare dashboard, then run the command again.");
   }
   const base = { box, appZones: config.appZones ?? [], domain: config.domain, sessionDuration: config.accessSessionDuration };
+  // Every route's service tokens are resolved and checked before any write: a token that matches no
+  // token or several, or that would also open another app, stops the whole sync.
+  const tokenPolicies = policies.filter((p) => isRouteTokenPolicyOf(box, p.name));
+  const plans = new Map<string, RouteTokenPlan>();
+  for (const route of routes) {
+    const plan = await planRouteTokens(ctx, box, route, routeApps(apps, box, route).app?.id, tokenPolicies.find((p) => p.name === routeTokenPolicyName(box, route)), false);
+    if (plan === undefined) {
+      continue;
+    }
+    if (plan.problems.length > 0) {
+      throw new FrostyError(`routes.${box}/${route.name}: ${plan.problems.join("; ")}.`, missingServiceTokenHint());
+    }
+    if (plan.elsewhere.length > 0) {
+      throw new FrostyError(`A service token opens exactly one box or route, but a token of ${box}/${route.name} also opens: ${plan.elsewhere.join("; ")}.`, SERVICE_TOKEN_ELSEWHERE_FIX);
+    }
+    for (const t of plan.tokens) {
+      const e = tokenExpiry(t.token, plan.now);
+      io.out(`Service token ${t.name} (route ${route.name}): ${e.text}${e.expired ? "  [EXPIRED: refresh or rotate it in the Cloudflare dashboard]" : e.soon ? "  [expires within 30 days]" : ""}.`);
+    }
+    plans.set(route.name, plan);
+  }
   for (const route of routes) {
     const have = routeApps(apps, box, route);
     for (const c of await checkExternalAccess(ctx, route, have)) {
@@ -176,9 +202,14 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
     }
     if (frostyProtected(route).length > 0) {
       const want = protectedUris(route);
-      if (have.app === undefined || !appMatches(await cloudflare.getAccessApp(config.accountId, have.app.id), want, [(emailPolicy as CfAccessPolicy).id])) {
-        io.out(`${have.app === undefined ? "Creating" : "Updating"} Access application ${routeAppName(box, route)} for ${want.join(", ")}.`);
-        await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "protected", policyIds: [(emailPolicy as CfAccessPolicy).id] }, have.app?.id);
+      // The token policy is written before the app that uses it.
+      const plan = plans.get(route.name);
+      const tokenPolicyId = plan === undefined ? undefined : await ensureRouteTokenPolicy(ctx, box, route, plan);
+      const policyIds = [(emailPolicy as CfAccessPolicy).id, ...(tokenPolicyId === undefined ? [] : [tokenPolicyId])];
+      if (have.app === undefined || !appMatches(await cloudflare.getAccessApp(config.accountId, have.app.id), want, policyIds)) {
+        const tokens = plan === undefined ? "" : `, with ${plan.policyName}`;
+        io.out(`${have.app === undefined ? "Creating" : "Updating"} Access application ${routeAppName(box, route)} for ${want.join(", ")}${tokens}.`);
+        await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "protected", policyIds }, have.app?.id);
       }
     }
     if (bypassUris(route).length > 0) {
@@ -199,6 +230,29 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
     io.out(`Deleting Access application ${app.name}: its route is no longer in config.`);
     await cloudflare.deleteAccessApp(config.accountId, app);
   }
+  // Token policies no route wants any more, now that no app of frosty's uses them.
+  const wantedPolicies = new Set(routes.filter((r) => plans.has(r.name)).map((r) => routeTokenPolicyName(box, r)));
+  for (const policy of tokenPolicies.filter((p) => !wantedPolicies.has(p.name))) {
+    io.out(`Deleting Access policy ${policy.name}: its route no longer lists service tokens.`);
+    await cloudflare.deleteAccessPolicy(config.accountId, policy);
+  }
+}
+
+// The route's token policy, created or rewritten to let in exactly the configured tokens. Its id.
+async function ensureRouteTokenPolicy(ctx: Context, box: string, route: Route, plan: RouteTokenPlan): Promise<string> {
+  const { cloudflare, config, io } = ctx;
+  const want = plan.tokens.map((t) => t.token.id).sort();
+  const names = plan.tokens.map((t) => t.name).join(", ");
+  if (plan.policy === undefined) {
+    io.out(`Creating Access policy ${plan.policyName}: let in service tokens ${names}.`);
+    return (await cloudflare.putTokenPolicy(config.accountId, box, want, undefined, route.name)).id;
+  }
+  const have = [...new Set(serviceTokenIds(plan.policy.include))].sort();
+  if (!isOurTokenPolicy(plan.policy, box, route.name) || have.join() !== want.join()) {
+    io.out(`Updating Access policy ${plan.policyName}: let in service tokens ${names}.`);
+    await cloudflare.putTokenPolicy(config.accountId, box, want, plan.policy.id, route.name);
+  }
+  return plan.policy.id;
 }
 
 function appUris(app: CfAccessApp): string[] {
@@ -420,7 +474,11 @@ export async function removeEdge(ctx: Context, edge: Edge): Promise<void> {
     io.out(`Deleting Access application ${app.name}.`);
     await cloudflare.deleteAccessApp(config.accountId, app);
   }
-  // After the app that uses it, before the email policy.
+  // After the apps that use them, before the email policy.
+  for (const policy of edge.routeTokenPolicies) {
+    io.out(`Deleting Access policy ${policy.name}.`);
+    await cloudflare.deleteAccessPolicy(config.accountId, policy);
+  }
   if (edge.tokenPolicy !== undefined) {
     io.out(`Deleting Access policy ${edge.tokenPolicy.name}.`);
     await cloudflare.deleteAccessPolicy(config.accountId, edge.tokenPolicy);
@@ -461,6 +519,9 @@ export function describeEdge(edge: Edge): string[] {
   }
   if (edge.tokenPolicy !== undefined) {
     lines.push(`Cloudflare Access policy ${edge.tokenPolicy.name}`);
+  }
+  for (const policy of edge.routeTokenPolicies) {
+    lines.push(`Cloudflare Access policy ${policy.name}`);
   }
   if (edge.alert !== undefined) {
     lines.push(`Cloudflare notification ${edge.alert.name}`);

@@ -21,6 +21,9 @@ export interface Route {
   externalAccess?: Record<string, string>;
   // A public path that must answer 200 from the app, so verify can tell the app from the tunnel's 404.
   probe?: string;
+  // Names of existing Cloudflare Access service tokens let into frosty's own Access app for the
+  // route, for clients that can't log in (they send CF-Access-Client-Id and -Secret headers).
+  serviceTokens?: string[];
 }
 
 const ROUTE_NAME = /^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$/;
@@ -32,6 +35,8 @@ export const ROOT = "/";
 const isPrefix = (p: unknown): p is string => typeof p === "string" && (p === ROOT || PREFIX.test(p));
 const SERVICE = /^http:\/\/127\.0\.0\.1:(\d{4,5})$/;
 const TEAM = /^[a-z0-9-]{1,63}$/;
+// A Cloudflare Access service token name, as frosty accepts it in config.
+export const SERVICE_TOKEN_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 // The first rule for every app hostname: 404 anything a path trick could hide in. cloudflared
 // matches the decoded path, so `%` here only catches double encoding (%25..); encoded dots and
@@ -111,6 +116,27 @@ export function isRouteAppOf(box: string, name: string): boolean {
   return name.startsWith(`stayfrosty-${box}:`);
 }
 
+export function isRouteName(name: string): boolean {
+  return ROUTE_NAME.test(name);
+}
+
+// stayfrosty-<box>:<route>:service-tokens: the policy that lets a route's service tokens into its
+// protected app. Two colons, so it is never the box's SSH token policy (stayfrosty-<box>:service-tokens).
+export function routeTokenPolicyName(box: string, route: Pick<Route, "name">): string {
+  return `${routeAppName(box, route)}:service-tokens`;
+}
+
+// Any route's token policy for this box, configured or not (route sync deletes the ones not wanted).
+export function isRouteTokenPolicyOf(box: string, name: string): boolean {
+  const prefix = `stayfrosty-${box}:`;
+  const suffix = ":service-tokens";
+  return name.startsWith(prefix) && name.endsWith(suffix) && ROUTE_NAME.test(name.slice(prefix.length, name.length - suffix.length));
+}
+
+export function routeServiceTokens(route: Route): string[] {
+  return route.serviceTokens ?? [];
+}
+
 // The Access destination for a prefix: "news.example.net/api" covers /api and everything under it.
 export function accessUri(hostname: string, prefix: string): string {
   const path = prefix.replace(/\/$/, "");
@@ -139,7 +165,7 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
       continue;
     }
     const r = raw as Record<string, unknown>;
-    const extra = Object.keys(r).filter((k) => !["name", "hostname", "service", "protected", "public", "publicExact", "externalAccess", "probe"].includes(k));
+    const extra = Object.keys(r).filter((k) => !["name", "hostname", "service", "protected", "public", "publicExact", "externalAccess", "probe", "serviceTokens"].includes(k));
     if (extra.length > 0) {
       problems.push(`${where} has unknown keys: ${extra.join(", ")}`);
     }
@@ -231,6 +257,22 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
       const apps = new Set(prot.map((p) => (external as Record<string, unknown>)[p] ?? "(frosty's own app)"));
       if (apps.size > 1) {
         problems.push(`${where}: protected paths must all use one Access app (two apps on one hostname share a login cookie and break apps that call their API from the browser)`);
+      }
+    }
+    const tokens = r["serviceTokens"];
+    if (tokens !== undefined) {
+      if (!Array.isArray(tokens) || tokens.some((t) => typeof t !== "string" || !SERVICE_TOKEN_NAME.test(t))) {
+        problems.push(`${where}.serviceTokens must be a list of service token names (letters, digits, dots, dashes and underscores, up to 64)`);
+      } else {
+        for (const t of new Set(tokens as string[])) {
+          if ((tokens as string[]).filter((x) => x === t).length > 1) {
+            problems.push(`${where}.serviceTokens lists ${t} twice`);
+          }
+        }
+        // The tokens go on frosty's own app for the protected prefixes; with none, there is no app.
+        if (tokens.length > 0 && !prot.some((q) => externalMap[q] === undefined)) {
+          problems.push(`${where}.serviceTokens needs a protected path on frosty's own Access app (not externalAccess)`);
+        }
       }
     }
     const probe = r["probe"];

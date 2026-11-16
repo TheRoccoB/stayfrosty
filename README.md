@@ -31,8 +31,8 @@ When it is released, it will install from a tagged version, never from `main`, a
   - Account: Cloudflare Tunnel Edit
   - Account: Access: Apps and Policies Edit
   - Account: Notifications Edit
-  - Account: Access: Service Tokens Read (only if you use `serviceTokens`)
-  - Account: Access: Organizations, Identity Providers, and Groups Read (only if you use `serviceTokens`)
+  - Account: Access: Service Tokens Read (only if you use `serviceTokens`, on a box or on a route)
+  - Account: Access: Organizations, Identity Providers, and Groups Read (only if you use `serviceTokens`, on a box or on a route)
   - Zone (only your one domain, never all zones): DNS Edit
   - Zone (only your one domain, never all zones): Zone Read
 
@@ -128,6 +128,21 @@ Serve a web app on a no-front-door box. Some paths are public, and the rest sit 
 - Every entry in `protected` and `public` is a **prefix**: `/hooks/incoming` also matches `/hooks/incoming/anything`, so the app must 404 what it doesn't serve under a public prefix.
 - **`publicExact`** (optional) opens single paths and nothing under or next to them: `"protected": ["/"], "publicExact": ["/api/feed"]` makes `/api/feed` public, while `/api/feed/`, `/api/feed/x` and `/api/feedx` still get the login. Each path must be inside a protected prefix of frosty's own Access app, not under a public prefix, with no trailing slash. The tunnel matches it exactly (case-sensitive). Access gets a bypass destination for the path and a `<path>/*` destination on frosty's own app, which takes the subpaths back, because Access matches a destination's path and everything under it. `verify` checks that the path reaches the app through the tunnel, and that its trailing slash, a subpath, a longer name and the upper-cased path don't: they get the login, or cloudflared's own 403 where Access's prefix match lets them past the edge. It can be the `probe`.
 - **`/` covers the whole site.** `"protected": ["/"], "public": ["/health"]` puts a whole app behind Access with one open path. `"public": ["/"], "protected": ["/admin"]` is a public site with a protected part. Rules go longest prefix first and `/` last, so the more specific one always wins, and protected prefixes keep cloudflared's own Access check under a public `/`. With `/` listed there are no unlisted paths: `verify` expects the login (protected `/`) or the app (public `/`) where it would otherwise expect the tunnel's 404. `/` can't be in both lists or in `externalAccess`. Protected prefixes match case-insensitively (`/ADMIN` meets the Access check like `/admin`); public prefixes match exactly as written.
+
+- **`serviceTokens`** (optional) lets clients that can't log in through a browser into the route's protected paths, for example monitoring agents on other machines that report to a hub on this box. Each is the name of a Cloudflare Access service token you made in the dashboard; the client sends its `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers. frosty writes one Service Auth policy, `stayfrosty-<box>:<route>:service-tokens` (one rule per named token, nothing else), and attaches it to its own Access app for the route, after the email policy. The route needs a protected prefix on frosty's own app (not `externalAccess`). As with SSH service tokens: frosty only reads tokens, never creates or rotates them; a token opens exactly one place (config refuses a name used by two routes, or by a route and a box's SSH, and `sync` refuses before any write if any other policy or app already lets it in); `plan` and `sync` print each token's expiry; `verify` fails on an expired token, a policy that lets in anything else, or a token that also opens something else. Taking the tokens out of the route detaches the policy, then deletes it. Routes without `serviceTokens` read no tokens, so they need no extra Cloudflare permission. A service token gets past Access only: the app's own login still applies.
+
+```json
+"routes": {
+  "mon1": [{
+    "name": "hub",
+    "hostname": "monitor.example.net",
+    "service": "http://127.0.0.1:8090",
+    "protected": ["/"],
+    "public": [],
+    "serviceTokens": ["monitoring-agents"]
+  }]
+}
+```
 
 Two options cover common setups:
 - **A public subpath inside a protected prefix.** Here that's `/api/public/` inside `/api`. frosty gives those paths their own Access app with a bypass policy, and that is the only place it ever uses a bypass.

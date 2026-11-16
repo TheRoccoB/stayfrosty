@@ -2,8 +2,8 @@ import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promise
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { FrostyError } from "./errors.ts";
-import { validateRouteHostnames, validateRoutes, type Route } from "./routes.ts";
 import { PROVIDER_KINDS, type ProviderKind } from "./provider.ts";
+import { SERVICE_TOKEN_NAME, validateRouteHostnames, validateRoutes, type Route } from "./routes.ts";
 import { validateRestrictedUsers, type RestrictedUser } from "./sshusers.ts";
 
 export interface Config {
@@ -191,6 +191,9 @@ export function validateConfig(value: unknown): string[] {
       if (problems.length === 0) {
         problems.push(...validateRouteHostnames(routes as Record<string, Route[]>));
       }
+      if (problems.length === 0) {
+        problems.push(...validateTokenPlaces(c["serviceTokens"], routes as Record<string, Route[]>));
+      }
     }
   }
   const restricted = c["restrictedUsers"];
@@ -259,8 +262,6 @@ export function validateProviders(boxProviders: unknown, digitalocean: unknown):
   return problems;
 }
 
-const SERVICE_TOKEN_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-
 export function validateServiceTokens(value: unknown): string[] {
   if (value === undefined) {
     return [];
@@ -296,6 +297,36 @@ export function validateServiceTokens(value: unknown): string[] {
         continue;
       }
       owner.set(name, box);
+    }
+  }
+  return problems;
+}
+
+// A service token opens exactly one Access app: one box's SSH (serviceTokens) or one route. The
+// same name under two boxes' SSH is validateServiceTokens's message; this catches the rest.
+export function validateTokenPlaces(serviceTokens: unknown, routes: Record<string, Route[]>): string[] {
+  const places = new Map<string, string>();
+  if (serviceTokens !== null && typeof serviceTokens === "object" && !Array.isArray(serviceTokens)) {
+    for (const [box, list] of Object.entries(serviceTokens as Record<string, unknown>)) {
+      for (const name of Array.isArray(list) ? list : []) {
+        if (typeof name === "string" && !places.has(name)) {
+          places.set(name, `serviceTokens.${box}`);
+        }
+      }
+    }
+  }
+  const problems: string[] = [];
+  for (const [box, list] of Object.entries(routes)) {
+    for (const route of list) {
+      for (const name of new Set(route.serviceTokens ?? [])) {
+        const here = `routes.${box}/${route.name}`;
+        const other = places.get(name);
+        if (other !== undefined) {
+          problems.push(`service token ${name} is listed under both ${other} and ${here}: a service token opens exactly one box or route`);
+          continue;
+        }
+        places.set(name, here);
+      }
     }
   }
   return problems;

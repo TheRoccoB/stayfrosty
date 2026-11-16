@@ -2,7 +2,7 @@ import { ApiError, FrostyError } from "./errors.ts";
 import { logDone, summarize, type ChangeLog } from "./changelog.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
 import { redact, registerSecret } from "./redact.ts";
-import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, protectedUris, publicAppName, routeAppName, validateRouteHostnames, validateRoutes, type IngressRule, type Route } from "./routes.ts";
+import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, isRouteName, protectedUris, publicAppName, routeAppName, routeTokenPolicyName, validateRouteHostnames, validateRoutes, type IngressRule, type Route } from "./routes.ts";
 
 export const CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4";
 
@@ -55,10 +55,11 @@ export function isOurEmailPolicy(policy: { name?: string; decision?: string; inc
 
 const BOX = /^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$/;
 
-// The policy that lets a box's configured Access service tokens into its SSH app. Its name keeps
-// the box first, so ls attributes it like a route app.
-export function tokenPolicyName(box: string): string {
-  return `${NAME_PREFIX}${box}:service-tokens`;
+// The policy that lets a box's configured Access service tokens into its SSH app, or with a route
+// name, into that route's protected app (routeTokenPolicyName). Its name keeps the box first, so ls
+// attributes it like a route app.
+export function tokenPolicyName(box: string, route?: string): string {
+  return route === undefined ? `${NAME_PREFIX}${box}:service-tokens` : routeTokenPolicyName(box, { name: route });
 }
 
 // Exactly { service_token: { token_id } }: one key, one key inside, nothing else.
@@ -67,13 +68,14 @@ function serviceTokenRule(rule: CfAccessRule): boolean {
   return Object.keys(rule).length === 1 && inner !== null && typeof inner === "object" && !Array.isArray(inner) && Object.keys(inner).length === 1 && typeof inner.token_id === "string";
 }
 
-// frosty's service token policy for one box: its exact name, non_identity, only service_token
-// includes (never any_valid_service_token, everyone or emails), no require or exclude.
-export function isOurTokenPolicy(policy: { name?: string; decision?: string; include?: CfAccessRule[]; require?: CfAccessRule[]; exclude?: CfAccessRule[] }, box: string): boolean {
+// frosty's service token policy for one box (or one route of it): its exact name, non_identity,
+// only service_token includes (never any_valid_service_token, everyone or emails), no require or exclude.
+export function isOurTokenPolicy(policy: { name?: string; decision?: string; include?: CfAccessRule[]; require?: CfAccessRule[]; exclude?: CfAccessRule[] }, box: string, route?: string): boolean {
   const include = policy.include ?? [];
   return (
     BOX.test(box) &&
-    policy.name === tokenPolicyName(box) &&
+    (route === undefined || isRouteName(route)) &&
+    policy.name === tokenPolicyName(box, route) &&
     policy.decision === "non_identity" &&
     include.length > 0 &&
     include.every(serviceTokenRule) &&
@@ -524,11 +526,11 @@ export class Cloudflare {
     return this.listAll<CfAccessGroup>(`${acct(accountId)}/access/groups`);
   }
 
-  // The box's service token policy (tokenPolicyName): non_identity, one service_token include per
-  // id, nothing else. The body is built here from the ids. With policyId it replaces that policy,
-  // re-read first and checked to carry the same name.
-  async putTokenPolicy(accountId: string, box: string, tokenIds: string[], policyId?: string): Promise<CfAccessPolicy> {
-    const name = tokenPolicyName(box);
+  // The box's service token policy (tokenPolicyName), or with a route name that route's:
+  // non_identity, one service_token include per id, nothing else. The body is built here from the
+  // ids. With policyId it replaces that policy, re-read first and checked to carry the same name.
+  async putTokenPolicy(accountId: string, box: string, tokenIds: string[], policyId?: string, route?: string): Promise<CfAccessPolicy> {
+    const name = tokenPolicyName(box, route);
     const refuse = (why: string): never => {
       throw new FrostyError(`frosty refused to write Access policy ${name}: ${why}.`, "This is a bug in frosty. Please report it.");
     };
@@ -540,7 +542,7 @@ export class Cloudflare {
       refuse("it needs one or more distinct service token ids");
     }
     const body = { name, decision: "non_identity", include: ids.map((id) => ({ service_token: { token_id: id } })) };
-    if (!isOurTokenPolicy(body, box)) {
+    if (!isOurTokenPolicy(body, box, route)) {
       refuse("wrong shape");
     }
     if (policyId === undefined) {
@@ -657,7 +659,8 @@ export class Cloudflare {
   }
 
   // A route's Access app (routes.ts). "protected": stayfrosty-<box>:<route> on the route's own
-  // protected prefixes, with only frosty's email policies. "public": stayfrosty-<box>:<route>:public
+  // protected prefixes, with only frosty's email policies, and last, optionally, the route's own
+  // service token policy (routeTokenPolicyName). "public": stayfrosty-<box>:<route>:public
   // on the route's public paths under a protected prefix, with only the bypass policy. The body is
   // built here; with appId it replaces that app (re-read and checked to be frosty's first).
   async putRouteAccessApp(
@@ -681,11 +684,15 @@ export class Cloudflare {
     if (uris.length === 0 || spec.policyIds.length === 0 || (kind === "public" && spec.policyIds.length !== 1) || !/^\d+(m|h)$/.test(spec.sessionDuration)) {
       refuse("nothing to cover, or the wrong number of policies");
     }
-    for (const id of spec.policyIds) {
+    for (const [i, id] of spec.policyIds.entries()) {
       const live = await this.getAccessPolicy(accountId, id);
-      const ok = kind === "public" ? isOurBypassPolicy(live) : isOurEmailPolicy(live);
+      // Only the last policy of a protected app may be the route's token policy, and only for a route
+      // that names service tokens.
+      const last = i === spec.policyIds.length - 1 && i > 0;
+      const token = kind === "protected" && last && (route.serviceTokens ?? []).length > 0 && isOurTokenPolicy(live, box, route.name);
+      const ok = kind === "public" ? isOurBypassPolicy(live) : isOurEmailPolicy(live) || token;
       if (!ok) {
-        refuse(`policy ${live.name} is not ${kind === "public" ? "frosty's bypass policy" : "one of frosty's allow-by-email policies"}`);
+        refuse(`policy ${live.name} is not ${kind === "public" ? "frosty's bypass policy" : `one of frosty's allow-by-email policies${last ? ` or ${tokenPolicyName(box, route.name)}` : ""}`}`);
       }
     }
     const body = {

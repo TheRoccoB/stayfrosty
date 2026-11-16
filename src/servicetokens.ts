@@ -4,6 +4,7 @@ import { serviceTokensFor } from "./config.ts";
 import type { Context } from "./context.ts";
 import { edgeName, sameEmails } from "./edge.ts";
 import { ApiError, FrostyError } from "./errors.ts";
+import { routeServiceTokens, routeTokenPolicyName, type Route } from "./routes.ts";
 
 // Cloudflare Access service tokens on a box's SSH app (config.serviceTokens). The user makes the
 // tokens in the dashboard; frosty only reads them, and writes one policy per box,
@@ -113,7 +114,8 @@ async function readGroups(ctx: Context): Promise<Map<string, CfAccessGroup>> {
 // another app that takes any valid service token (any_valid_service_token, or Service Auth with
 // everyone); or an app that has the box's own token policy attached. Lists that leave out rules
 // are read in full. `ids` maps token id to the name to print. Fails closed on groups it can't read.
-export async function tokensUsedElsewhere(ctx: Context, box: string, ids: Map<string, string>, own: { appId: string | undefined; policyId: string | undefined }): Promise<string[]> {
+// `own.policyName` names the token policy being checked when it isn't the box's SSH one (a route's).
+export async function tokensUsedElsewhere(ctx: Context, box: string, ids: Map<string, string>, own: { appId: string | undefined; policyId: string | undefined; policyName?: string }): Promise<string[]> {
   if (ids.size === 0) {
     return [];
   }
@@ -147,7 +149,7 @@ export async function tokensUsedElsewhere(ctx: Context, box: string, ids: Map<st
     for (const p of app.policies ?? []) {
       const label = `Access application ${app.name} (policy ${p.name ?? p.id})`;
       if (own.policyId !== undefined && p.id === own.policyId) {
-        out.push(`${label} is ${tokenPolicyName(box)} itself`);
+        out.push(`${label} is ${own.policyName ?? tokenPolicyName(box)} itself`);
         continue;
       }
       const r = policyReach(p, ids, groups);
@@ -279,4 +281,36 @@ export function tokenSteps(ctx: Context, box: string, state: TokenState): TokenS
     steps.push(setPolicies(() => [emailPolicy.id, policyId as string], [emailPolicy.name, tokenPolicyName(box)]));
   }
   return steps;
+}
+
+// A route's service tokens (Route.serviceTokens) as they are: the names resolved, the route's token
+// policy read in full, and every other place one of them also opens. Undefined, with no calls, for
+// a route without service tokens. `withPolicyIds` also checks the ids the live policy already
+// names (verify), not only the configured ones (sync, which would remove the others).
+export interface RouteTokenPlan extends ServiceTokenAccess {
+  policyName: string;
+  policy: CfAccessPolicy | undefined;
+}
+
+export async function planRouteTokens(
+  ctx: Context,
+  box: string,
+  route: Route,
+  appId: string | undefined,
+  listedPolicy: CfAccessPolicy | undefined,
+  withPolicyIds: boolean,
+): Promise<RouteTokenPlan | undefined> {
+  const names = routeServiceTokens(route);
+  if (names.length === 0) {
+    return undefined;
+  }
+  const { tokens, problems } = await resolveServiceTokens(ctx, names);
+  const policy = listedPolicy === undefined ? undefined : await ctx.cloudflare.getAccessPolicy(ctx.config.accountId, listedPolicy.id);
+  const ids = new Map<string, string>(withPolicyIds ? serviceTokenIds(policy?.include).map((id) => [id, `token id ${id}`]) : []);
+  for (const t of tokens) {
+    ids.set(t.token.id, t.name);
+  }
+  const policyName = routeTokenPolicyName(box, route);
+  const elsewhere = await tokensUsedElsewhere(ctx, box, ids, { appId, policyId: policy?.id, policyName });
+  return { names, tokens, problems, elsewhere, now: ctx.now(), policyName, policy };
 }
