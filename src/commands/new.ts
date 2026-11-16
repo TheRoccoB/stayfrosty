@@ -135,11 +135,20 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
     server = await provider.getServer(created.server.id);
     // A new box has a new host key; forget the pin of any earlier box with this name.
     await ctx.forgetHost(hostKeyAlias(box));
-  } else if (!(server.public_net.firewalls ?? []).some((f) => f.id === firewall.id)) {
+  } else if (
+    !(server.public_net.firewalls ?? []).some((f) => f.id === firewall.id) ||
+    // On DigitalOcean the box's tag alone also attaches it; frosty attaches by droplet id too.
+    (provider.kind === "digitalocean" && !firewall.applied_to.some((a) => a.type === "server" && a.server?.id === server?.id))
+  ) {
     io.out(`Attaching firewall ${firewall.name} to ${box}.`);
     for (const action of await provider.applyFirewall(firewall.id, server.id)) {
       await provider.waitForAction(action);
     }
+  }
+  // A DigitalOcean firewall reaches a new droplet asynchronously (pending_changes). Nothing talks to
+  // the box until DigitalOcean says it is applied.
+  if (provider.kind === "digitalocean") {
+    server = await waitForFirewallApplied(ctx, provider, server, firewall);
   }
   const target = directTarget(ctx, box, server, source.family);
 
@@ -151,6 +160,26 @@ export async function runNew(deps: Deps, opts: NewOptions): Promise<number> {
   await rebootIfRequired(ctx, target, rebootHint(provider));
 
   return finishBox(ctx, { box, server, firewall, target, resume: opts.resume });
+}
+
+export async function waitForFirewallApplied(ctx: Context, provider: Provider, server: Server, firewall: Firewall, timeoutMs = 3 * 60_000): Promise<Server> {
+  const deadline = ctx.now() + timeoutMs;
+  let current = server;
+  for (;;) {
+    current = await provider.getServer(current.id);
+    const attached = (current.public_net.firewalls ?? []).find((f) => f.id === firewall.id);
+    if (attached?.status === "applied") {
+      return current;
+    }
+    if (ctx.now() >= deadline) {
+      throw new FrostyError(
+        `${provider.label} still reports firewall ${firewall.name} as ${attached?.status ?? "not attached"} on ${current.name} after ${Math.round(timeoutMs / 60_000)} minutes. frosty has not connected to the box.`,
+        `Look at the firewall in ${provider.consoleName}, then run: frosty new ${current.name} --resume`,
+      );
+    }
+    ctx.io.out(`Waiting for ${provider.label} to apply firewall ${firewall.name} (${attached?.status ?? "not attached yet"}).`);
+    await ctx.sleep(3000);
+  }
 }
 
 export interface FinishInput {

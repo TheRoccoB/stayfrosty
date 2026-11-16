@@ -43,7 +43,9 @@ When it is released, it will install from a tagged version, never from `main`, a
   - `tag`: read, create (not delete)
   - `actions:read`, `regions:read`, `sizes:read`, `image:read`, `snapshot:read`, `vpc:read`
 
-  The last line is what DigitalOcean itself requires for `droplet:create`; if ticking it adds other read scopes, keep them. frosty needs no `account`, `project` or `domain` scope, and no Full Access or Read Only preset. A team that holds only frosty's droplets limits what a leaked token can delete.
+  The last line is what DigitalOcean itself requires for `droplet:create`; if ticking it adds other read scopes, keep them. frosty needs no `account`, `project` or `domain` scope, and no Full Access or Read Only preset.
+
+  **Create the token in a DigitalOcean team that holds only frosty's droplets.** DigitalOcean scopes can't be limited to some droplets: `droplet:delete` reaches every droplet in the team, and tags are the only mark of what is frosty's. frosty itself never deletes a droplet it didn't tag, but a leaked token could. A team of its own is what limits that, the way a Hetzner project of its own does.
 
 Keep them out of your shell history. Use `op run --env-file=... -- frosty ...`, or a `chmod 600` env file that you source. Put passkeys or hardware keys on your Hetzner, DigitalOcean, Cloudflare and GitHub accounts: anyone who controls those accounts controls your boxes.
 
@@ -69,9 +71,10 @@ Boxes not in `boxProviders` stay on Hetzner. Then `frosty new mon1`, `destroy`, 
 How it maps, and what differs from Hetzner:
 
 - **Labels are tags.** frosty's labels become the droplet tags `stayfrosty:1` and `stayfrosty-box:<box>`. frosty never changes a droplet's tags after creating it.
-- **The firewall.** A DigitalOcean cloud firewall has no labels, so frosty knows its own by its whole shape: the name `stayfrosty-<box>`, applied by no tag except `stayfrosty-box:<box>`, and exactly frosty's outbound rules. It never writes to a firewall without that shape, and `new` refuses a box whose firewall name is taken by one.
+- **The firewall.** A DigitalOcean cloud firewall has no labels, so frosty knows its own by its whole shape: the name `stayfrosty-<box>`, applied by exactly the tag `stayfrosty-box:<box>`, exactly frosty's outbound rules, no inbound rule but the window, and attached by id only to droplets tagged `stayfrosty:1` and `stayfrosty-box:<box>`. It never writes to a firewall without that shape, and `new` refuses a box whose firewall name is taken by one. So a firewall made by hand, or one someone attached to another droplet, is left alone.
 - **Outbound.** Unlike Hetzner's, a DigitalOcean firewall blocks outbound traffic that no rule allows. frosty's firewall always carries allow-all outbound rules (TCP, UDP and ICMP) and only ever changes its inbound rules: none, or the window (TCP 22 from your laptop's address).
-- **From the first second.** The firewall is created before the droplet and applied by the box's tag, so it covers the droplet as DigitalOcean creates it. It is also attached by droplet id right after, so removing the tag by hand doesn't take it off.
+- **From the first second.** The firewall is created before the droplet and applied by the box's tag, so DigitalOcean applies it as it creates the droplet. It is also attached by droplet id right after (and again by `--resume` if that attach is missing), so removing the tag by hand doesn't take it off. DigitalOcean applies firewalls asynchronously, so `new` waits until it reports the firewall applied, with nothing pending, before it connects to the droplet.
+- **Deleting.** DigitalOcean deletes a firewall that still covers droplets. frosty deletes its firewall only once no droplet holds it, by id or by the box's tag, so `destroy` never leaves a droplet with no firewall.
 - **No delete protection.** DigitalOcean droplets have no delete or rebuild protection. frosty refuses to delete a droplet it didn't tag, or one tagged `stayfrosty-adopted:*`, but nothing stops a person in the control panel. So `adopt` (and `detach-foreign`) refuse DigitalOcean boxes: adopting is for servers that can't be recreated, and those need protection.
 - **No window age.** With no firewall labels, `ls` shows an open window on a droplet as `OPEN` without its age.
 - **The droplet** gets public IPv4 and IPv6, no DigitalOcean monitoring agent and no Droplet Agent (the web Droplet Console's SSH helper). The console password is for DigitalOcean's Recovery Console.

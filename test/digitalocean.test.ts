@@ -133,6 +133,23 @@ describe("DigitalOcean boxes", () => {
     expect(readFileSync(join(home, ".ssh", "stayfrosty.conf"), "utf8")).toContain("Host mon1");
   });
 
+  it("new waits until DigitalOcean reports the firewall applied before it connects to the droplet", async () => {
+    let polls = 0;
+    http.on("GET", DO, "/v2/firewalls", () => {
+      if (dig.droplets.length > 0) {
+        polls++;
+      }
+      const pending = dig.droplets.length > 0 && polls < 3;
+      return { body: { firewalls: dig.firewalls.map((f) => ({ ...f, status: pending ? "waiting" : "succeeded", pending_changes: pending ? dig.droplets.map((d) => ({ droplet_id: d["id"], removing: false, status: "waiting" })) : [] })), links: {} } };
+    });
+    const io = new ScriptedIo();
+    expect(await runNew(deps(io), { box: "mon1", resume: false, dryRun: false }), io.text()).toBe(0);
+    const firstSsh = io.stdout.findIndex((l) => l.startsWith("Waiting for SSH"));
+    const waited = io.stdout.findIndex((l) => l.startsWith("Waiting for DigitalOcean to apply firewall stayfrosty-mon1 (pending)"));
+    expect(waited).toBeGreaterThan(-1);
+    expect(waited).toBeLessThan(firstSsh);
+  });
+
   it("a Hetzner box in the same config never writes to DigitalOcean, and ssh config lists both", async () => {
     await runNew(deps(new ScriptedIo()), { box: "mon1", resume: false, dryRun: false });
     const before = doWrites().length;
@@ -179,7 +196,9 @@ describe("DigitalOcean boxes", () => {
   it("ls lists boxes from both providers and leftovers by provider", async () => {
     await runNew(deps(new ScriptedIo()), { box: "mon1", resume: false, dryRun: false });
     await runNew(deps(new ScriptedIo()), { box: "web1", resume: false, dryRun: false });
+    // DigitalOcean takes a deleted droplet off its firewalls.
     dig.droplets = [];
+    (dig.firewalls[0] as { droplet_ids: number[] }).droplet_ids = [];
     const io = new ScriptedIo();
     expect(await runLs({ io, env, fetch: http.fetch, sleep: noSleep })).toBe(0);
     expect(io.text()).toMatch(/web1 +running +cx23 +fsn1/);
@@ -201,6 +220,30 @@ describe("DigitalOcean boxes", () => {
     const io = new ScriptedIo(["mon1"]);
     await expect(runDestroy(deps(io), { box: "mon1", dryRun: false })).rejects.toThrow(/frosty never deletes a server it did not create/);
     expect(dig.droplets).toHaveLength(1);
+  });
+
+  it("destroy never strips the firewall from a droplet whose tags were removed by hand", async () => {
+    await runNew(deps(new ScriptedIo()), { box: "mon1", resume: false, dryRun: false });
+    (dig.droplets[0] as { tags: string[] }).tags = [];
+    await runDestroy(deps(new ScriptedIo(["mon1"])), { box: "mon1", dryRun: false }).catch(() => 1);
+    expect(dig.firewalls).toHaveLength(1);
+    expect(doWrites().filter((w) => w.startsWith("DELETE /v2/firewalls/") && !w.endsWith("/rules"))).toEqual([]);
+    // And the client refuses outright while any droplet is still covered.
+    const client = new DigitalOcean({ token: DO_TOKEN, fetch: http.fetch, sleep: noSleep });
+    (dig.droplets[0] as { tags: string[] }).tags = ["stayfrosty:1", "stayfrosty-box:mon1"];
+    await expect(client.deleteFirewall((dig.firewalls[0] as { id: string }).id)).rejects.toThrow(/still covers droplet/);
+  });
+
+  it("--resume attaches the firewall by droplet id when only the tag holds it", async () => {
+    await runNew(deps(new ScriptedIo()), { box: "mon1", resume: false, dryRun: false });
+    const fw = dig.firewalls[0] as { id: string; droplet_ids: number[]; inbound_rules: unknown[] };
+    const droplet = dig.droplets[0] as { id: number };
+    fw.droplet_ids = [];
+    const before = doWrites().length;
+    const io = new ScriptedIo();
+    expect(await runNew(deps(io), { box: "mon1", resume: true, dryRun: false }), io.text()).toBe(0);
+    expect(doWrites().slice(before)).toContain(`POST /v2/firewalls/${fw.id}/droplets`);
+    expect(fw.droplet_ids).toEqual([droplet.id]);
   });
 
   it("adopt and detach-foreign refuse DigitalOcean boxes before any call", async () => {
@@ -230,15 +273,23 @@ describe("DigitalOcean client guards", () => {
   });
 
   it("knows its firewall only by its whole shape", () => {
-    expect(frostyFirewallBox(ours())).toBe("mon1");
-    expect(frostyFirewallBox({ ...ours(), tags: [] })).toBe("mon1");
-    expect(frostyFirewallBox({ ...ours(), tags: ["stayfrosty:1"] })).toBeUndefined();
-    expect(frostyFirewallBox({ ...ours(), tags: ["stayfrosty-box:other"] })).toBeUndefined();
-    expect(frostyFirewallBox({ ...ours(), outbound_rules: OUTBOUND_RULES.slice(0, 2) })).toBeUndefined();
-    expect(frostyFirewallBox({ ...ours(), name: "stayfrosty-Mon1" })).toBeUndefined();
-    expect(frostyFirewallBox({ ...ours(), name: "web" })).toBeUndefined();
+    expect(frostyFirewallBox(ours(), new Map())).toBe("mon1");
+    // A firewall made by hand with the control panel's default outbound rules and no tag is not frosty's.
+    expect(frostyFirewallBox({ ...ours(), tags: [] }, new Map())).toBeUndefined();
+    expect(frostyFirewallBox({ ...ours(), inbound_rules: [{ protocol: "tcp", ports: "443", sources: { addresses: ["0.0.0.0/0", "::/0"] } }] }, new Map())).toBeUndefined();
+    expect(frostyFirewallBox({ ...ours(), inbound_rules: [{ protocol: "tcp", ports: "22", sources: { addresses: ["198.51.100.7"] } }] }, new Map())).toBe("mon1");
+    expect(frostyFirewallBox({ ...ours(), tags: ["stayfrosty:1"] }, new Map())).toBeUndefined();
+    expect(frostyFirewallBox({ ...ours(), tags: ["stayfrosty-box:other"] }, new Map())).toBeUndefined();
+    expect(frostyFirewallBox({ ...ours(), outbound_rules: OUTBOUND_RULES.slice(0, 2) }, new Map())).toBeUndefined();
+    expect(frostyFirewallBox({ ...ours(), name: "stayfrosty-Mon1" }, new Map())).toBeUndefined();
+    expect(frostyFirewallBox({ ...ours(), name: "web" }, new Map())).toBeUndefined();
+    // Every droplet attached by id must be tagged as the box; a missing one counts as a stranger.
+    expect(frostyFirewallBox({ ...ours(), droplet_ids: [7] }, new Map([[7, ["stayfrosty:1", "stayfrosty-box:mon1"]]]))).toBe("mon1");
+    expect(frostyFirewallBox({ ...ours(), droplet_ids: [7, 8] }, new Map([[7, ["stayfrosty:1", "stayfrosty-box:mon1"]], [8, ["db"]]]))).toBeUndefined();
+    expect(frostyFirewallBox({ ...ours(), droplet_ids: [7] }, new Map([[7, ["stayfrosty-box:mon1"]]]))).toBeUndefined();
+    expect(frostyFirewallBox({ ...ours(), droplet_ids: [9] }, new Map())).toBeUndefined();
     // DigitalOcean may say "all" or leave out ports and prefix lengths; the same rules either way.
-    expect(frostyFirewallBox({ ...ours(), outbound_rules: [{ protocol: "icmp", ports: "0", destinations: { addresses: ["::/0", "0.0.0.0/0"] } }, ...OUTBOUND_RULES.slice(0, 2).map((r) => ({ ...r, ports: "all" }))] })).toBe("mon1");
+    expect(frostyFirewallBox({ ...ours(), outbound_rules: [{ protocol: "icmp", ports: "0", destinations: { addresses: ["::/0", "0.0.0.0/0"] } }, ...OUTBOUND_RULES.slice(0, 2).map((r) => ({ ...r, ports: "all" }))] }, new Map())).toBe("mon1");
   });
 
   it("sets only inbound window rules, new before old, and never on a firewall that isn't frosty's", async () => {
@@ -248,6 +299,10 @@ describe("DigitalOcean client guards", () => {
     expect(http.writes().map((c) => `${c.method} ${c.url.pathname}`)).toEqual([`POST /v2/firewalls/${FW}/rules`, `DELETE /v2/firewalls/${FW}/rules`]);
     expect((fake.firewalls[0] as { inbound_rules: unknown[] }).inbound_rules).toEqual([{ protocol: "tcp", ports: "22", sources: { addresses: ["198.51.100.8/32"] } }]);
     await expect(client.setFirewallRules(FW, [{ ...window("0.0.0.0/0") }])).rejects.toThrow(/only ever sets none, or TCP 22 from one address/);
+    fake.droplets.push({ id: 31, name: "db", status: "active", created_at: "2026-01-01T00:00:00Z", tags: ["db"], size_slug: "s", region: { slug: "fra1" } });
+    (fake.firewalls[0] as { droplet_ids: number[] }).droplet_ids = [31];
+    await expect(client.setFirewallRules(FW, [])).rejects.toThrow(/doesn't have the shape of frosty's/);
+    (fake.firewalls[0] as { droplet_ids: number[] }).droplet_ids = [];
     (fake.firewalls[0] as { tags: string[] }).tags = ["stayfrosty:1"];
     await expect(client.setFirewallRules(FW, [])).rejects.toThrow(/doesn't have the shape of frosty's/);
     await expect(client.deleteFirewall(FW)).rejects.toThrow(/doesn't have the shape of frosty's/);
@@ -258,7 +313,7 @@ describe("DigitalOcean client guards", () => {
     const { http, fake, client } = setup();
     await expect(client.createFirewall("web", { stayfrosty: "1", "stayfrosty-box": "mon1" }, [])).rejects.toThrow(/refused to create firewall/);
     await expect(client.createFirewall("stayfrosty-mon1", { stayfrosty: "1", "stayfrosty-box": "mon1" }, [{ ...window("198.51.100.7/32"), port: "443" }])).rejects.toThrow(/only ever sets/);
-    fake.firewalls.push(ours(), { ...ours(), id: "00000000-0000-4000-8000-000000000043", name: "stayfrosty-other", tags: [] });
+    fake.firewalls.push(ours(), { ...ours(), id: "00000000-0000-4000-8000-000000000043", name: "stayfrosty-other", tags: ["stayfrosty-box:other"] });
     const spec = { name: "mon1", serverType: "s", image: "i", location: "fra1", sshKeyIds: [1], userData: "#cloud-config", labels: { stayfrosty: "1", "stayfrosty-box": "mon1" }, firewallIds: [FW] };
     await expect(client.createServer({ ...spec, name: "other" })).rejects.toThrow(/refused to create droplet/);
     await expect(client.createServer({ ...spec, labels: { ...spec.labels, extra: "1" } })).rejects.toThrow(/refused to create droplet/);

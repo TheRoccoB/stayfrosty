@@ -124,39 +124,60 @@ function selected(labels: Record<string, string>, wanted: Record<string, string>
   return Object.entries(wanted).every(([k, v]) => labels[k] === v);
 }
 
-function ruleKey(r: DoRule): string {
+// Inbound rules name sources, outbound rules destinations; the other field is ignored.
+function ruleKey(r: DoRule, direction: "in" | "out" = "in"): string {
   const ports = r.protocol === "icmp" ? "" : r.ports === undefined || r.ports === "" || r.ports === "all" ? "0" : r.ports;
-  const t = r.sources ?? r.destinations ?? {};
+  const t = (direction === "in" ? r.sources : r.destinations) ?? {};
   const others = [...(t.droplet_ids ?? []).map((d) => `droplet:${d}`), ...(t.load_balancer_uids ?? []).map((u) => `lb:${u}`), ...(t.kubernetes_ids ?? []).map((k) => `k8s:${k}`), ...(t.tags ?? []).map((g) => `tag:${g}`)];
   return `${r.protocol}|${ports}|${[...(t.addresses ?? []).map(withPrefix), ...others].sort().join(",")}`;
 }
 
-function sameRuleSet(a: DoRule[], b: DoRule[]): boolean {
-  const ka = a.map(ruleKey).sort();
-  const kb = b.map(ruleKey).sort();
+function sameOutbound(a: DoRule[], b: DoRule[]): boolean {
+  const ka = a.map((r) => ruleKey(r, "out")).sort();
+  const kb = b.map((r) => ruleKey(r, "out")).sort();
   return ka.length === kb.length && ka.every((k, i) => k === kb[i]);
 }
 
 // DigitalOcean may return a single address without its prefix length.
 function withPrefix(address: string): string {
-  if (address.includes("/")) {
-    return address;
+  const a = address.toLowerCase();
+  if (a.includes("/")) {
+    return a;
   }
-  return address.includes(":") ? `${address}/128` : `${address}/32`;
+  return a.includes(":") ? `${a}/128` : `${a}/32`;
 }
 
-// The box a firewall belongs to, if it has exactly frosty's shape (see the top of this file).
-export function frostyFirewallBox(fw: Pick<DoFirewall, "name" | "tags" | "outbound_rules">): string | undefined {
+type DropletTags = Map<number, string[]>;
+
+// The box a firewall belongs to, if it has exactly frosty's shape (see the top of this file). Every
+// droplet it is attached to by id must carry the box's tag too: a stranger attached by hand would
+// otherwise get frosty's window, and lose its firewall on destroy. A droplet missing from
+// `dropletTags` counts as a stranger.
+export function frostyFirewallBox(fw: Pick<DoFirewall, "name" | "tags" | "outbound_rules" | "droplet_ids" | "inbound_rules">, dropletTags: DropletTags): string | undefined {
   const m = /^stayfrosty-(.+)$/.exec(fw.name);
   const box = m?.[1];
   if (box === undefined || !BOX.test(box)) {
     return undefined;
   }
+  // frosty creates it applied by exactly the box's tag; a firewall made by hand has none.
   const tags = fw.tags ?? [];
-  if (tags.some((t) => t !== boxTag(box))) {
+  if (tags.length !== 1 || tags[0] !== boxTag(box)) {
     return undefined;
   }
-  if (!sameRuleSet(fw.outbound_rules ?? [], OUTBOUND_RULES)) {
+  if (!sameOutbound(fw.outbound_rules ?? [], OUTBOUND_RULES)) {
+    return undefined;
+  }
+  // Inbound: none, or frosty's window (TCP 22 from one address), at most one per family.
+  const inbound = fw.inbound_rules ?? [];
+  const windowRule = (r: DoRule): boolean => {
+    const [protocol, ports, sources] = ruleKey(r, "in").split("|");
+    return protocol === "tcp" && ports === "22" && /^(\d{1,3}(\.\d{1,3}){3}\/32|[0-9a-f:]+\/128)$/.test(sources ?? "");
+  };
+  if (inbound.length > 2 || !inbound.every(windowRule)) {
+    return undefined;
+  }
+  const managed = labelTag(LABEL_MANAGED, "1");
+  if ((fw.droplet_ids ?? []).some((id) => !(dropletTags.get(id) ?? []).includes(boxTag(box)) || !(dropletTags.get(id) ?? []).includes(managed))) {
     return undefined;
   }
   return box;
@@ -165,7 +186,7 @@ export function frostyFirewallBox(fw: Pick<DoFirewall, "name" | "tags" | "outbou
 // The inbound rules as frosty's model has them. Sources other than addresses are kept as
 // "tag:..." etc., so a check sees them and assertWindowRules refuses them.
 function toModelRule(r: DoRule): FirewallRule {
-  const key = ruleKey(r).split("|");
+  const key = ruleKey(r, "in").split("|");
   return {
     direction: "in",
     protocol: r.protocol,
@@ -179,8 +200,12 @@ function toDoInbound(r: FirewallRule): DoRule {
   return { protocol: r.protocol, ports: r.port ?? "0", sources: { addresses: [...(r.source_ips ?? [])] } };
 }
 
-function toModelFirewall(fw: DoFirewall): Firewall {
-  const box = frostyFirewallBox(fw);
+function tagsOf(droplets: DoDroplet[]): DropletTags {
+  return new Map(droplets.map((d) => [d.id, d.tags ?? []]));
+}
+
+function toModelFirewall(fw: DoFirewall, dropletTags: DropletTags): Firewall {
+  const box = frostyFirewallBox(fw, dropletTags);
   return {
     id: fw.id,
     name: fw.name,
@@ -302,6 +327,21 @@ export class DigitalOcean implements Provider {
     return body.firewall;
   }
 
+  // The tags of the droplets a firewall is attached to by id. One that is gone is left out.
+  private async dropletTagsFor(fw: DoFirewall): Promise<DropletTags> {
+    const tags: DropletTags = new Map();
+    for (const id of fw.droplet_ids ?? []) {
+      try {
+        tags.set(id, (await this.getDroplet(id)).tags ?? []);
+      } catch (error) {
+        if (!(error instanceof ApiError && error.status === 404)) {
+          throw error;
+        }
+      }
+    }
+    return tags;
+  }
+
   private async getDroplet(id: number): Promise<DoDroplet> {
     const body = await this.request<{ droplet: DoDroplet }>("GET", `/droplets/${id}`);
     return body.droplet;
@@ -319,7 +359,8 @@ export class DigitalOcean implements Provider {
 
   async listFirewalls(labelSelector?: string): Promise<Firewall[]> {
     const wanted = parseSelector(labelSelector);
-    return (await this.listDoFirewalls()).map(toModelFirewall).filter((f) => selected(f.labels, wanted));
+    const [firewalls, droplets] = await Promise.all([this.listDoFirewalls(), this.listAll<DoDroplet>("/droplets", "droplets")]);
+    return firewalls.map((f) => toModelFirewall(f, tagsOf(droplets))).filter((f) => selected(f.labels, wanted));
   }
 
   async serversNamed(name: string): Promise<Server[]> {
@@ -328,7 +369,8 @@ export class DigitalOcean implements Provider {
   }
 
   async firewallsNamed(name: string): Promise<Firewall[]> {
-    return (await this.listDoFirewalls()).filter((f) => f.name === name).map(toModelFirewall);
+    const [firewalls, droplets] = await Promise.all([this.listDoFirewalls(), this.listAll<DoDroplet>("/droplets", "droplets")]);
+    return firewalls.filter((f) => f.name === name).map((f) => toModelFirewall(f, tagsOf(droplets)));
   }
 
   listSshKeys(): Promise<SshKey[]> {
@@ -368,24 +410,26 @@ export class DigitalOcean implements Provider {
     await this.ensureTag(tag);
     const body = { name, inbound_rules: rules.map(toDoInbound), outbound_rules: OUTBOUND_RULES, tags: [tag], droplet_ids: [] };
     const created = await this.request<{ firewall: DoFirewall }>("POST", "/firewalls", body);
-    return { firewall: toModelFirewall(created.firewall), actions: [] };
+    return { firewall: toModelFirewall(created.firewall, new Map()), actions: [] };
   }
 
   async getFirewall(id: FirewallId): Promise<Firewall> {
-    return toModelFirewall(await this.getDoFirewall(id));
+    const fw = await this.getDoFirewall(id);
+    return toModelFirewall(fw, await this.dropletTagsFor(fw));
   }
 
   // Every firewall write re-reads the firewall and acts only on frosty's own (by its shape).
-  private async ourFirewall(id: FirewallId): Promise<DoFirewall & { box: string }> {
+  private async ourFirewall(id: FirewallId): Promise<DoFirewall & { box: string; dropletTags: DropletTags }> {
     const live = await this.getDoFirewall(id);
-    const box = frostyFirewallBox(live);
+    const dropletTags = await this.dropletTagsFor(live);
+    const box = frostyFirewallBox(live, dropletTags);
     if (box === undefined) {
       throw new FrostyError(
-        `frosty refused to change firewall ${live.name} (id ${live.id}): it doesn't have the shape of frosty's (name stayfrosty-<box>, no tag but the box's, allow-all outbound).`,
+        `frosty refused to change firewall ${live.name} (id ${live.id}): it doesn't have the shape of frosty's (name stayfrosty-<box>, no tag but the box's, allow-all outbound, attached only to droplets tagged as the box).`,
         "If frosty made it, someone changed it in the DigitalOcean control panel. Delete it there, then run the command again.",
       );
     }
-    return { ...live, box };
+    return { ...live, box, dropletTags };
   }
 
   // DigitalOcean firewalls have no labels: this only checks that the caller keeps frosty's, and
@@ -395,7 +439,7 @@ export class DigitalOcean implements Provider {
     if (labels[LABEL_MANAGED] !== "1" || labels[LABEL_BOX] !== live.box) {
       throw new FrostyError(`frosty refused to relabel firewall ${live.name}: it keeps frosty's labels.`, "This is a bug in frosty. Please report it.");
     }
-    return toModelFirewall(live);
+    return toModelFirewall(live, live.dropletTags);
   }
 
   // Inbound rules only, through the rules endpoints, so the outbound rules and the droplets the
@@ -405,10 +449,11 @@ export class DigitalOcean implements Provider {
     assertWindowRules(live.name, rules);
     const want = rules.map(toDoInbound);
     const have = live.inbound_rules ?? [];
-    const haveKeys = new Set(have.map(ruleKey));
-    const wantKeys = new Set(want.map(ruleKey));
-    const add = want.filter((r) => !haveKeys.has(ruleKey(r)));
-    const remove = have.filter((r) => !wantKeys.has(ruleKey(r)));
+    const key = (r: DoRule): string => ruleKey(r, "in");
+    const haveKeys = new Set(have.map(key));
+    const wantKeys = new Set(want.map(key));
+    const add = want.filter((r) => !haveKeys.has(key(r)));
+    const remove = have.filter((r) => !wantKeys.has(key(r)));
     const path = `/firewalls/${encodeURIComponent(live.id)}/rules`;
     if (add.length > 0) {
       await this.request<unknown>("POST", path, { inbound_rules: add }, { inbound_rules: have });
@@ -434,8 +479,18 @@ export class DigitalOcean implements Provider {
     throw new FrostyError("frosty detach-foreign works on Hetzner boxes only.", "Remove the other firewall in the DigitalOcean control panel (Networking, Firewalls).");
   }
 
+  // DigitalOcean deletes a firewall that still covers droplets, which would leave them open on
+  // every port. So frosty deletes it only once no droplet holds it by id or by its tag.
   async deleteFirewall(id: FirewallId): Promise<void> {
     const live = await this.ourFirewall(id);
+    const tagged = await this.listAll<DoDroplet>("/droplets", "droplets", { tag_name: boxTag(live.box) });
+    const covered = [...live.dropletTags.keys(), ...tagged.map((d) => d.id)];
+    if (covered.length > 0) {
+      throw new FrostyError(
+        `frosty refused to delete firewall ${live.name}: it still covers droplet(s) ${[...new Set(covered)].join(", ")}, which would be left with no firewall.`,
+        "Delete those droplets first (frosty destroy deletes the box's own), or remove them from the firewall in the DigitalOcean control panel if they aren't frosty's.",
+      );
+    }
     await this.request<unknown>("DELETE", `/firewalls/${encodeURIComponent(live.id)}`, undefined, { name: live.name, inbound_rules: live.inbound_rules, droplet_ids: live.droplet_ids, tags: live.tags });
   }
 
