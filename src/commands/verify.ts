@@ -1,4 +1,4 @@
-import { assertBoxName, buildContext, requireCloudflared, tunnelTarget, type Deps } from "../context.ts";
+import { allProviders, assertBoxName, buildContext, providerFor, requireCloudflared, tunnelTarget, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { LABEL_BOX, MANAGED_SELECTOR, boxSelector } from "../hetzner.ts";
 import { checkBox, printResults } from "./new.ts";
@@ -17,7 +17,8 @@ export async function runVerify(deps: Deps, opts: VerifyOptions): Promise<number
   const box = opts.box === undefined ? undefined : assertBoxName(opts.box);
   const ctx = await buildContext(deps);
   requireCloudflared(ctx);
-  const servers = await ctx.hetzner.listServers(box === undefined ? MANAGED_SELECTOR : boxSelector(box));
+  const servers =
+    box === undefined ? (await Promise.all(allProviders(ctx).map((p) => p.listServers(MANAGED_SELECTOR)))).flat() : await providerFor(ctx, box).listServers(boxSelector(box));
   if (servers.length === 0) {
     throw new FrostyError(box === undefined ? "frosty manages no boxes in this project." : `frosty has no box named ${box}.`, "See what exists with: frosty ls");
   }

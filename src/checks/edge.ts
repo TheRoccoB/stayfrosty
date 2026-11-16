@@ -1,6 +1,6 @@
 import { isOurTokenPolicy, serviceTokenIds, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfAccessRule, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfServiceToken, type CfTunnel } from "../cloudflare.ts";
 import { sameIngress } from "../edge.ts";
-import type { HzFirewall, HzServer } from "../hetzner.ts";
+import type { Firewall, Server } from "../provider.ts";
 import { LABEL_ADOPTED, LABEL_WINDOW_OPENED } from "../hetzner.ts";
 import type { Fetch } from "../http.ts";
 import { fail, pass, type CheckResult } from "./types.ts";
@@ -11,7 +11,7 @@ function rebuild(box: string): string {
   return `Run: frosty new ${box} --resume, or for an adopted box frosty adopt ${box} --ip <ip> --resume (each step checks and repairs its part)`;
 }
 
-export function checkWindowClosed(box: string, firewall: HzFirewall | undefined, now: number): CheckResult {
+export function checkWindowClosed(box: string, firewall: Firewall | undefined, now: number): CheckResult {
   const name = "Box firewall: no inbound rules";
   if (firewall === undefined) {
     return fail(name, "the box has no stayfrosty firewall", rebuild(box));
@@ -26,21 +26,22 @@ export function checkWindowClosed(box: string, firewall: HzFirewall | undefined,
   return pass(name, "deny all inbound");
 }
 
-// Hetzner firewalls add up, so a second firewall's allow rules would undo frosty's deny-all.
-export function checkOnlyOurFirewall(box: string, server: HzServer, firewall: HzFirewall | undefined): CheckResult {
+// Firewalls add up (on Hetzner and DigitalOcean alike), so a second firewall's allow rules would
+// undo frosty's deny-all.
+export function checkOnlyOurFirewall(box: string, server: Server, firewall: Firewall | undefined, consoleName = "the Hetzner Cloud Console"): CheckResult {
   const name = "Box firewall is the only one attached";
   const attached = server.public_net.firewalls ?? [];
   const ours = firewall !== undefined && attached.some((f) => f.id === firewall.id && f.status === "applied");
   const others = attached.filter((f) => f.id !== firewall?.id);
   if (!ours || others.length > 0) {
     const problems = [...(ours ? [] : ["frosty's firewall is not attached"]), ...(others.length > 0 ? [`other firewall(s) attached: id ${others.map((f) => f.id).join(", ")}`] : [])];
-    return fail(name, problems.join("; "), `Detach the others in the Hetzner Cloud Console (Firewalls); attach frosty's with the same command that set up ${box} and --resume.`);
+    return fail(name, problems.join("; "), `Detach the others in ${consoleName} (Firewalls); attach frosty's with the same command that set up ${box} and --resume.`);
   }
   return pass(name, `only ${firewall.name}`);
 }
 
 // An adopted server cannot be recreated (that is why it was adopted), so it must stay protected.
-export function checkProtected(server: HzServer): CheckResult | undefined {
+export function checkProtected(server: Server): CheckResult | undefined {
   if (server.labels[LABEL_ADOPTED] === undefined) {
     return undefined;
   }

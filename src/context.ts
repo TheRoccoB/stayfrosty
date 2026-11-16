@@ -4,15 +4,17 @@ import { closeSshMaster, fingerprintOf, hostKeyAlias, keyScan, systemSsh, forget
 import { isPublicKey } from "./cloudinit.ts";
 import { fileChangeLog } from "./changelog.ts";
 import { Cloudflare } from "./cloudflare.ts";
-import { expandHome, loadConfig, type Config, type Env } from "./config.ts";
+import { expandHome, loadConfig, providerKindFor, type Config, type Env } from "./config.ts";
+import { DigitalOcean } from "./digitalocean.ts";
 import { authoritativeResolves, systemResolves } from "./dns.ts";
 import { FrostyError } from "./errors.ts";
-import { Hetzner, LABEL_ADOPTED, type HzServer } from "./hetzner.ts";
+import { Hetzner, LABEL_ADOPTED } from "./hetzner.ts";
 import { realSleep, type Fetch, type Sleep } from "./http.ts";
 import type { Io } from "./io.ts";
 import { findLaptopIp, type LaptopIp } from "./ip.ts";
 import { shellPasswordCommand, type PasswordCommandRunner } from "./password.ts";
-import { loadTokens } from "./tokens.ts";
+import type { Provider, Server, ServerSettings } from "./provider.ts";
+import { loadDigitalOceanToken, loadTokens } from "./tokens.ts";
 import { rawGet, type RawGet } from "./rawget.ts";
 import { findCommand, findStableCommand } from "./which.ts";
 
@@ -46,6 +48,8 @@ export interface Context {
   env: Env;
   config: Config;
   hetzner: Hetzner;
+  // Only when the config has a digitalocean section.
+  digitalocean: DigitalOcean | undefined;
   cloudflare: Cloudflare;
   sleep: Sleep;
   now: () => number;
@@ -84,11 +88,23 @@ export async function buildContext(deps: Deps): Promise<Context> {
     throw new FrostyError(`${keyPath}.pub is not a single OpenSSH public key line.`, "Point sshKey at a valid key: frosty init");
   }
   const fetchImpl = deps.fetch ?? globalThis.fetch;
+  const digitalocean =
+    config.digitalocean === undefined
+      ? undefined
+      : new DigitalOcean({
+          token: loadDigitalOceanToken(env),
+          fetch: fetchImpl,
+          sleep,
+          backups: config.digitalocean.backups,
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+          changeLog: config.digitaloceanChangeLog === undefined ? undefined : fileChangeLog(config.digitaloceanChangeLog),
+        });
   return {
     io: deps.io,
     env,
     config,
     hetzner: new Hetzner({ token: tokens.hetzner, fetch: fetchImpl, sleep, changeLog: config.hetznerChangeLog === undefined ? undefined : fileChangeLog(config.hetznerChangeLog) }),
+    digitalocean,
     cloudflare: new Cloudflare({ token: tokens.cloudflare, fetch: fetchImpl, sleep, changeLog: config.cloudflareChangeLog === undefined ? undefined : fileChangeLog(config.cloudflareChangeLog) }),
     sleep,
     now: deps.now ?? Date.now,
@@ -112,6 +128,30 @@ export async function buildContext(deps: Deps): Promise<Context> {
   };
 }
 
+// The cloud a box lives on, from boxProviders (Hetzner unless listed).
+export function providerFor(ctx: Pick<Context, "config" | "hetzner" | "digitalocean">, box: string): Provider {
+  if (providerKindFor(ctx.config, box) === "digitalocean") {
+    if (ctx.digitalocean === undefined) {
+      throw new FrostyError(`${box} is on digitalocean in boxProviders, but the config has no digitalocean section.`, "Add it (region, size, image), then run the command again.");
+    }
+    return ctx.digitalocean;
+  }
+  return ctx.hetzner;
+}
+
+// Every cloud frosty may have boxes on: Hetzner, then DigitalOcean if the config has it.
+export function allProviders(ctx: Pick<Context, "hetzner" | "digitalocean">): Provider[] {
+  return ctx.digitalocean === undefined ? [ctx.hetzner] : [ctx.hetzner, ctx.digitalocean];
+}
+
+// What new creates a box with: its provider's settings.
+export function serverSettings(config: Config, box: string): ServerSettings {
+  if (providerKindFor(config, box) === "digitalocean" && config.digitalocean !== undefined) {
+    return { serverType: config.digitalocean.size, location: config.digitalocean.region, image: config.digitalocean.image };
+  }
+  return { serverType: config.serverType, location: config.location, image: config.image };
+}
+
 // Box names become a Hetzner server name and the DNS label ssh-<box>.
 const BOX_NAME = /^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$/;
 
@@ -127,7 +167,7 @@ export function assertBoxName(box: string | undefined): string {
 }
 
 // During a window frosty reaches the box directly on its public IP.
-export function directTarget(ctx: Context, box: string, server: HzServer, family: 4 | 6): SshTarget {
+export function directTarget(ctx: Context, box: string, server: Server, family: 4 | 6): SshTarget {
   const host = family === 4 ? server.public_net.ipv4?.ip : ipv6Host(server.public_net.ipv6?.ip);
   if (host === undefined) {
     throw new FrostyError(`Box ${server.name} has no public IPv${family} address.`, "This is a bug in frosty. Please report it.");

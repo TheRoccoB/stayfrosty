@@ -2,7 +2,7 @@
 
 A VPS with no front door.
 
-`frosty` is a command-line tool that runs on your laptop. It creates a Hetzner Cloud server that has no open inbound ports from its first second of life. The server is reachable only through a Cloudflare Tunnel behind Cloudflare Access, and it keeps itself patched and rebooted. `frosty` also writes your SSH config, and its `verify` command proves all of that. When the tunnel breaks, `breakglass` opens a short, narrow way back in and closes it again.
+`frosty` is a command-line tool that runs on your laptop. It creates a Hetzner Cloud server (or, optionally, a DigitalOcean droplet) that has no open inbound ports from its first second of life. The server is reachable only through a Cloudflare Tunnel behind Cloudflare Access, and it keeps itself patched and rebooted. `frosty` also writes your SSH config, and its `verify` command proves all of that. When the tunnel breaks, `breakglass` opens a short, narrow way back in and closes it again.
 
 It replaces [cloudflared-vps-lockdown](https://github.com/TheRoccoB/cloudflared-vps-lockdown) (`stayfrosty.sh`).
 
@@ -18,12 +18,13 @@ It replaces [cloudflared-vps-lockdown](https://github.com/TheRoccoB/cloudflared-
 | M3 | `verify`, `breakglass`, `ssh-config` | `verify`, `ssh-config` done |
 | M4 | `adopt`, full docs, first release | `adopt` done |
 | Extra | `route`: serve a web app through the tunnel (beyond the original scope, optional) | done |
+| Extra | Boxes on DigitalOcean (optional): `new`, `destroy`, `ls`, `verify`, `console-password` | done |
 
 When it is released, it will install from a tagged version, never from `main`, and never with `curl | bash`. Test it yourself, run `verify`, and do not trust some guy on the internet.
 
 ## Tokens
 
-`frosty` reads two tokens from the environment and nowhere else.
+`frosty` reads two tokens from the environment and nowhere else, plus a third for boxes on DigitalOcean.
 
 - `HCLOUD_TOKEN`: a Hetzner Cloud **Read & Write** token, in a project used only for stayfrosty boxes. One project per purpose limits what a leaked token can create or delete.
 - `CLOUDFLARE_API_TOKEN`: a custom Cloudflare token with exactly these permissions. Cloudflare is renaming "Edit" to "Write", and either name is the same permission.
@@ -35,7 +36,18 @@ When it is released, it will install from a tagged version, never from `main`, a
   - Zone (only your one domain, never all zones): DNS Edit
   - Zone (only your one domain, never all zones): Zone Read
 
-Keep them out of your shell history. Use `op run --env-file=... -- frosty ...`, or a `chmod 600` env file that you source. Put passkeys or hardware keys on your Hetzner, Cloudflare and GitHub accounts: anyone who controls those accounts controls your boxes.
+- `DIGITALOCEAN_TOKEN` (only once the config has a `digitalocean` section, see below): a DigitalOcean token with **Custom Scopes**, an expiry (90 days is a good default), and exactly these scopes:
+  - `droplet`: read, create, delete (not update, not admin)
+  - `firewall`: read, create, update, delete
+  - `ssh_key`: read, create
+  - `tag`: read, create (not delete)
+  - `actions:read`, `regions:read`, `sizes:read`, `image:read`, `snapshot:read`, `vpc:read`
+
+  The last line is what DigitalOcean itself requires for `droplet:create`; if ticking it adds other read scopes, keep them. frosty needs no `account`, `project` or `domain` scope, and no Full Access or Read Only preset.
+
+  **Create the token in a DigitalOcean team that holds only frosty's droplets.** DigitalOcean scopes can't be limited to some droplets: `droplet:delete` reaches every droplet in the team, and tags are the only mark of what is frosty's. frosty itself never deletes a droplet it didn't tag, but a leaked token could. A team of its own is what limits that, the way a Hetzner project of its own does.
+
+Keep them out of your shell history. Use `op run --env-file=... -- frosty ...`, or a `chmod 600` env file that you source. Put passkeys or hardware keys on your Hetzner, DigitalOcean, Cloudflare and GitHub accounts: anyone who controls those accounts controls your boxes.
 
 ## `frosty init`
 
@@ -44,6 +56,29 @@ frosty init
 ```
 
 It asks for your domain, the emails allowed through Access, an alert email, the SSH key, and the Hetzner location, server type and image. It checks both tokens with read-only calls, and writes `~/.config/stayfrosty/config.json` (mode 600). It creates nothing. Run it again to change a value; it offers your current values as defaults.
+
+## Boxes on DigitalOcean (optional)
+
+A box can be a DigitalOcean droplet instead of a Hetzner server, with the same cloud-init, tunnel, Access, alert, SSH config and checks. Add to the config by hand (`init` keeps these keys but doesn't ask about them):
+
+```json
+"boxProviders": { "mon1": "digitalocean" },
+"digitalocean": { "region": "fra1", "size": "s-1vcpu-512mb-10gb", "image": "ubuntu-24-04-x64", "backups": false }
+```
+
+Boxes not in `boxProviders` stay on Hetzner. Then `frosty new mon1`, `destroy`, `ls`, `verify`, `ssh-config` and `console-password` work as for any box; `--type` and `--location` take DigitalOcean slugs. `backups` turns on DigitalOcean's weekly droplet backups (a paid add-on). Set `digitaloceanChangeLog` for a JSON-lines log of every DigitalOcean write.
+
+How it maps, and what differs from Hetzner:
+
+- **Labels are tags.** frosty's labels become the droplet tags `stayfrosty:1` and `stayfrosty-box:<box>`. frosty never changes a droplet's tags after creating it.
+- **The firewall.** A DigitalOcean cloud firewall has no labels, so frosty knows its own by its whole shape: the name `stayfrosty-<box>`, applied by exactly the tag `stayfrosty-box:<box>`, exactly frosty's outbound rules, no inbound rule but the window, and attached by id only to droplets tagged `stayfrosty:1` and `stayfrosty-box:<box>`. It never writes to a firewall without that shape, and `new` refuses a box whose firewall name is taken by one. So a firewall made by hand, or one someone attached to another droplet, is left alone.
+- **Outbound.** Unlike Hetzner's, a DigitalOcean firewall blocks outbound traffic that no rule allows. frosty's firewall always carries allow-all outbound rules (TCP, UDP and ICMP) and only ever changes its inbound rules: none, or the window (TCP 22 from your laptop's address).
+- **Not quite from the first second.** The firewall is created before the droplet and applied by the box's tag, and attached by droplet id right after (and again by `--resume` if that attach is missing), so removing the tag by hand doesn't take it off. But DigitalOcean applies firewalls asynchronously: in a live run it reported the firewall pending for about 50 seconds after creating the droplet, 17 of them with the droplet already active. Whether traffic is filtered during that time isn't documented. Until then the droplet runs the stock image, where only sshd listens, with key-only login (DigitalOcean turns off password login when SSH keys are given). `new` waits until DigitalOcean reports the firewall applied, with nothing pending, before it connects. On Hetzner the firewall is part of the create call.
+- **Deleting.** DigitalOcean deletes a firewall that still covers droplets. frosty deletes its firewall only once no droplet holds it, by id or by the box's tag, so `destroy` never leaves a droplet with no firewall.
+- **No delete protection.** DigitalOcean droplets have no delete or rebuild protection. frosty refuses to delete a droplet it didn't tag, or one tagged `stayfrosty-adopted:*`, but nothing stops a person in the control panel. So `adopt` (and `detach-foreign`) refuse DigitalOcean boxes: adopting is for servers that can't be recreated, and those need protection.
+- **No window age.** With no firewall labels, `ls` shows an open window on a droplet as `OPEN` without its age.
+- **The droplet** gets public IPv4 and IPv6, no DigitalOcean monitoring agent and no Droplet Agent (the web Droplet Console's SSH helper). The console password is for DigitalOcean's Recovery Console.
+- **IPv6.** The DNS check looks for the droplet's own IPv6 address, where on Hetzner it looks for the box's whole /64.
 
 ## `frosty adopt`
 
@@ -185,7 +220,7 @@ An automated client on another machine, for example a backup puller, can't do th
 
 ## Change logs and guards
 
-Set `hetznerChangeLog` and `cloudflareChangeLog` in the config to absolute paths, and frosty appends a JSON line before and after every API write (and `boxChangeLog` for `ssh-users sync`) (status and ids only, bodies redacted). frosty only creates, changes or deletes Cloudflare tunnels, Access apps, policies and notifications named `stayfrosty-*`, and DNS records commented `stayfrosty box *`, so a broad token cannot reach anything else through it. It never deletes a server that is adopted or protected.
+Set `hetznerChangeLog`, `digitaloceanChangeLog` and `cloudflareChangeLog` in the config to absolute paths, and frosty appends a JSON line before and after every API write (and `boxChangeLog` for `ssh-users sync`) (status and ids only, bodies redacted). frosty only creates, changes or deletes Cloudflare tunnels, Access apps, policies and notifications named `stayfrosty-*`, and DNS records commented `stayfrosty box *`, so a broad token cannot reach anything else through it. It never deletes a server that is adopted or protected.
 
 ## `frosty ssh-config`
 
@@ -193,7 +228,7 @@ Set `hetznerChangeLog` and `cloudflareChangeLog` in the config to absolute paths
 frosty ssh-config [--dry-run]
 ```
 
-Rewrites `~/.ssh/stayfrosty.conf` from the Hetzner API, one `Host` block per box, and adds `Include stayfrosty.conf` to the top of `~/.ssh/config` if it isn't there yet (keeping a backup). It needs both tokens, like every command, but only reads the Hetzner API. Run it after making a box from another laptop, or when the file points at a cloudflared that is gone. `new`, `adopt` and `destroy` already do this.
+Rewrites `~/.ssh/stayfrosty.conf` from the Hetzner (and DigitalOcean) API, one `Host` block per box, and adds `Include stayfrosty.conf` to the top of `~/.ssh/config` if it isn't there yet (keeping a backup). It needs both tokens, like every command, but only reads the Hetzner API. Run it after making a box from another laptop, or when the file points at a cloudflared that is gone. `new`, `adopt` and `destroy` already do this.
 
 The `ProxyCommand` uses the first cloudflared on your `PATH`. A mise install path (`.../installs/cloudflared/<version>/...`) is written as mise's `latest` symlink to the newest installed version, so upgrading cloudflared doesn't leave SSH on the old one. Never the shim: a shim picks the version from the directory you run ssh in, so a cloned repo could choose what runs. Without a `latest` symlink (asdf), the versioned path is kept; run `frosty ssh-config` again after an upgrade.
 

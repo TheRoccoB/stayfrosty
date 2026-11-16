@@ -2,7 +2,7 @@ import { FRESH_CONNECTION, runOrFail, type SshTarget } from "../box.ts";
 import { logDone, fileChangeLog, type ChangeLog } from "../changelog.ts";
 import { runOnBoxChecks } from "../checks/onbox.ts";
 import { rebootTimeFor, restrictedUsersFor } from "../config.ts";
-import { assertBoxName, buildContext, requireCloudflared, tunnelTarget, type Context, type Deps } from "../context.ts";
+import { assertBoxName, buildContext, providerFor, requireCloudflared, tunnelTarget, type Context, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { boxSelector } from "../hetzner.ts";
 import { SSH_USERS_CLEANUP, SSH_USERS_ROLLBACK, sshUsersScript } from "../sshusers.ts";
@@ -23,7 +23,7 @@ export async function runSshUsers(deps: Deps, opts: SshUsersOptions): Promise<nu
   const box = assertBoxName(opts.box);
   const ctx = await buildContext(deps);
   requireCloudflared(ctx);
-  const servers = await ctx.hetzner.listServers(boxSelector(box));
+  const servers = await providerFor(ctx, box).listServers(boxSelector(box));
   if (servers.length === 0) {
     throw new FrostyError(`frosty has no box named ${box}.`, "See what exists with: frosty ls");
   }

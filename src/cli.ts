@@ -31,14 +31,15 @@ Usage:
   frosty ls
   frosty ssh-config                   rewrite ~/.ssh/stayfrosty.conf from the APIs
   frosty destroy <box>                type the box name to confirm
-  frosty console-password <box>       set a new password for the Hetzner web console
+  frosty console-password <box>       set a new password for the provider's web console
 
 Global flags:
   --dry-run    print what would change, change nothing
   --help       show this help
   --version    show the version
 
-Tokens come from HCLOUD_TOKEN and CLOUDFLARE_API_TOKEN. Run "frosty init" for details.`;
+Tokens come from HCLOUD_TOKEN and CLOUDFLARE_API_TOKEN, plus DIGITALOCEAN_TOKEN for boxes on
+DigitalOcean. Run "frosty init" for details.`;
 
 // Commands from later milestones, so nobody mistakes a missing command for a broken one.
 const PLANNED: Record<string, string> = {

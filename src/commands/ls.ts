@@ -1,9 +1,11 @@
 import { Cloudflare, NAME_PREFIX, type CfTunnel, BYPASS_POLICY_NAME } from "../cloudflare.ts";
 import { loadConfig, type Env } from "../config.ts";
-import { Hetzner, LABEL_BOX, LABEL_WINDOW_OPENED, MANAGED_SELECTOR, serverLocation, type HzFirewall } from "../hetzner.ts";
+import { DigitalOcean } from "../digitalocean.ts";
+import { Hetzner, LABEL_BOX, LABEL_WINDOW_OPENED, MANAGED_SELECTOR, serverLocation } from "../hetzner.ts";
+import type { Firewall, Provider } from "../provider.ts";
 import type { Fetch, Sleep } from "../http.ts";
 import { table, yellow, type Io } from "../io.ts";
-import { loadTokens } from "../tokens.ts";
+import { loadDigitalOceanToken, loadTokens } from "../tokens.ts";
 
 export interface LsDeps {
   io: Io;
@@ -19,12 +21,19 @@ export async function runLs(deps: LsDeps): Promise<number> {
   const now = deps.now ?? (() => new Date());
   const tokens = loadTokens(env);
   const config = await loadConfig(env, (line) => io.err(line));
-  const hetzner = new Hetzner({ token: tokens.hetzner, fetch: deps.fetch, sleep: deps.sleep });
+  const providers: Provider[] = [new Hetzner({ token: tokens.hetzner, fetch: deps.fetch, sleep: deps.sleep })];
+  if (config.digitalocean !== undefined) {
+    providers.push(new DigitalOcean({ token: loadDigitalOceanToken(env), fetch: deps.fetch, sleep: deps.sleep }));
+  }
   const cloudflare = new Cloudflare({ token: tokens.cloudflare, fetch: deps.fetch, sleep: deps.sleep });
 
-  const [servers, firewalls, tunnels, apps, policies, alerts, records] = await Promise.all([
-    hetzner.listServers(MANAGED_SELECTOR),
-    hetzner.listFirewalls(MANAGED_SELECTOR),
+  const [clouds, tunnels, apps, policies, alerts, records] = await Promise.all([
+    Promise.all(
+      providers.map(async (provider) => {
+        const [servers, firewalls] = await Promise.all([provider.listServers(MANAGED_SELECTOR), provider.listFirewalls(MANAGED_SELECTOR)]);
+        return { provider, servers, firewalls };
+      }),
+    ),
     cloudflare.listTunnels(config.accountId, { is_deleted: false }),
     cloudflare.listAccessApps(config.accountId),
     cloudflare.listAccessPolicies(config.accountId),
@@ -35,7 +44,8 @@ export async function runLs(deps: LsDeps): Promise<number> {
 
   const boxNames = new Set<string>();
   const rows: string[][] = [["BOX", "STATUS", "TYPE", "LOCATION", "IPV4", "TUNNEL", "WINDOW"]];
-  for (const server of [...servers].sort((a, b) => boxName(a.labels, a.name).localeCompare(boxName(b.labels, b.name)))) {
+  const servers = clouds.flatMap((c) => c.servers.map((server) => ({ server, firewalls: c.firewalls })));
+  for (const { server, firewalls } of [...servers].sort((a, b) => boxName(a.server.labels, a.server.name).localeCompare(boxName(b.server.labels, b.server.name)))) {
     const box = boxName(server.labels, server.name);
     boxNames.add(box);
     const firewall = firewalls.find((fw) => fw.labels[LABEL_BOX] === box);
@@ -61,10 +71,12 @@ export async function runLs(deps: LsDeps): Promise<number> {
 
   // Things frosty created whose box is gone. destroy should leave none.
   const leftovers: string[] = [];
-  for (const firewall of firewalls) {
-    const box = firewall.labels[LABEL_BOX];
-    if (box === undefined || !boxNames.has(box)) {
-      leftovers.push(`Hetzner firewall ${firewall.name}`);
+  for (const { provider, firewalls } of clouds) {
+    for (const firewall of firewalls) {
+      const box = firewall.labels[LABEL_BOX];
+      if (box === undefined || !boxNames.has(box)) {
+        leftovers.push(`${provider.label} firewall ${firewall.name}`);
+      }
     }
   }
   // stayfrosty-<box>, or a route app stayfrosty-<box>:<route>[:public]. The shared bypass policy
@@ -106,7 +118,7 @@ function tunnelState(tunnel: CfTunnel | undefined): string {
   return tunnel.status;
 }
 
-export function windowState(firewall: HzFirewall | undefined, now: Date): string {
+export function windowState(firewall: Firewall | undefined, now: Date): string {
   if (firewall === undefined) {
     return yellow("no firewall");
   }

@@ -49,7 +49,7 @@ export interface ConsolePasswordDeps {
 // Returns false when there is nowhere safe to send it, and sets nothing.
 export async function setConsolePassword(
   deps: ConsolePasswordDeps,
-  opts: { box: string; target: SshTarget; user: string; passwordCommand: string | undefined },
+  opts: { box: string; target: SshTarget; user: string; passwordCommand: string | undefined; consoleName?: string },
 ): Promise<boolean> {
   const password = generatePassword();
   if (opts.passwordCommand !== undefined) {
@@ -73,7 +73,7 @@ export async function setConsolePassword(
   }
   await setOnBox(deps.ssh, opts.target, opts.user, password);
   deps.io.out("");
-  deps.io.out(`Console password for ${opts.user} on ${opts.box} (Hetzner web console only; SSH stays key only).`);
+  deps.io.out(`Console password for ${opts.user} on ${opts.box} (${opts.consoleName ?? "Hetzner web console"} only; SSH stays key only).`);
   deps.io.out("Save this in your password manager now. frosty does not keep it and cannot show it again:");
   deps.io.reveal(`    ${password}`);
   deps.io.out("");

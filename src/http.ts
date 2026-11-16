@@ -1,4 +1,4 @@
-import { FrostyError, type ApiName } from "./errors.ts";
+import { API_LABELS, FrostyError, type ApiName } from "./errors.ts";
 
 export type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -56,7 +56,7 @@ export async function sendJson(opts: {
         await opts.sleep(backoffMs(attempt, undefined));
         continue;
       }
-      const label = opts.api === "hetzner" ? "Hetzner" : "Cloudflare";
+      const label = API_LABELS[opts.api];
       const reason = error instanceof Error ? error.message : String(error);
       throw new FrostyError(
         `Could not reach the ${label} API (${opts.method} ${pathOf(opts.url)}): ${reason}`,

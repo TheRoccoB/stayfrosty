@@ -1,4 +1,4 @@
-import { assertBoxName, buildContext, directTarget, tunnelTarget, type Deps } from "../context.ts";
+import { assertBoxName, buildContext, directTarget, providerFor, tunnelTarget, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { boxSelector } from "../hetzner.ts";
 import { windowSource } from "../ip.ts";
@@ -8,7 +8,8 @@ import { setConsolePassword } from "../password.ts";
 export async function runConsolePassword(deps: Deps, opts: { box: string | undefined; dryRun: boolean; direct?: boolean }): Promise<number> {
   const box = assertBoxName(opts.box);
   const ctx = await buildContext(deps);
-  const server = (await ctx.hetzner.listServers(boxSelector(box)))[0];
+  const provider = providerFor(ctx, box);
+  const server = (await provider.listServers(boxSelector(box)))[0];
   if (server === undefined) {
     throw new FrostyError(`frosty has no box named ${box}.`, "See what exists with: frosty ls");
   }
@@ -25,6 +26,6 @@ export async function runConsolePassword(deps: Deps, opts: { box: string | undef
   }
   // Normally through the tunnel. --direct uses the box's IP, for an open break-glass window.
   const target = opts.direct === true ? directTarget(ctx, box, server, windowSource(await ctx.laptopIp()).family) : tunnelTarget(ctx, box);
-  await setConsolePassword(ctx, { box, target, user: ctx.config.adminUser, passwordCommand: ctx.config.passwordCommand });
+  await setConsolePassword(ctx, { box, target, user: ctx.config.adminUser, passwordCommand: ctx.config.passwordCommand, consoleName: provider.webConsoleName });
   return 0;
 }

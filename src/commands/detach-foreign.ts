@@ -1,3 +1,4 @@
+import { providerKindFor } from "../config.ts";
 import { assertBoxName, buildContext, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { boxSelector } from "../hetzner.ts";
@@ -16,6 +17,9 @@ export async function runDetachForeign(deps: Deps, opts: DetachForeignOptions): 
   const box = assertBoxName(opts.box);
   const ctx = await buildContext(deps);
   const { io, hetzner } = ctx;
+  if (providerKindFor(ctx.config, box) !== "hetzner") {
+    throw new FrostyError(`frosty detach-foreign works on adopted Hetzner boxes only, and ${box} is on ${providerKindFor(ctx.config, box)}.`, "Remove other firewalls in that provider's own console.");
+  }
   const servers = await hetzner.listServers(boxSelector(box));
   if (servers.length !== 1) {
     throw new FrostyError(servers.length === 0 ? `frosty has no box named ${box}.` : `More than one server is labeled as box ${box}.`, "See what exists with: frosty ls");
