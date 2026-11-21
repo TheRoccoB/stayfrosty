@@ -1,5 +1,5 @@
 import { BYPASS_POLICY_NAME, DNS_COMMENT_PREFIX, NAME_PREFIX, isOurBypassPolicy, isOurEmailPolicy, isOurTokenPolicy, serviceTokenIds, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel, type IngressSpec } from "./cloudflare.ts";
-import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, isRouteAppOf, isRouteTokenPolicyOf, protectedUris, publicAppName, routeAppName, routeTokenPolicyName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
+import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, isRouteAppOf, isRouteEmailPolicyOf, isRouteTokenPolicyOf, protectedUris, publicAppName, routeAppName, routeEmailPolicyName, routeTokenPolicyName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
 import { missingServiceTokenHint, SERVICE_TOKEN_ELSEWHERE_FIX, tokenExpiry } from "./checks/edge.ts";
 import { planRouteTokens, type RouteTokenPlan } from "./servicetokens.ts";
 import { runOrFail, type SshTarget } from "./box.ts";
@@ -88,6 +88,8 @@ export interface Edge {
   tokenPolicy: CfAccessPolicy | undefined;
   // stayfrosty-<box>:<route>:service-tokens, only for routes with serviceTokens (frosty route sync).
   routeTokenPolicies: CfAccessPolicy[];
+  // stayfrosty-<box>:<route>:emails, only for routes with their own emails (frosty route sync).
+  routeEmailPolicies: CfAccessPolicy[];
   alert: CfNotificationPolicy | undefined;
 }
 
@@ -111,12 +113,13 @@ export async function findEdge(ctx: Context, box: string): Promise<Edge> {
     policy: policies.find((p) => p.name === name),
     tokenPolicy: policies.find((p) => p.name === tokenPolicyName(box)),
     routeTokenPolicies: policies.filter((p) => isRouteTokenPolicyOf(box, p.name)),
+    routeEmailPolicies: policies.filter((p) => isRouteEmailPolicyOf(box, p.name)),
     alert: alerts.find((a) => a.name === name),
   };
 }
 
 export function edgeIsEmpty(edge: Edge): boolean {
-  return edge.tunnel === undefined && edge.dns.length === 0 && edge.app === undefined && edge.routeApps.length === 0 && edge.policy === undefined && edge.tokenPolicy === undefined && edge.routeTokenPolicies.length === 0 && edge.alert === undefined;
+  return edge.tunnel === undefined && edge.dns.length === 0 && edge.app === undefined && edge.routeApps.length === 0 && edge.policy === undefined && edge.tokenPolicy === undefined && edge.routeTokenPolicies.length === 0 && edge.routeEmailPolicies.length === 0 && edge.alert === undefined;
 }
 
 // Step 7: the tunnel and its ingress, managed from Cloudflare.
@@ -192,6 +195,16 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
     }
     plans.set(route.name, plan);
   }
+  // A route's email policy may only ever be on that route's own app: one found anywhere else stops
+  // the sync before any write (frosty would otherwise keep changing who gets into that other app).
+  const emailPolicies = policies.filter((p) => isRouteEmailPolicyOf(box, p.name));
+  if (emailPolicies.length > 0) {
+    const full = await Promise.all(apps.map((a) => cloudflare.getAccessApp(config.accountId, a.id)));
+    const misplaced = routeEmailPoliciesElsewhere(box, emailPolicies, full);
+    if (misplaced.length > 0) {
+      throw new FrostyError(`A route's email policy belongs on that route's own Access app only, but: ${misplaced.join("; ")}.`, "Take the policy off those apps in the Cloudflare dashboard (Zero Trust, Access, Applications), then run the command again.");
+    }
+  }
   for (const route of routes) {
     const have = routeApps(apps, box, route);
     for (const c of await checkExternalAccess(ctx, route, have)) {
@@ -205,10 +218,13 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
       // The token policy is written before the app that uses it.
       const plan = plans.get(route.name);
       const tokenPolicyId = plan === undefined ? undefined : await ensureRouteTokenPolicy(ctx, box, route, plan);
-      const policyIds = [(emailPolicy as CfAccessPolicy).id, ...(tokenPolicyId === undefined ? [] : [tokenPolicyId])];
+      // A route with its own emails gets its own email policy in place of the box's, written first.
+      const emailPolicyId = route.emails === undefined ? (emailPolicy as CfAccessPolicy).id : await ensureRouteEmailPolicy(ctx, box, route, emailPolicies.find((p) => p.name === routeEmailPolicyName(box, route)));
+      const policyIds = [emailPolicyId, ...(tokenPolicyId === undefined ? [] : [tokenPolicyId])];
       if (have.app === undefined || !appMatches(await cloudflare.getAccessApp(config.accountId, have.app.id), want, policyIds)) {
-        const tokens = plan === undefined ? "" : `, with ${plan.policyName}`;
-        io.out(`${have.app === undefined ? "Creating" : "Updating"} Access application ${routeAppName(box, route)} for ${want.join(", ")}${tokens}.`);
+        const tokens = plan === undefined ? "" : ` and ${plan.policyName}`;
+        const who = route.emails === undefined ? edgeName(box) : routeEmailPolicyName(box, route);
+        io.out(`${have.app === undefined ? "Creating" : "Updating"} Access application ${routeAppName(box, route)} for ${want.join(", ")}, with ${who}${tokens}.`);
         await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "protected", policyIds }, have.app?.id);
       }
     }
@@ -236,6 +252,43 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
     io.out(`Deleting Access policy ${policy.name}: its route no longer lists service tokens.`);
     await cloudflare.deleteAccessPolicy(config.accountId, policy);
   }
+  // Email policies of routes that no longer list emails: their apps went back to the box's policy above.
+  const wantedEmailPolicies = new Set(routes.filter((r) => r.emails !== undefined && frostyProtected(r).length > 0).map((r) => routeEmailPolicyName(box, r)));
+  for (const policy of emailPolicies.filter((p) => !wantedEmailPolicies.has(p.name))) {
+    io.out(`Deleting Access policy ${policy.name}: its route no longer lists its own emails.`);
+    await cloudflare.deleteAccessPolicy(config.accountId, policy);
+  }
+}
+
+// Where the box's route email policies are attached outside their own route's app, as problems.
+export function routeEmailPoliciesElsewhere(box: string, emailPolicies: CfAccessPolicy[], apps: CfAccessApp[]): string[] {
+  const out: string[] = [];
+  for (const app of apps) {
+    for (const p of app.policies ?? []) {
+      const policy = emailPolicies.find((e) => e.id === p.id);
+      if (policy !== undefined && policy.name !== `${app.name}:emails`) {
+        out.push(`${policy.name} is attached to ${app.name}`);
+      }
+    }
+  }
+  return out;
+}
+
+// The route's email policy, created or rewritten to let in exactly the route's emails. Its id.
+async function ensureRouteEmailPolicy(ctx: Context, box: string, route: Route, listed: CfAccessPolicy | undefined): Promise<string> {
+  const { cloudflare, config, io } = ctx;
+  const name = routeEmailPolicyName(box, route);
+  const emails = route.emails ?? [];
+  if (listed === undefined) {
+    io.out(`Creating Access policy ${name}: allow ${emails.join(", ")}.`);
+    return (await cloudflare.putRouteEmailPolicy(config.accountId, box, route)).id;
+  }
+  const live = await cloudflare.getAccessPolicy(config.accountId, listed.id);
+  if (!isOurEmailPolicy(live) || live.name !== name || !sameEmails((live.include ?? []).map((r) => r.email?.email ?? ""), emails)) {
+    io.out(`Updating Access policy ${name}: allow ${emails.join(", ")}.`);
+    await cloudflare.putRouteEmailPolicy(config.accountId, box, route, live.id);
+  }
+  return live.id;
 }
 
 // The route's token policy, created or rewritten to let in exactly the configured tokens. Its id.
@@ -475,7 +528,7 @@ export async function removeEdge(ctx: Context, edge: Edge): Promise<void> {
     await cloudflare.deleteAccessApp(config.accountId, app);
   }
   // After the apps that use them, before the email policy.
-  for (const policy of edge.routeTokenPolicies) {
+  for (const policy of [...edge.routeTokenPolicies, ...edge.routeEmailPolicies]) {
     io.out(`Deleting Access policy ${policy.name}.`);
     await cloudflare.deleteAccessPolicy(config.accountId, policy);
   }
@@ -520,7 +573,7 @@ export function describeEdge(edge: Edge): string[] {
   if (edge.tokenPolicy !== undefined) {
     lines.push(`Cloudflare Access policy ${edge.tokenPolicy.name}`);
   }
-  for (const policy of edge.routeTokenPolicies) {
+  for (const policy of [...edge.routeTokenPolicies, ...edge.routeEmailPolicies]) {
     lines.push(`Cloudflare Access policy ${policy.name}`);
   }
   if (edge.alert !== undefined) {

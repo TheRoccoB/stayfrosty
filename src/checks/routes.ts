@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { BYPASS_POLICY_NAME, isOurBypassPolicy, isOurEmailPolicy, isOurTokenPolicy, serviceTokenIds, type CfAccessApp, type CfAccessPolicy } from "../cloudflare.ts";
-import { appCovers, appMatches, describeIncludes, externalPolicyProblems, routeApps } from "../edge.ts";
-import { ROOT, accessUri, isUnder, bypassUris, exactPaths, frostyProtected, protectedUris, publicAppName, routeAppName, routeServiceTokens, routeTokenPolicyName, servicePort, type Route } from "../routes.ts";
+import { appCovers, appMatches, describeIncludes, externalPolicyProblems, routeApps, routeEmailPoliciesElsewhere, sameEmails } from "../edge.ts";
+import { ROOT, accessUri, isUnder, bypassUris, exactPaths, frostyProtected, protectedUris, publicAppName, routeAppName, routeEmailPolicyName, routeServiceTokens, routeTokenPolicyName, servicePort, type Route } from "../routes.ts";
 import type { RouteTokenPlan } from "../servicetokens.ts";
 import { missingServiceTokenHint, SERVICE_TOKEN_ELSEWHERE_FIX, SERVICE_TOKEN_EXPIRED_FIX, tokenExpiry } from "./edge.ts";
 import type { RawGet, RawResponse } from "../rawget.ts";
@@ -135,7 +135,10 @@ export function checkRouteAccess(box: string, route: Route, apps: CfAccessApp[],
   const name = `Route ${route.name}: Access apps`;
   const problems: string[] = [];
   const have = routeApps(apps, box, route);
-  const emailPolicy = policies.find((p) => p.id === boxPolicyId);
+  // A route with its own emails uses its own email policy instead of the box's (checkRouteEmails
+  // checks that policy's contents).
+  const emailPolicy = route.emails === undefined ? policies.find((p) => p.id === boxPolicyId) : policies.find((p) => p.name === routeEmailPolicyName(box, route));
+  const emailLabel = route.emails === undefined ? "frosty's email policy" : routeEmailPolicyName(box, route);
   const bypass = policies.find((p) => p.name === BYPASS_POLICY_NAME);
   const prot = frostyProtected(route);
   if (prot.length > 0) {
@@ -143,7 +146,7 @@ export function checkRouteAccess(box: string, route: Route, apps: CfAccessApp[],
     const tokens = routeServiceTokens(route).length > 0;
     const ids = emailPolicy === undefined ? [] : [emailPolicy.id, ...(tokens && tokenPolicy !== undefined ? [tokenPolicy.id] : [])];
     if (have.app === undefined || emailPolicy === undefined || !isOurEmailPolicy(emailPolicy) || (tokens && tokenPolicy === undefined) || !appMatches(have.app, want, ids)) {
-      problems.push(`${routeAppName(box, route)} should cover exactly ${want.join(", ")} with only frosty's email policy${tokens ? ` and ${routeTokenPolicyName(box, route)}` : ""}`);
+      problems.push(`${routeAppName(box, route)} should cover exactly ${want.join(", ")} with only ${emailLabel}${tokens ? ` and ${routeTokenPolicyName(box, route)}` : ""}`);
     }
   } else if (have.app !== undefined) {
     problems.push(`${routeAppName(box, route)} exists but covers nothing`);
@@ -178,6 +181,50 @@ export function checkRouteAccess(box: string, route: Route, apps: CfAccessApp[],
     return fail(name, problems.join("; "), `Run: frosty route sync ${box}`);
   }
   return pass(name, [`${[prot.length > 0 ? routeAppName(box, route) : "", bp.length > 0 ? publicAppName(box, route) : ""].filter((x) => x !== "").join(" and ") || "external apps only"} as configured`, ...externals].join("; "));
+}
+
+// A route's own emails: its email policy lets in exactly the configured emails, frosty's shape (allow,
+// emails only), it is on no app but the route's own, and that app offers every login method of the
+// team (allowed_idps empty), so people without the other login can use the one-time PIN.
+export function checkRouteEmails(box: string, route: Route, policy: CfAccessPolicy | undefined, apps: CfAccessApp[], allEmailPolicies: CfAccessPolicy[]): CheckResult {
+  const policyName = routeEmailPolicyName(box, route);
+  const name = `Route ${route.name}: its own emails`;
+  const sync = `Run: frosty route sync ${box}`;
+  const problems: string[] = [];
+  const emails = route.emails ?? [];
+  if (policy === undefined) {
+    problems.push(`no Access policy ${policyName}`);
+  } else {
+    if (!isOurEmailPolicy(policy) || policy.name !== policyName) {
+      problems.push(`${policyName} is not only emails (allow, email includes, no require or exclude)`);
+    }
+    const have = (policy.include ?? []).map((r) => r.email?.email ?? "");
+    if (!sameEmails(have, emails)) {
+      const want = new Set(emails.map((e) => e.toLowerCase()));
+      const got = new Set(have.map((e) => e.toLowerCase()));
+      const extra = [...got].filter((e) => !want.has(e));
+      const missing = [...want].filter((e) => !got.has(e));
+      problems.push(`${policyName} doesn't match the route's emails${extra.length > 0 ? `; lets in ${extra.join(", ")} too` : ""}${missing.length > 0 ? `; leaves out ${missing.join(", ")}` : ""}`);
+    }
+  }
+  problems.push(...routeEmailPoliciesElsewhere(box, allEmailPolicies, apps).filter((p) => p.startsWith(`${policyName} `)));
+  const app = routeApps(apps, box, route).app;
+  const idps = app?.allowed_idps ?? [];
+  if (idps.length > 0) {
+    problems.push(`${routeAppName(box, route)} offers only ${idps.length} login method(s) (allowed_idps), not every one of the team`);
+  }
+  if (problems.length > 0) {
+    return fail(name, problems.join("; "), sync);
+  }
+  return pass(name, `${policyName} lets in ${emails.length} email(s), on ${routeAppName(box, route)} only, every login method offered`);
+}
+
+// Route email policies that no configured route wants: route sync deletes them.
+export function checkStrayRouteEmailPolicies(box: string, strays: CfAccessPolicy[]): CheckResult | undefined {
+  if (strays.length === 0) {
+    return undefined;
+  }
+  return fail("Route email policies", `${strays.map((p) => p.name).join(", ")}: no route of ${box} lists its own emails for it`, `Run: frosty route sync ${box}`);
 }
 
 // A route's service tokens: its token policy lets in exactly the configured tokens and nothing else,
