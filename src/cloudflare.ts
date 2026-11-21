@@ -285,6 +285,8 @@ export class Cloudflare {
   private readonly baseUrl: string;
 
   private readonly changeLog: ChangeLog | undefined;
+  // Set for a dry run: every write throws before anything is sent.
+  private writesRefused = false;
 
   constructor(opts: { token: string; fetch?: Fetch; sleep?: Sleep; baseUrl?: string; changeLog?: ChangeLog | undefined }) {
     this.token = opts.token;
@@ -294,9 +296,18 @@ export class Cloudflare {
     this.baseUrl = opts.baseUrl ?? CLOUDFLARE_BASE_URL;
   }
 
+  // From now on this client sends no writes: a dry run's guarantee, whatever the code above it does.
+  refuseWrites(): void {
+    this.writesRefused = true;
+  }
+
   // Private, so every write goes through a method below and its guard.
   private async envelope<T>(method: string, path: string, body?: unknown, before?: unknown): Promise<Envelope<T>> {
     const write = method !== "GET";
+    if (write && this.writesRefused) {
+      // A plain Error: reportError calls it a bug in frosty, which it is.
+      throw new Error(`A dry run tried to send cloudflare ${method} ${path}. Nothing was sent.`);
+    }
     if (write) {
       this.changeLog?.({ phase: "intent", action: `cloudflare ${method}`, target: path, before, request: body });
     }

@@ -386,6 +386,40 @@ describe("frosty route plan with service tokens", () => {
     expect(http.writes()).toEqual([]);
   });
 
+  it("sync --dry-run prints every write in order and makes none; after a real sync it has nothing to do", async () => {
+    const io = new ScriptedIo();
+    expect(await runRoute(deps(io), { action: "sync", box: "mon1", dryRun: true }), io.text()).toBe(0);
+    expect(http.writes()).toEqual([]);
+    const lines = io.stdout.filter((l) => l.startsWith("Would ") || l.startsWith("  + ") || l.startsWith("  - "));
+    expect(lines[0]).toBe(`Would create Access policy ${POLICY}: let in service tokens monitoring-agents.`);
+    expect(lines[1]).toMatch(/^Would create Access application stayfrosty-mon1:hub for .*, with stayfrosty-mon1 and /);
+    expect(lines.some((l) => l.startsWith("Would set the tunnel's ingress:"))).toBe(true);
+    expect(lines.some((l) => l.startsWith("  + ") && l.includes("[Access: the new app's audience]"))).toBe(true);
+    expect(io.text()).toContain("Nothing was changed.");
+
+    const real = new ScriptedIo();
+    expect(await runRoute(deps(real), { action: "sync", box: "mon1" }), real.text()).toBe(0);
+    // The real sync says the same things, in the same order, as the dry run said it would.
+    const did = real.stdout.filter((l) => /^(Creating|Updating|Deleting|Setting) /.test(l));
+    const would = io.stdout.filter((l) => l.startsWith("Would "));
+    // Same object and detail on each line; only the verb differs ("Would create" / "Creating").
+    const rest = (l: string): string => l.replace(/^Would \w+ |^\w+ /, "");
+    expect(would.map(rest)).toEqual(did.map(rest));
+    expect(would.length).toBeGreaterThan(0);
+
+    const writes = http.writes().length;
+    const again = new ScriptedIo();
+    expect(await runRoute(deps(again), { action: "sync", box: "mon1", dryRun: true })).toBe(0);
+    expect(again.text()).toContain("Dry run: sync would change nothing.");
+    expect(http.writes().length).toBe(writes);
+  });
+
+  it("sync --dry-run refuses where sync would, before anything", async () => {
+    await config([{ ...hub, serviceTokens: ["no-such-token"] }]);
+    await expect(runRoute(deps(new ScriptedIo()), { action: "sync", box: "mon1", dryRun: true })).rejects.toThrow(/no service token named no-such-token/);
+    expect(http.writes()).toEqual([]);
+  });
+
   it("sync creates the policy and the app, then plan shows both in place", async () => {
     const io = new ScriptedIo();
     expect(await runRoute(deps(io), { action: "sync", box: "mon1" }), io.text()).toBe(0);

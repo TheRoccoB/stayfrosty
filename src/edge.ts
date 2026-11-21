@@ -1,5 +1,5 @@
 import { BYPASS_POLICY_NAME, DNS_COMMENT_PREFIX, NAME_PREFIX, isOurBypassPolicy, isOurEmailPolicy, isOurTokenPolicy, serviceTokenIds, tokenPolicyName, type CfAccessApp, type CfAccessPolicy, type CfDnsRecord, type CfIngressRule, type CfNotificationPolicy, type CfTunnel, type IngressSpec } from "./cloudflare.ts";
-import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, isRouteAppOf, isRouteEmailPolicyOf, isRouteTokenPolicyOf, protectedUris, publicAppName, routeAppName, routeEmailPolicyName, routeTokenPolicyName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
+import { accessUri, boxIngress, bypassUris, frostyProtected, ingressKey, inZones, isRouteAppOf, isRouteEmailPolicyOf, isRouteTokenPolicyOf, protectedUris, publicAppName, routeAppName, routeEmailPolicyName, routeTokenPolicyName, sameIngressRules, type IngressRule, type Route } from "./routes.ts";
 import { missingServiceTokenHint, SERVICE_TOKEN_ELSEWHERE_FIX, tokenExpiry } from "./checks/edge.ts";
 import { planRouteTokens, type RouteTokenPlan } from "./servicetokens.ts";
 import { runOrFail, type SshTarget } from "./box.ts";
@@ -135,9 +135,9 @@ export async function ensureTunnel(ctx: Context, box: string, existing: CfTunnel
 }
 
 // SSH, plus every configured route whose Access apps exist, plus the 404s. Idempotent.
-export async function ensureIngress(ctx: Context, box: string, tunnel: CfTunnel): Promise<void> {
-  const { cloudflare, config, io } = ctx;
-  const spec = boxRoutes(ctx, box).length === 0 ? ingressSpec(ctx, box, []) : ingressSpec(ctx, box, await cloudflare.listAccessApps(config.accountId));
+export async function ensureIngress(ctx: Context, box: string, tunnel: CfTunnel, run: SyncRun = realRun(ctx)): Promise<void> {
+  const { cloudflare, config } = ctx;
+  const spec = boxRoutes(ctx, box).length === 0 ? ingressSpec(ctx, box, []) : ingressSpec(ctx, box, [...(await cloudflare.listAccessApps(config.accountId)), ...run.planned]);
   const have = await cloudflare.getTunnelIngress(config.accountId, tunnel.id);
   // Rules frosty could have written: the SSH host, app hosts in appZones (current or removed
   // routes), and the catch-all. Anything else came from someone else, and frosty won't overwrite it.
@@ -148,11 +148,70 @@ export async function ensureIngress(ctx: Context, box: string, tunnel: CfTunnel)
       "Remove those rules in the Cloudflare dashboard (Zero Trust, Networks, Tunnels), or add the hostname to appZones and routes, then run the command again.",
     );
   }
-  if (!sameIngressRules(have, specIngress(spec))) {
+  const want = specIngress(spec);
+  if (!sameIngressRules(have, want)) {
     const routes = spec.routes.map((r) => `${r.route.hostname} (${[...r.route.public, ...r.route.protected].length} paths)`);
-    io.out(`Setting the tunnel's ingress: ${sshHostname(ctx, box)} to ssh://localhost:22${routes.length > 0 ? `, ${routes.join(", ")}` : ""}, everything else 404.`);
+    run.say("Setting", "set", `the tunnel's ingress: ${sshHostname(ctx, box)} to ssh://localhost:22${routes.length > 0 ? `, ${routes.join(", ")}` : ""}, everything else 404.`);
+    if (run.dry) {
+      for (const line of ingressDiff(have, want)) {
+        ctx.io.out(`  ${line}`);
+      }
+      return;
+    }
     await cloudflare.putTunnelIngress(config.accountId, tunnel, spec);
   }
+}
+
+// The rules a new ingress drops (-) and adds (+), and whether the rules it keeps change order.
+export function ingressDiff(have: CfIngressRule[], want: IngressRule[]): string[] {
+  const haveKeys = have.map(ingressKey);
+  const wantKeys = want.map((r) => ingressKey(r));
+  const out = [
+    ...have.filter((_, i) => !wantKeys.includes(haveKeys[i] as string)).map((r) => `- ${showRule(r)}`),
+    ...want.filter((_, i) => !haveKeys.includes(wantKeys[i] as string)).map((r) => `+ ${showRule(r)}`),
+  ];
+  const keptHave = haveKeys.filter((k) => wantKeys.includes(k));
+  const keptWant = wantKeys.filter((k) => haveKeys.includes(k));
+  if (keptHave.join("\n") !== keptWant.join("\n")) {
+    out.push("and the rules it keeps change order");
+  }
+  return out;
+}
+
+function showRule(rule: { hostname?: string; path?: string; service: string; originRequest?: unknown }): string {
+  const aud = (rule.originRequest as { access?: { audTag?: string[] } } | undefined)?.access?.audTag;
+  const access = aud === undefined ? "" : `  [Access: ${aud.map((a) => (a === NEW_AUD ? "the new app's audience" : `audience ${a.slice(0, 12)}...`)).join(", ")}]`;
+  return `${rule.hostname ?? "everything else"}${rule.path === undefined ? "" : ` ${rule.path}`} -> ${rule.service}${access}`;
+}
+
+// What a sync does with each write: really make it, or (dry run) print it and skip it. planned holds
+// the Access apps a dry run would have created, so its ingress can route their paths.
+export interface SyncRun {
+  dry: boolean;
+  changes: number;
+  planned: CfAccessApp[];
+  say(doing: string, would: string, rest: string): void;
+}
+
+// Stand-ins for what a dry run would have created: no real object has these.
+const NEW_ID = "(new)";
+const NEW_AUD = "(new)";
+
+function realRun(ctx: Context): SyncRun {
+  return syncRun(ctx, false);
+}
+
+export function syncRun(ctx: Context, dry: boolean): SyncRun {
+  const run: SyncRun = {
+    dry,
+    changes: 0,
+    planned: [],
+    say(doing, would, rest) {
+      run.changes++;
+      ctx.io.out(dry ? `Would ${would} ${rest}` : `${doing} ${rest}`);
+    },
+  };
+  return run;
 }
 
 export function sameIngress(a: CfIngressRule[], b: CfIngressRule[]): boolean {
@@ -161,7 +220,10 @@ export function sameIngress(a: CfIngressRule[], b: CfIngressRule[]): boolean {
 
 // frosty route sync: each route's Access apps first, then the ingress that routes their paths, then
 // remove apps of routes no longer in config (their paths already left the ingress).
-export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): Promise<void> {
+// With a dry run, every write is printed as "Would ..." and skipped (the caller also sets the client
+// to refuse writes); the checks before any write still run, so a dry run refuses where sync would.
+// The number of changes made, or that a dry run would make.
+export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel, run: SyncRun = realRun(ctx)): Promise<number> {
   const { cloudflare, config, io } = ctx;
   const routes = boxRoutes(ctx, box);
   const [apps, policies] = await Promise.all([cloudflare.listAccessApps(config.accountId), cloudflare.listAccessPolicies(config.accountId)]);
@@ -217,47 +279,66 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
       const want = protectedUris(route);
       // The token policy is written before the app that uses it.
       const plan = plans.get(route.name);
-      const tokenPolicyId = plan === undefined ? undefined : await ensureRouteTokenPolicy(ctx, box, route, plan);
+      const tokenPolicyId = plan === undefined ? undefined : await ensureRouteTokenPolicy(ctx, box, route, plan, run);
       // A route with its own emails gets its own email policy in place of the box's, written first.
-      const emailPolicyId = route.emails === undefined ? (emailPolicy as CfAccessPolicy).id : await ensureRouteEmailPolicy(ctx, box, route, emailPolicies.find((p) => p.name === routeEmailPolicyName(box, route)));
+      const emailPolicyId = route.emails === undefined ? (emailPolicy as CfAccessPolicy).id : await ensureRouteEmailPolicy(ctx, box, route, emailPolicies.find((p) => p.name === routeEmailPolicyName(box, route)), run);
       const policyIds = [emailPolicyId, ...(tokenPolicyId === undefined ? [] : [tokenPolicyId])];
       if (have.app === undefined || !appMatches(await cloudflare.getAccessApp(config.accountId, have.app.id), want, policyIds)) {
         const tokens = plan === undefined ? "" : ` and ${plan.policyName}`;
         const who = route.emails === undefined ? edgeName(box) : routeEmailPolicyName(box, route);
-        io.out(`${have.app === undefined ? "Creating" : "Updating"} Access application ${routeAppName(box, route)} for ${want.join(", ")}, with ${who}${tokens}.`);
-        await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "protected", policyIds }, have.app?.id);
+        run.say(have.app === undefined ? "Creating" : "Updating", have.app === undefined ? "create" : "update", `Access application ${routeAppName(box, route)} for ${want.join(", ")}, with ${who}${tokens}.`);
+        if (run.dry) {
+          if (have.app === undefined) {
+            run.planned.push({ id: NEW_ID, name: routeAppName(box, route), aud: NEW_AUD } as CfAccessApp);
+          }
+        } else {
+          await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "protected", policyIds }, have.app?.id);
+        }
       }
     }
     if (bypassUris(route).length > 0) {
       if (bypass === undefined) {
-        io.out(`Creating Access policy ${BYPASS_POLICY_NAME} (for public paths under a protected prefix only).`);
-        bypass = await cloudflare.createBypassPolicy(config.accountId);
+        run.say("Creating", "create", `Access policy ${BYPASS_POLICY_NAME} (for public paths under a protected prefix only).`);
+        bypass = run.dry ? ({ id: NEW_ID, name: BYPASS_POLICY_NAME } as CfAccessPolicy) : await cloudflare.createBypassPolicy(config.accountId);
       }
       const want = bypassUris(route);
       if (have.publicApp === undefined || !appMatches(await cloudflare.getAccessApp(config.accountId, have.publicApp.id), want, [bypass.id])) {
-        io.out(`${have.publicApp === undefined ? "Creating" : "Updating"} Access application ${publicAppName(box, route)} (bypass) for ${want.join(", ")}.`);
-        await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "public", policyIds: [bypass.id] }, have.publicApp?.id);
+        run.say(have.publicApp === undefined ? "Creating" : "Updating", have.publicApp === undefined ? "create" : "update", `Access application ${publicAppName(box, route)} (bypass) for ${want.join(", ")}.`);
+        if (run.dry) {
+          if (have.publicApp === undefined) {
+            run.planned.push({ id: NEW_ID, name: publicAppName(box, route) } as CfAccessApp);
+          }
+        } else {
+          await cloudflare.putRouteAccessApp(config.accountId, { ...base, route, kind: "public", policyIds: [bypass.id] }, have.publicApp?.id);
+        }
       }
     }
   }
-  await ensureIngress(ctx, box, tunnel);
+  await ensureIngress(ctx, box, tunnel, run);
   const wanted = new Set(routes.flatMap((r) => [...(frostyProtected(r).length > 0 ? [routeAppName(box, r)] : []), ...(bypassUris(r).length > 0 ? [publicAppName(box, r)] : [])]));
   for (const app of apps.filter((a) => isRouteAppOf(box, a.name) && !wanted.has(a.name))) {
-    io.out(`Deleting Access application ${app.name}: its route is no longer in config.`);
-    await cloudflare.deleteAccessApp(config.accountId, app);
+    run.say("Deleting", "delete", `Access application ${app.name}: its route is no longer in config.`);
+    if (!run.dry) {
+      await cloudflare.deleteAccessApp(config.accountId, app);
+    }
   }
   // Token policies no route wants any more, now that no app of frosty's uses them.
   const wantedPolicies = new Set(routes.filter((r) => plans.has(r.name)).map((r) => routeTokenPolicyName(box, r)));
   for (const policy of tokenPolicies.filter((p) => !wantedPolicies.has(p.name))) {
-    io.out(`Deleting Access policy ${policy.name}: its route no longer lists service tokens.`);
-    await cloudflare.deleteAccessPolicy(config.accountId, policy);
+    run.say("Deleting", "delete", `Access policy ${policy.name}: its route no longer lists service tokens.`);
+    if (!run.dry) {
+      await cloudflare.deleteAccessPolicy(config.accountId, policy);
+    }
   }
   // Email policies of routes that no longer list emails: their apps went back to the box's policy above.
   const wantedEmailPolicies = new Set(routes.filter((r) => r.emails !== undefined && frostyProtected(r).length > 0).map((r) => routeEmailPolicyName(box, r)));
   for (const policy of emailPolicies.filter((p) => !wantedEmailPolicies.has(p.name))) {
-    io.out(`Deleting Access policy ${policy.name}: its route no longer lists its own emails.`);
-    await cloudflare.deleteAccessPolicy(config.accountId, policy);
+    run.say("Deleting", "delete", `Access policy ${policy.name}: its route no longer lists its own emails.`);
+    if (!run.dry) {
+      await cloudflare.deleteAccessPolicy(config.accountId, policy);
+    }
   }
+  return run.changes;
 }
 
 // Where the box's route email policies are attached outside their own route's app, as problems. The
@@ -277,35 +358,39 @@ export function routeEmailPoliciesElsewhere(box: string, emailPolicies: CfAccess
 }
 
 // The route's email policy, created or rewritten to let in exactly the route's emails. Its id.
-async function ensureRouteEmailPolicy(ctx: Context, box: string, route: Route, listed: CfAccessPolicy | undefined): Promise<string> {
-  const { cloudflare, config, io } = ctx;
+async function ensureRouteEmailPolicy(ctx: Context, box: string, route: Route, listed: CfAccessPolicy | undefined, run: SyncRun): Promise<string> {
+  const { cloudflare, config } = ctx;
   const name = routeEmailPolicyName(box, route);
   const emails = route.emails ?? [];
   if (listed === undefined) {
-    io.out(`Creating Access policy ${name}: allow ${emails.join(", ")}.`);
-    return (await cloudflare.putRouteEmailPolicy(config.accountId, box, route)).id;
+    run.say("Creating", "create", `Access policy ${name}: allow ${emails.join(", ")}.`);
+    return run.dry ? NEW_ID : (await cloudflare.putRouteEmailPolicy(config.accountId, box, route)).id;
   }
   const live = await cloudflare.getAccessPolicy(config.accountId, listed.id);
   if (!isOurEmailPolicy(live) || live.name !== name || !sameEmails((live.include ?? []).map((r) => r.email?.email ?? ""), emails)) {
-    io.out(`Updating Access policy ${name}: allow ${emails.join(", ")}.`);
-    await cloudflare.putRouteEmailPolicy(config.accountId, box, route, live.id);
+    run.say("Updating", "update", `Access policy ${name}: allow ${emails.join(", ")}.`);
+    if (!run.dry) {
+      await cloudflare.putRouteEmailPolicy(config.accountId, box, route, live.id);
+    }
   }
   return live.id;
 }
 
 // The route's token policy, created or rewritten to let in exactly the configured tokens. Its id.
-async function ensureRouteTokenPolicy(ctx: Context, box: string, route: Route, plan: RouteTokenPlan): Promise<string> {
-  const { cloudflare, config, io } = ctx;
+async function ensureRouteTokenPolicy(ctx: Context, box: string, route: Route, plan: RouteTokenPlan, run: SyncRun): Promise<string> {
+  const { cloudflare, config } = ctx;
   const want = plan.tokens.map((t) => t.token.id).sort();
   const names = plan.tokens.map((t) => t.name).join(", ");
   if (plan.policy === undefined) {
-    io.out(`Creating Access policy ${plan.policyName}: let in service tokens ${names}.`);
-    return (await cloudflare.putTokenPolicy(config.accountId, box, want, undefined, route.name)).id;
+    run.say("Creating", "create", `Access policy ${plan.policyName}: let in service tokens ${names}.`);
+    return run.dry ? NEW_ID : (await cloudflare.putTokenPolicy(config.accountId, box, want, undefined, route.name)).id;
   }
   const have = [...new Set(serviceTokenIds(plan.policy.include))].sort();
   if (!isOurTokenPolicy(plan.policy, box, route.name) || have.join() !== want.join()) {
-    io.out(`Updating Access policy ${plan.policyName}: let in service tokens ${names}.`);
-    await cloudflare.putTokenPolicy(config.accountId, box, want, plan.policy.id, route.name);
+    run.say("Updating", "update", `Access policy ${plan.policyName}: let in service tokens ${names}.`);
+    if (!run.dry) {
+      await cloudflare.putTokenPolicy(config.accountId, box, want, plan.policy.id, route.name);
+    }
   }
   return plan.policy.id;
 }

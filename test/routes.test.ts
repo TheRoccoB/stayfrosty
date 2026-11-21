@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { BYPASS_POLICY_NAME, Cloudflare } from "../src/cloudflare.ts";
 import { validateConfig } from "../src/config.ts";
 import type { Context } from "../src/context.ts";
-import { appCovers, checkExternalAccess, routeApps, syncRoutes } from "../src/edge.ts";
+import { appCovers, checkExternalAccess, ingressDiff, routeApps, syncRoutes, syncRun } from "../src/edge.ts";
 import { checkRouteAccess, checkRouteOutside, checkRoutePorts, classify } from "../src/checks/routes.ts";
 import { assertBoxName } from "../src/context.ts";
 import type { RawGet } from "../src/rawget.ts";
@@ -200,6 +200,43 @@ describe("route guards and sync", () => {
     const removes = s.http.writes().slice(removeFrom).map((w) => `${w.method} ${w.url.pathname.replace(/^.*\/accounts\/[^/]+/, "").replace(/app-[^/]+$/, "app")}`);
     expect(removes).toEqual([`PUT /cfd_tunnel/${tunnel.id}/configurations`, "DELETE /access/apps/app", "DELETE /access/apps/app"]);
     expect(s.fcf.ingress.get(tunnel.id)).toEqual([{ hostname: "ssh-svc1.example.com", service: "ssh://localhost:22" }, { service: "http_status:404" }]);
+  });
+
+  it("a dry run of removing a route shows the ingress lines going, then both apps deleted, and sends nothing", async () => {
+    const s = setup();
+    const { tunnel } = await seedBox(s);
+    await syncRoutes(s.ctx, "svc1", tunnel);
+    (s.config.routes as Record<string, Route[]>)["svc1"] = [];
+    const before = s.http.writes().length;
+    const out = s.io.stdout.length;
+    s.cloudflare.refuseWrites();
+    expect(await syncRoutes(s.ctx, "svc1", tunnel, syncRun(s.ctx, true))).toBe(3);
+    expect(s.http.writes().length).toBe(before);
+    const lines = s.io.stdout.slice(out);
+    expect(lines[0]).toMatch(/^Would set the tunnel's ingress: ssh-svc1.example.com to ssh:\/\/localhost:22, everything else 404\.$/);
+    expect(lines.filter((l) => l.startsWith("  - ")).length).toBeGreaterThan(0);
+    expect(lines.filter((l) => l.startsWith("  + "))).toEqual([]);
+    expect(lines.filter((l) => l.startsWith("Would delete"))).toEqual([
+      "Would delete Access application stayfrosty-svc1:listmonk: its route is no longer in config.",
+      "Would delete Access application stayfrosty-svc1:listmonk:public: its route is no longer in config.",
+    ]);
+  });
+
+  it("a client set to refuse writes sends none, even when asked", async () => {
+    const s = setup();
+    s.cloudflare.refuseWrites();
+    await expect(s.cloudflare.createTunnel("acc123", "stayfrosty-svc1")).rejects.toThrow(/A dry run tried to send cloudflare POST .*Nothing was sent/);
+    expect(s.http.writes()).toEqual([]);
+    expect(await s.cloudflare.listAccessApps("acc123")).toEqual([]);
+  });
+
+  it("ingressDiff lists dropped and added rules, and a change of order", () => {
+    const ssh = { hostname: "ssh-svc1.example.com", service: "ssh://localhost:22" };
+    const a = { hostname: "a.example.net", service: "http://127.0.0.1:8080" };
+    const b = { hostname: "b.example.net", path: "^/x", service: "http://127.0.0.1:8080" };
+    const end = { service: "http_status:404" };
+    expect(ingressDiff([ssh, a, end], [ssh, b, end])).toEqual(["- a.example.net -> http://127.0.0.1:8080", "+ b.example.net ^/x -> http://127.0.0.1:8080"]);
+    expect(ingressDiff([ssh, a, b, end], [ssh, b, a, end])).toEqual(["and the rules it keeps change order"]);
   });
 
   it("an external Access app must exist and cover its path; frosty only reads it", async () => {
