@@ -156,6 +156,7 @@ Two options cover common setups:
 Commands:
 - `frosty route plan box1` shows what the routes need, including the DNS record to add for each hostname. frosty doesn't write DNS outside its own domain. It also makes the same checks of `externalAccess` apps as sync (they exist, cover the path, and only let identified people in), and exits 1 if sync would refuse.
 - `frosty route sync box1` creates or updates the Access apps first, then the tunnel's ingress, and removes routes no longer in config.
+- `frosty route sync box1 --dry-run` makes the same checks as sync, then prints each write sync would make, in order (Access policies and apps to create, update or delete, and the ingress rules each side of the change, `-` dropped and `+` added), and makes none: the Cloudflare client refuses every write for the run. `plan` shows the target state; the dry run shows the changes.
 - `frosty verify box1` then checks every path from outside: it tries the protected paths, a set of path tricks (`..`, `%2f`, `//`, case changes) and unlisted paths, all without credentials. On the box, it checks that the app listens on 127.0.0.1 only.
 
 See DECISIONS.md, "App routes".

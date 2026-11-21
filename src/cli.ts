@@ -25,7 +25,7 @@ Usage:
   frosty verify (<box> | --all)       check a box again, through the tunnel (changes nothing);
                                       exit 1 if a check failed, 3 if --all skipped a provider
   frosty detach-foreign <box>         detach other firewalls from an adopted box (keeps frosty's)
-  frosty route (plan | sync) <box>    web apps through the box's tunnel (config: routes)
+  frosty route (plan | sync [--dry-run]) <box>  web apps through the box's tunnel (config: routes)
   frosty ssh-users (plan | sync) <box>  forced-command-only SSH users (config: restrictedUsers)
   frosty service-tokens (plan | sync) <box>  Access service tokens for the box's SSH (config: serviceTokens)
   frosty breakglass <box> [--minutes N | --close]
@@ -36,8 +36,8 @@ Usage:
 
 Flags:
   --dry-run    print what would change, change nothing (init, new, adopt, detach-foreign,
-               ssh-config, destroy, console-password; route, ssh-users and service-tokens
-               use plan instead)
+               ssh-config, destroy, console-password, route sync; ssh-users and
+               service-tokens use plan instead)
   --help       show this help
   --version    show the version
 
@@ -66,7 +66,7 @@ const COMMANDS: Record<string, CommandShape> = {
   new: { flags: ["dry-run", "resume", "type", "location"], args: 1 },
   adopt: { flags: ["dry-run", "resume", "ip", "user", "host-key", "trust-first-use"], args: 1 },
   verify: { flags: ["all"], args: 1 },
-  route: { flags: [], args: 2 },
+  route: { flags: ["dry-run"], args: 2 },
   "ssh-users": { flags: [], args: 2 },
   "service-tokens": { flags: [], args: 2 },
   "detach-foreign": { flags: ["dry-run"], args: 1 },
@@ -75,8 +75,8 @@ const COMMANDS: Record<string, CommandShape> = {
   "console-password": { flags: ["dry-run", "direct"], args: 1 },
 };
 
-// Commands whose plan action is their dry run.
-const PLAN_SYNC = new Set(["route", "ssh-users", "service-tokens"]);
+// Commands whose plan action is their dry run (route sync has a real one).
+const PLAN_SYNC = new Set(["ssh-users", "service-tokens"]);
 
 const OPTIONS = {
   help: { type: "boolean", short: "h" },
@@ -148,7 +148,7 @@ export async function main(argv: string[], io: Io): Promise<number> {
     case "verify":
       return runVerify({ io }, { box: positionals[1], all: values["all"] === true });
     case "route":
-      return runRoute({ io }, { action: positionals[1], box: positionals[2] });
+      return runRoute({ io }, { action: positionals[1], box: positionals[2], dryRun });
     case "ssh-users":
       return runSshUsers({ io }, { action: positionals[1], box: positionals[2] });
     case "service-tokens":

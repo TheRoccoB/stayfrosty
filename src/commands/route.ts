@@ -1,6 +1,6 @@
 import { assertBoxName, buildContext, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
-import { boxRoutes, checkExternalAccess, describeIncludes, findEdge, routeApps, routeAuds, syncRoutes } from "../edge.ts";
+import { boxRoutes, checkExternalAccess, describeIncludes, findEdge, routeApps, routeAuds, syncRoutes, syncRun } from "../edge.ts";
 import { tokenExpiry } from "../checks/edge.ts";
 import { bypassUris, exactPaths, frostyProtected, isRouteEmailPolicyOf, isRouteTokenPolicyOf, protectedUris, publicAppName, routeAppName, routeEmailPolicyName, routeServiceTokens, routeTokenPolicyName } from "../routes.ts";
 import { planRouteTokens } from "../servicetokens.ts";
@@ -8,12 +8,15 @@ import { planRouteTokens } from "../servicetokens.ts";
 export interface RouteOptions {
   action: string | undefined;
   box: string | undefined;
+  dryRun?: boolean;
 }
 
 // frosty route plan <box>: what the box's routes need (read-only).
 // frosty route sync <box>: make Cloudflare match: Access apps first, then the ingress, then remove
 // apps of routes taken out of config. DNS for the route hostnames isn't frosty's to write; the plan
 // prints the records to add.
+// frosty route sync <box> --dry-run: the same checks and the same writes, in order, printed and not
+// made. The Cloudflare client refuses writes for the whole run.
 export async function runRoute(deps: Deps, opts: RouteOptions): Promise<number> {
   if (opts.action !== "plan" && opts.action !== "sync") {
     throw new FrostyError("frosty route needs plan or sync.", "frosty route plan <box>   or   frosty route sync <box>");
@@ -26,6 +29,16 @@ export async function runRoute(deps: Deps, opts: RouteOptions): Promise<number> 
     throw new FrostyError(`${box} has no frosty tunnel.`, `Set the box up first: frosty new ${box}, or frosty adopt ${box}.`);
   }
   const routes = boxRoutes(ctx, box);
+  // plan --dry-run is just plan: it changes nothing either way.
+  if (opts.dryRun === true && opts.action === "sync") {
+    cloudflare.refuseWrites();
+    io.out(`Dry run of frosty route sync ${box}: nothing below is changed.`);
+    const changes = await syncRoutes(ctx, box, edge.tunnel, syncRun(ctx, true));
+    io.out("");
+    io.out(changes === 0 ? "Dry run: sync would change nothing." : `Dry run: sync would make the ${changes} change(s) above, in that order. Nothing was changed.`);
+    io.out("DNS for route hostnames isn't frosty's to write: frosty route plan prints the records.");
+    return 0;
+  }
   if (opts.action === "sync") {
     await syncRoutes(ctx, box, edge.tunnel);
   }

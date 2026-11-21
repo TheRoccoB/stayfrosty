@@ -23,10 +23,11 @@ describe("cli", () => {
     expect(io.text()).toContain("frosty --help");
   });
 
-  it("refuses --dry-run on route, ssh-users and service-tokens sync, before anything runs", async () => {
+  it("refuses --dry-run on ssh-users and service-tokens sync, before anything runs", async () => {
     // Before, sync ignored --dry-run and applied. The command never gets to load config or call an API:
     // there is none in this test, so getting that far would throw instead of returning 2.
-    for (const command of ["route", "ssh-users", "service-tokens"]) {
+    // (route sync has a real dry run.)
+    for (const command of ["ssh-users", "service-tokens"]) {
       for (const argv of [[command, "sync", "box1", "--dry-run"], ["--dry-run", command, "sync", "box1"]]) {
         const io = new ScriptedIo();
         expect(await main(argv, io)).toBe(2);
@@ -78,6 +79,7 @@ describe("cli", () => {
     // shapeProblem directly: running these would read the real config.
     expect(shapeProblem("route", { "dry-run": true }, ["route", "plan", "box1"])).toBeUndefined();
     expect(shapeProblem("route", {}, ["route", "sync", "box1"])).toBeUndefined();
+    expect(shapeProblem("route", { "dry-run": true }, ["route", "sync", "box1"])).toBeUndefined();
     expect(shapeProblem("destroy", { "dry-run": true }, ["destroy", "box1"])).toBeUndefined();
     expect(shapeProblem("new", { type: "cx22", location: "nbg1", resume: true, "dry-run": true }, ["new", "box1"])).toBeUndefined();
     expect(shapeProblem("adopt", { ip: "192.0.2.1", user: "root", "trust-first-use": true }, ["adopt", "box1"])).toBeUndefined();
