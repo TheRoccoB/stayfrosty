@@ -34,10 +34,14 @@ Usage:
   frosty destroy <box>                type the box name to confirm
   frosty console-password <box>       set a new password for the provider's web console
 
-Global flags:
-  --dry-run    print what would change, change nothing
+Flags:
+  --dry-run    print what would change, change nothing (init, new, adopt, detach-foreign,
+               ssh-config, destroy, console-password; route, ssh-users and service-tokens
+               use plan instead)
   --help       show this help
   --version    show the version
+
+A flag or word a command doesn't take is refused, and nothing runs.
 
 Tokens come from HCLOUD_TOKEN and CLOUDFLARE_API_TOKEN, plus DIGITALOCEAN_TOKEN for boxes on
 DigitalOcean. Run "frosty init" for details.`;
@@ -47,26 +51,64 @@ const PLANNED: Record<string, string> = {
   breakglass: "M3",
 };
 
+// What each command takes besides --help and --version: its flags, and how many words it takes
+// after its own name. Anything else is refused before the command runs, so a misspelt or misplaced
+// flag (say --dry-run on a command that doesn't honour it) can't be silently ignored while the
+// command goes ahead and changes things.
+interface CommandShape {
+  flags: string[];
+  args: number;
+}
+
+const COMMANDS: Record<string, CommandShape> = {
+  init: { flags: ["dry-run"], args: 0 },
+  ls: { flags: [], args: 0 },
+  new: { flags: ["dry-run", "resume", "type", "location"], args: 1 },
+  adopt: { flags: ["dry-run", "resume", "ip", "user", "host-key", "trust-first-use"], args: 1 },
+  verify: { flags: ["all"], args: 1 },
+  route: { flags: [], args: 2 },
+  "ssh-users": { flags: [], args: 2 },
+  "service-tokens": { flags: [], args: 2 },
+  "detach-foreign": { flags: ["dry-run"], args: 1 },
+  "ssh-config": { flags: ["dry-run"], args: 0 },
+  destroy: { flags: ["dry-run"], args: 1 },
+  "console-password": { flags: ["dry-run", "direct"], args: 1 },
+};
+
+// Commands whose plan action is their dry run.
+const PLAN_SYNC = new Set(["route", "ssh-users", "service-tokens"]);
+
+const OPTIONS = {
+  help: { type: "boolean", short: "h" },
+  version: { type: "boolean" },
+  "dry-run": { type: "boolean" },
+  resume: { type: "boolean" },
+  direct: { type: "boolean" },
+  type: { type: "string" },
+  location: { type: "string" },
+  ip: { type: "string" },
+  user: { type: "string" },
+  "host-key": { type: "string" },
+  "trust-first-use": { type: "boolean" },
+  all: { type: "boolean" },
+} as const;
+
+// strict: an unknown flag, a value on a yes/no flag (--dry-run=false) or a flag missing its value
+// is an error, not something to guess at.
+function parse(argv: string[]) {
+  return parseArgs({ args: argv, allowPositionals: true, strict: true, options: OPTIONS });
+}
+
 export async function main(argv: string[], io: Io): Promise<number> {
-  const { values, positionals } = parseArgs({
-    args: argv,
-    allowPositionals: true,
-    strict: false,
-    options: {
-      help: { type: "boolean", short: "h" },
-      version: { type: "boolean" },
-      "dry-run": { type: "boolean" },
-      resume: { type: "boolean" },
-      direct: { type: "boolean" },
-      type: { type: "string" },
-      location: { type: "string" },
-      ip: { type: "string" },
-      user: { type: "string" },
-      "host-key": { type: "string" },
-      "trust-first-use": { type: "boolean" },
-      all: { type: "boolean" },
-    },
-  });
+  let parsed: ReturnType<typeof parse>;
+  try {
+    parsed = parse(argv);
+  } catch (error) {
+    io.err(`${error instanceof Error ? error.message : String(error)}`);
+    io.err("Nothing was changed. Run: frosty --help");
+    return 2;
+  }
+  const { values, positionals } = parsed;
   const command = positionals[0];
   if (values["version"] === true) {
     io.out(VERSION);
@@ -75,6 +117,12 @@ export async function main(argv: string[], io: Io): Promise<number> {
   if (command === undefined || values["help"] === true || command === "help") {
     io.out(USAGE);
     return 0;
+  }
+  const refused = shapeProblem(command, values, positionals);
+  if (refused !== undefined) {
+    io.err(refused);
+    io.err("Nothing was changed. Run: frosty --help");
+    return 2;
   }
   const dryRun = values["dry-run"] === true;
   switch (command) {
@@ -123,6 +171,32 @@ export async function main(argv: string[], io: Io): Promise<number> {
       return 2;
     }
   }
+}
+
+// Why this command line is refused, or undefined. Unknown commands are left to main.
+export function shapeProblem(command: string, values: Record<string, unknown>, positionals: string[]): string | undefined {
+  const shape = COMMANDS[command];
+  if (shape === undefined) {
+    return undefined;
+  }
+  for (const flag of Object.keys(values)) {
+    if (flag === "help" || flag === "version" || shape.flags.includes(flag)) {
+      continue;
+    }
+    if (flag === "dry-run" && PLAN_SYNC.has(command)) {
+      // plan already changes nothing; sync --dry-run would be a sync that changes things.
+      if (positionals[1] === "plan") {
+        continue;
+      }
+      return `frosty ${command} has no --dry-run. Use "frosty ${command} plan <box>": it shows what sync would change, and changes nothing.`;
+    }
+    return `frosty ${command} doesn't take --${flag}.`;
+  }
+  const extra = positionals.slice(1 + shape.args);
+  if (extra.length > 0) {
+    return `frosty ${command} doesn't take ${extra.map((x) => `"${x}"`).join(" ")}.`;
+  }
+  return undefined;
 }
 
 function stringFlag(value: unknown): string | undefined {
