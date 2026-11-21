@@ -230,6 +230,15 @@ Design from a security review (2026-11). The first user is a backup host pulling
 - Nothing changes in the tunnel: a request that passes Access with a service token carries an Access JWT for the app's audience, so cloudflared's own Access check on the protected rule passes it like a logged-in person. Why: the ingress stays the allowlist it was. Alt: a separate unchecked rule for agents (it would open the path to anyone past the edge).
 - A route without `serviceTokens` makes no service token or group call, so the extra permissions are only needed when some route or box uses tokens.
 
+### A route's own emails (`routes.<box>[].emails`)
+
+- A route can list its own people. They go in one allow policy per route, `stayfrosty-<box>:<route>:emails`, which takes the place of the box's email policy on frosty's protected app for the route. Why: sharing one app (a preview site, say) with outside people must not also let them into the box's SSH or its other routes, which all use the box's policy. Alt: add them to `accessEmails` (opens everything), or a second Access app on the hostname (fights over the login cookie).
+- Emails only: the policy is frosty's email shape (allow, only `email` includes, no require or exclude), the same check every other frosty email policy passes, built in `putRouteEmailPolicy` from the route's config. Config refuses wildcards, domains and duplicates, and caps the list at 50.
+- `putRouteAccessApp` now names the email policy exactly: the first policy of a protected app is the route's own email policy when the route lists `emails`, and the box's (`stayfrosty-<box>`) otherwise; the second, if any, is that route's token policy; no more than two. Why: before, any frosty email policy passed, which would have let a route's list onto another route's app. Alt: keep the looser check.
+- The policy lives only on its route's app. `route sync` re-reads every app and refuses before any write if the policy is attached anywhere else; `verify` fails the same case. Why: frosty rewrites the list on every sync, so it would otherwise keep changing who gets into an app it doesn't own.
+- Order, as for token policies: write the email policy, then attach it with the app; when the route drops `emails`, put the box's policy back on the app, then delete the route's policy. Policies of routes gone from config go after their apps, and `destroy` deletes them after the apps.
+- Login methods: frosty's app body never sets `allowed_idps`, so Cloudflare offers every login method of the team, One-time PIN included. `verify` fails a route with `emails` whose app limits them, since people on the list may have no other login. Alt: a per-route `loginMethods` setting; not needed while all methods are offered.
+
 ## DigitalOcean boxes (`boxProviders`)
 
 - A provider interface (`src/provider.ts`) over servers, firewalls, SSH keys and actions, in Hetzner's model, since Hetzner came first. `Hetzner` implements it unchanged; `DigitalOcean` translates its API into it. Why: the commands and checks stay one code path, and Hetzner's calls and output don't change. Alt: a neutral model with adapters on both sides, a far larger change to reviewed code.

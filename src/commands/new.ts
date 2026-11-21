@@ -9,8 +9,8 @@ import { allProviders, assertBoxName, buildContext, directTarget, providerFor, r
 import type { Firewall, Provider, Server } from "../provider.ts";
 import { checkAccessLogin, checkAlert, checkDns, checkOnlyOurFirewall, checkProtected, checkTunnel, checkWindowClosed } from "../checks/edge.ts";
 import { checkTokenNotExposed } from "../checks/token.ts";
-import { checkRouteAccess, checkRouteMissing, checkRouteOutside, checkRoutePorts, checkRouteServiceTokens, checkStrayRouteTokenPolicies } from "../checks/routes.ts";
-import { routeServiceTokens, routeTokenPolicyName } from "../routes.ts";
+import { checkRouteAccess, checkRouteMissing, checkRouteOutside, checkRoutePorts, checkRouteEmails, checkRouteServiceTokens, checkStrayRouteEmailPolicies, checkStrayRouteTokenPolicies } from "../checks/routes.ts";
+import { routeEmailPolicyName, routeServiceTokens, routeTokenPolicyName } from "../routes.ts";
 import { planRouteTokens } from "../servicetokens.ts";
 import { boxRoutes, routeApps, ensureAccess, ensureAlert, ensureDns, ensureTunnel, findEdge, ingressSpec, installConnector, specIngress, waitForDns, waitForHealthyTunnel } from "../edge.ts";
 import { readSshConfigEntries, tildify, writeSshConfig, type SshConfigEntry } from "../sshconfig.ts";
@@ -465,6 +465,12 @@ export async function checkBox(
       if (plan !== undefined) {
         routeResults.push(checkRouteServiceTokens(box, route, plan));
       }
+      if (route.emails !== undefined) {
+        // Re-read: the list may leave out a policy's rules.
+        const listedEmail = edge.routeEmailPolicies.find((p) => p.name === routeEmailPolicyName(box, route));
+        const emailPolicy = listedEmail === undefined ? undefined : await cloudflare.getAccessPolicy(config.accountId, listedEmail.id);
+        routeResults.push(checkRouteEmails(box, route, emailPolicy, apps, edge.routeEmailPolicies));
+      }
       routeResults.push(await checkRouteOutside(ctx.rawGet, route, config.accessTeam ?? ""));
     }
   }
@@ -473,6 +479,11 @@ export async function checkBox(
   const stray = checkStrayRouteTokenPolicies(box, edge.routeTokenPolicies.filter((p) => !wantedTokenPolicies.has(p.name)));
   if (stray !== undefined) {
     routeResults.push(stray);
+  }
+  const wantedEmailPolicies = new Set(routes.filter((r) => r.emails !== undefined).map((r) => routeEmailPolicyName(box, r)));
+  const strayEmails = checkStrayRouteEmailPolicies(box, edge.routeEmailPolicies.filter((p) => !wantedEmailPolicies.has(p.name)));
+  if (strayEmails !== undefined) {
+    routeResults.push(strayEmails);
   }
   const api = [
     ...(opts.window === false ? [] : await windowChecks(ctx, box, server)),

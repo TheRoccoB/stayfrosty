@@ -2,7 +2,7 @@ import { assertBoxName, buildContext, type Deps } from "../context.ts";
 import { FrostyError } from "../errors.ts";
 import { boxRoutes, checkExternalAccess, describeIncludes, findEdge, routeApps, routeAuds, syncRoutes } from "../edge.ts";
 import { tokenExpiry } from "../checks/edge.ts";
-import { bypassUris, exactPaths, frostyProtected, isRouteTokenPolicyOf, protectedUris, publicAppName, routeAppName, routeServiceTokens, routeTokenPolicyName } from "../routes.ts";
+import { bypassUris, exactPaths, frostyProtected, isRouteEmailPolicyOf, isRouteTokenPolicyOf, protectedUris, publicAppName, routeAppName, routeEmailPolicyName, routeServiceTokens, routeTokenPolicyName } from "../routes.ts";
 import { planRouteTokens } from "../servicetokens.ts";
 
 export interface RouteOptions {
@@ -36,6 +36,10 @@ export async function runRoute(deps: Deps, opts: RouteOptions): Promise<number> 
   for (const p of stray) {
     io.out(`Access policy ${p.name}: no route lists service tokens for it${opts.action === "sync" ? "" : "; sync deletes it"}.`);
   }
+  const wantedEmailPolicies = new Set(routes.filter((r) => r.emails !== undefined).map((r) => routeEmailPolicyName(box, r)));
+  for (const p of policies.filter((x) => isRouteEmailPolicyOf(box, x.name) && !wantedEmailPolicies.has(x.name))) {
+    io.out(`Access policy ${p.name}: no route lists its own emails for it${opts.action === "sync" ? "" : "; sync puts the box's emails back on its app, then deletes it"}.`);
+  }
   if (routes.length === 0) {
     io.out(`${box} has no routes in config.${opts.action === "sync" ? " Its tunnel carries SSH only." : ""}`);
     return 0;
@@ -51,7 +55,8 @@ export async function runRoute(deps: Deps, opts: RouteOptions): Promise<number> 
       io.out(`  public, exact path only: ${exactPaths(route).join(" ")}`);
     }
     if (frostyProtected(route).length > 0) {
-      io.out(`  Access ${routeAppName(box, route)} (your emails): ${protectedUris(route).join(", ")}${have.app === undefined ? "  [missing]" : ""}`);
+      const who = route.emails === undefined ? "your emails" : `the route's own emails, via ${routeEmailPolicyName(box, route)}${policies.some((p) => p.name === routeEmailPolicyName(box, route)) ? "" : " [missing]"}: ${route.emails.join(", ")}`;
+      io.out(`  Access ${routeAppName(box, route)} (${who}): ${protectedUris(route).join(", ")}${have.app === undefined ? "  [missing]" : ""}`);
     }
     // The same checks sync makes before any write, so a plan that looks fine never ends in a refused sync.
     const plan = await planRouteTokens(ctx, box, route, have.app?.id, policies.find((p) => p.name === routeTokenPolicyName(box, route)), false);

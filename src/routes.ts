@@ -24,6 +24,9 @@ export interface Route {
   // Names of existing Cloudflare Access service tokens let into frosty's own Access app for the
   // route, for clients that can't log in (they send CF-Access-Client-Id and -Secret headers).
   serviceTokens?: string[];
+  // People let into frosty's own Access app for the route instead of the box's accessEmails, by
+  // email. Plain addresses only: frosty writes them as one allow-by-email policy for this route.
+  emails?: string[];
 }
 
 const ROUTE_NAME = /^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$/;
@@ -37,6 +40,9 @@ const SERVICE = /^http:\/\/127\.0\.0\.1:(\d{4,5})$/;
 const TEAM = /^[a-z0-9-]{1,63}$/;
 // A Cloudflare Access service token name, as frosty accepts it in config.
 export const SERVICE_TOKEN_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// A plain email address (no wildcards, no domain-only rules): what a route's emails list takes.
+const ROUTE_EMAIL = /^[^\s@*,]+@[^\s@*,]+\.[^\s@*,]+$/;
+const MAX_ROUTE_EMAILS = 50;
 
 // The first rule for every app hostname: 404 anything a path trick could hide in. cloudflared
 // matches the decoded path, so `%` here only catches double encoding (%25..); encoded dots and
@@ -133,6 +139,19 @@ export function isRouteTokenPolicyOf(box: string, name: string): boolean {
   return name.startsWith(prefix) && name.endsWith(suffix) && ROUTE_NAME.test(name.slice(prefix.length, name.length - suffix.length));
 }
 
+// stayfrosty-<box>:<route>:emails: the allow-by-email policy of a route with its own emails list. It
+// replaces the box's policy (stayfrosty-<box>) on that route's protected app.
+export function routeEmailPolicyName(box: string, route: Pick<Route, "name">): string {
+  return `${routeAppName(box, route)}:emails`;
+}
+
+// Any route's email policy for this box, configured or not (route sync deletes the ones not wanted).
+export function isRouteEmailPolicyOf(box: string, name: string): boolean {
+  const prefix = `stayfrosty-${box}:`;
+  const suffix = ":emails";
+  return name.startsWith(prefix) && name.endsWith(suffix) && ROUTE_NAME.test(name.slice(prefix.length, name.length - suffix.length));
+}
+
 export function routeServiceTokens(route: Route): string[] {
   return route.serviceTokens ?? [];
 }
@@ -165,7 +184,7 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
       continue;
     }
     const r = raw as Record<string, unknown>;
-    const extra = Object.keys(r).filter((k) => !["name", "hostname", "service", "protected", "public", "publicExact", "externalAccess", "probe", "serviceTokens"].includes(k));
+    const extra = Object.keys(r).filter((k) => !["name", "hostname", "service", "protected", "public", "publicExact", "externalAccess", "probe", "serviceTokens", "emails"].includes(k));
     if (extra.length > 0) {
       problems.push(`${where} has unknown keys: ${extra.join(", ")}`);
     }
@@ -272,6 +291,22 @@ export function validateRoutes(box: string, routes: unknown, opts: { domain: str
         // The tokens go on frosty's own app for the protected prefixes; with none, there is no app.
         if (tokens.length > 0 && !prot.some((q) => externalMap[q] === undefined)) {
           problems.push(`${where}.serviceTokens needs a protected path on frosty's own Access app (not externalAccess)`);
+        }
+      }
+    }
+    const emails = r["emails"];
+    if (emails !== undefined) {
+      if (!Array.isArray(emails) || emails.length === 0 || emails.length > MAX_ROUTE_EMAILS || emails.some((e) => typeof e !== "string" || !ROUTE_EMAIL.test(e))) {
+        problems.push(`${where}.emails must be a list of 1-${MAX_ROUTE_EMAILS} plain email addresses (no wildcards or domains); leave it out to use accessEmails`);
+      } else {
+        const lower = (emails as string[]).map((e) => e.toLowerCase());
+        for (const e of new Set(lower)) {
+          if (lower.filter((x) => x === e).length > 1) {
+            problems.push(`${where}.emails lists ${e} twice`);
+          }
+        }
+        if (!prot.some((q) => externalMap[q] === undefined)) {
+          problems.push(`${where}.emails needs a protected path on frosty's own Access app (not externalAccess)`);
         }
       }
     }

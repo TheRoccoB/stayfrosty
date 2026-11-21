@@ -130,7 +130,7 @@ describe("route app guard with a token policy", () => {
     const before = s.http.writes().length;
     await expect(s.cloudflare.putRouteAccessApp("acc123", { ...base, kind: "protected", policyIds: [token.id] })).rejects.toThrow(/allow-by-email/);
     await expect(s.cloudflare.putRouteAccessApp("acc123", { ...base, kind: "protected", policyIds: [token.id, policy.id] })).rejects.toThrow(/refused/);
-    await expect(s.cloudflare.putRouteAccessApp("acc123", { ...base, kind: "protected", policyIds: [policy.id, ssh.id] })).rejects.toThrow(/or stayfrosty-mon1:hub:service-tokens/);
+    await expect(s.cloudflare.putRouteAccessApp("acc123", { ...base, kind: "protected", policyIds: [policy.id, ssh.id] })).rejects.toThrow(/is not stayfrosty-mon1:hub:service-tokens/);
     await expect(s.cloudflare.putRouteAccessApp("acc123", { ...base, kind: "protected", policyIds: [policy.id, other.id] })).rejects.toThrow(/refused/);
     await expect(s.cloudflare.putRouteAccessApp("acc123", { ...base, route: { ...hub, serviceTokens: [] }, kind: "protected", policyIds: [policy.id, token.id] })).rejects.toThrow(/refused/);
     await expect(s.cloudflare.putRouteAccessApp("acc123", { ...base, kind: "public", policyIds: [token.id] })).rejects.toThrow(/refused/);

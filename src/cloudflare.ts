@@ -2,7 +2,7 @@ import { ApiError, FrostyError } from "./errors.ts";
 import { logDone, summarize, type ChangeLog } from "./changelog.ts";
 import { realSleep, sendJson, withQuery, type Fetch, type Sleep } from "./http.ts";
 import { redact, registerSecret } from "./redact.ts";
-import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, isRouteName, protectedUris, publicAppName, routeAppName, routeTokenPolicyName, validateRouteHostnames, validateRoutes, type IngressRule, type Route } from "./routes.ts";
+import { accessUri, boxIngress, bypassUris, frostyProtected, inZones, isRouteName, protectedUris, publicAppName, routeAppName, routeEmailPolicyName, routeTokenPolicyName, validateRouteHostnames, validateRoutes, type IngressRule, type Route } from "./routes.ts";
 
 export const CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4";
 
@@ -176,6 +176,8 @@ export interface CfAccessApp {
   self_hosted_domains?: string[];
   type: string;
   session_duration?: string;
+  // Login methods (identity provider ids) the app offers; empty or missing means every one of the team.
+  allowed_idps?: string[];
   policies?: { id: string; name?: string; decision?: string; precedence?: number; include?: CfAccessRule[]; require?: CfAccessRule[]; exclude?: CfAccessRule[] }[];
 }
 
@@ -555,6 +557,36 @@ export class Cloudflare {
     return this.request<CfAccessPolicy>("PUT", `${acct(accountId)}/access/policies/${encodeURIComponent(live.id)}`, body, live);
   }
 
+  // A route's own email policy (routeEmailPolicyName): allow, one email include per address, nothing
+  // else. The body is built here from the route's emails. With policyId it replaces that policy,
+  // re-read first and checked to carry the same name.
+  async putRouteEmailPolicy(accountId: string, box: string, route: Route, policyId?: string): Promise<CfAccessPolicy> {
+    const name = routeEmailPolicyName(box, route);
+    const refuse = (why: string): never => {
+      throw new FrostyError(`frosty refused to write Access policy ${name}: ${why}.`, "This is a bug in frosty. Please report it.");
+    };
+    if (boxOf("Access policy", `${NAME_PREFIX}${box}`) !== box || !isRouteName(route.name)) {
+      refuse("bad box or route name");
+    }
+    const emails = route.emails ?? [];
+    const problems = validateRoutes(box, [route], { domain: "checked-elsewhere.invalid", appZones: [route.hostname], accessTeam: "checked-elsewhere" }).filter((p) => p.includes(".emails"));
+    if (emails.length === 0 || problems.length > 0) {
+      refuse(problems.join("; ") || "the route has no emails");
+    }
+    const body = { name, decision: "allow", include: emails.map((email) => ({ email: { email } })) };
+    if (!isOurEmailPolicy(body)) {
+      refuse("wrong shape");
+    }
+    if (policyId === undefined) {
+      return this.request<CfAccessPolicy>("POST", `${acct(accountId)}/access/policies`, body);
+    }
+    const live = await this.getAccessPolicy(accountId, policyId);
+    if (live.name !== name) {
+      refuse(`policy ${policyId} is named ${live.name}`);
+    }
+    return this.request<CfAccessPolicy>("PUT", `${acct(accountId)}/access/policies/${encodeURIComponent(live.id)}`, body, live);
+  }
+
   async createAccessPolicy(accountId: string, policy: { name: string; decision: string; include: CfAccessRule[]; session_duration?: string }): Promise<CfAccessPolicy> {
     // Only "allow these emails": never bypass, everyone, groups, IdP orgs, IP ranges or service tokens.
     if (!isOurEmailPolicy(policy) || Object.keys(policy).some((k) => !["name", "decision", "include", "session_duration"].includes(k))) {
@@ -681,18 +713,22 @@ export class Cloudflare {
       refuse(problems.join("; ") || `${route.hostname} is not an app hostname`);
     }
     const uris = kind === "protected" ? protectedUris(route) : bypassUris(route);
-    if (uris.length === 0 || spec.policyIds.length === 0 || (kind === "public" && spec.policyIds.length !== 1) || !/^\d+(m|h)$/.test(spec.sessionDuration)) {
+    if (uris.length === 0 || spec.policyIds.length === 0 || spec.policyIds.length > (kind === "public" ? 1 : 2) || new Set(spec.policyIds).size !== spec.policyIds.length || !/^\d+(m|h)$/.test(spec.sessionDuration)) {
       refuse("nothing to cover, or the wrong number of policies");
     }
+    // A protected app's first policy is the route's own email policy when the route lists emails, and
+    // the box's otherwise; the second, only for a route that names service tokens, is its token policy.
+    const emailPolicy = route.emails === undefined ? `${NAME_PREFIX}${box}` : routeEmailPolicyName(box, route);
     for (const [i, id] of spec.policyIds.entries()) {
       const live = await this.getAccessPolicy(accountId, id);
-      // Only the last policy of a protected app may be the route's token policy, and only for a route
-      // that names service tokens.
-      const last = i === spec.policyIds.length - 1 && i > 0;
-      const token = kind === "protected" && last && (route.serviceTokens ?? []).length > 0 && isOurTokenPolicy(live, box, route.name);
-      const ok = kind === "public" ? isOurBypassPolicy(live) : isOurEmailPolicy(live) || token;
+      const ok =
+        kind === "public"
+          ? isOurBypassPolicy(live)
+          : i === 0
+            ? isOurEmailPolicy(live) && live.name === emailPolicy
+            : (route.serviceTokens ?? []).length > 0 && isOurTokenPolicy(live, box, route.name);
       if (!ok) {
-        refuse(`policy ${live.name} is not ${kind === "public" ? "frosty's bypass policy" : `one of frosty's allow-by-email policies${last ? ` or ${tokenPolicyName(box, route.name)}` : ""}`}`);
+        refuse(`policy ${live.name} is not ${kind === "public" ? "frosty's bypass policy" : i === 0 ? `the allow-by-email policy ${emailPolicy}` : tokenPolicyName(box, route.name)}`);
       }
     }
     const body = {
