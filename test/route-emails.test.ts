@@ -243,6 +243,9 @@ describe("route verify with emails", () => {
     expect(checkRouteEmails("web1", share, { ...p, include: [{ email: { email: "ALICE@example.org" } }, { email: { email: "bob@example.org" } }] }, apps, emailPolicies).ok).toBe(true);
     const elsewhere = [...s.fcf.apps, { id: "app-x", name: "stayfrosty-web1:other", type: "self_hosted", policies: [{ id: p.id }] }];
     expect(checkRouteEmails("web1", share, p, elsewhere as never, emailPolicies).detail).toContain(`${POLICY} is attached to stayfrosty-web1:other`);
+    // A second app with the route app's own name is still elsewhere: it's matched by id.
+    const twin = [...s.fcf.apps, { id: "app-twin", name: "stayfrosty-web1:share", type: "self_hosted", policies: [{ id: p.id }] }];
+    expect(checkRouteEmails("web1", share, p, twin as never, emailPolicies).detail).toContain(`${POLICY} is attached to stayfrosty-web1:share`);
     appOf(s)["allowed_idps"] = ["idp-github"];
     expect(checkRouteEmails("web1", share, p, s.fcf.apps as never, emailPolicies).detail).toContain("offers only 1 login method(s) (allowed_idps)");
   });

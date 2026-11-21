@@ -260,13 +260,15 @@ export async function syncRoutes(ctx: Context, box: string, tunnel: CfTunnel): P
   }
 }
 
-// Where the box's route email policies are attached outside their own route's app, as problems.
+// Where the box's route email policies are attached outside their own route's app, as problems. The
+// route's app is the one routeApps picks, by id: a second app with the same name counts as elsewhere.
 export function routeEmailPoliciesElsewhere(box: string, emailPolicies: CfAccessPolicy[], apps: CfAccessApp[]): string[] {
   const out: string[] = [];
-  for (const app of apps) {
-    for (const p of app.policies ?? []) {
-      const policy = emailPolicies.find((e) => e.id === p.id);
-      if (policy !== undefined && policy.name !== `${app.name}:emails`) {
+  for (const policy of emailPolicies) {
+    const ownName = policy.name.slice(0, -":emails".length);
+    const ownId = apps.find((a) => a.name === ownName)?.id;
+    for (const app of apps) {
+      if (app.id !== ownId && (app.policies ?? []).some((p) => p.id === policy.id)) {
         out.push(`${policy.name} is attached to ${app.name}`);
       }
     }
